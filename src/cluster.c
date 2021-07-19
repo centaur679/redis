@@ -76,9 +76,35 @@ sds representClusterNodeFlags(sds ci, uint16_t flags);
 uint64_t clusterGetMaxEpoch(void);
 int clusterBumpConfigEpochWithoutConsensus(void);
 void moduleCallClusterReceivers(const char *sender_id, uint64_t module_id, uint8_t type, const unsigned char *payload, uint32_t len);
+const char *clusterGetMessageTypeString(int type);
 
 #define RCVBUF_INIT_LEN 1024
 #define RCVBUF_MAX_PREALLOC (1<<20) /* 1MB */
+
+/* Cluster nodes hash table, mapping nodes addresses 1.2.3.4:6379 to
+ * clusterNode structures. */
+dictType clusterNodesDictType = {
+        dictSdsHash,                /* hash function */
+        NULL,                       /* key dup */
+        NULL,                       /* val dup */
+        dictSdsKeyCompare,          /* key compare */
+        dictSdsDestructor,          /* key destructor */
+        NULL,                       /* val destructor */
+        NULL                        /* allow to expand */
+};
+
+/* Cluster re-addition blacklist. This maps node IDs to the time
+ * we can re-add this node. The goal is to avoid readding a removed
+ * node for some time. */
+dictType clusterNodesBlackListDictType = {
+        dictSdsCaseHash,            /* hash function */
+        NULL,                       /* key dup */
+        NULL,                       /* val dup */
+        dictSdsKeyCaseCompare,      /* key compare */
+        dictSdsDestructor,          /* key destructor */
+        NULL,                       /* val destructor */
+        NULL                        /* allow to expand */
+};
 
 /* -----------------------------------------------------------------------------
  * Initialization
@@ -535,6 +561,10 @@ void clusterInit(void) {
                    "Your Redis port number must be 55535 or less.");
         exit(1);
     }
+    if (!server.bindaddr_count) {
+        serverLog(LL_WARNING, "No bind address is configured, but it is required for the Cluster bus.");
+        exit(1);
+    }
     if (listenToPort(port+CLUSTER_PORT_INCR, &server.cfd) == C_ERR) {
         exit(1);
     }
@@ -705,8 +735,8 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             connClose(conn);
             return;
         }
-        connNonBlock(conn);
         connEnableTcpNoDelay(conn);
+        connKeepAlive(conn,server.cluster_node_timeout * 2);
 
         /* Use non-blocking I/O for cluster messages. */
         serverLog(LL_VERBOSE,"Accepting cluster node connection from %s:%d", cip, cport);
@@ -1184,7 +1214,7 @@ void clusterHandleConfigEpochCollision(clusterNode *sender) {
  * CLUSTER nodes blacklist
  *
  * The nodes blacklist is just a way to ensure that a given node with a given
- * Node ID is not readded before some time elapsed (this time is specified
+ * Node ID is not re-added before some time elapsed (this time is specified
  * in seconds in CLUSTER_BLACKLIST_TTL).
  *
  * This is useful when we want to remove a node from the cluster completely:
@@ -1740,7 +1770,7 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
 }
 
 /* When this function is called, there is a packet to process starting
- * at node->rcvbuf. Releasing the buffer is up to the caller, so this
+ * at link->rcvbuf. Releasing the buffer is up to the caller, so this
  * function should just handle the higher level stuff of processing the
  * packet, modifying the cluster state if needed.
  *
@@ -1859,8 +1889,6 @@ int clusterProcessPacket(clusterLink *link) {
 
     /* Initial processing of PING and MEET requests replying with a PONG. */
     if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_MEET) {
-        serverLog(LL_DEBUG,"Ping packet received: %p", (void*)link->node);
-
         /* We use incoming MEET messages in order to set the address
          * for 'myself', since only other cluster nodes will send us
          * MEET messages on handshakes, when the cluster joins, or
@@ -1917,9 +1945,9 @@ int clusterProcessPacket(clusterLink *link) {
     if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG ||
         type == CLUSTERMSG_TYPE_MEET)
     {
-        serverLog(LL_DEBUG,"%s packet received: %p",
-            type == CLUSTERMSG_TYPE_PING ? "ping" : "pong",
-            (void*)link->node);
+        serverLog(LL_DEBUG,"%s packet received: %s",
+            clusterGetMessageTypeString(type),
+            link->node ? link->node->name : "NULL");
         if (link->node) {
             if (nodeInHandshake(link->node)) {
                 /* If we already have this node, try to change the
@@ -2149,6 +2177,8 @@ int clusterProcessPacket(clusterLink *link) {
                 hdr->sender, hdr->data.fail.about.nodename);
         }
     } else if (type == CLUSTERMSG_TYPE_PUBLISH) {
+        if (!sender) return 1;  /* We don't know that node. */
+
         robj *channel, *message;
         uint32_t channel_len, message_len;
 
@@ -2499,7 +2529,8 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
         totlen += sizeof(clusterMsgDataUpdate);
     }
     hdr->totlen = htonl(totlen);
-    /* For PING, PONG, and MEET, fixing the totlen field is up to the caller. */
+    /* For PING, PONG, MEET and other variable length messages fixing the
+     * totlen field is up to the caller. */
 }
 
 /* Return non zero if the node is already present in the gossip section of the
@@ -2650,7 +2681,7 @@ void clusterSendPing(clusterLink *link, int type) {
         dictReleaseIterator(di);
     }
 
-    /* Ready to send... fix the totlen fiend and queue the message in the
+    /* Ready to send... fix the totlen field and queue the message in the
      * output buffer. */
     totlen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
     totlen += (sizeof(clusterMsgDataGossip)*gossipcount);
@@ -3351,10 +3382,10 @@ void clusterHandleSlaveMigration(int max_slaves) {
      *
      * Note: this means that eventually a replica migration will occur
      * since slaves that are reachable again always have their FAIL flag
-     * cleared, so eventually there must be a candidate. At the same time
-     * this does not mean that there are no race conditions possible (two
-     * slaves migrating at the same time), but this is unlikely to
-     * happen, and harmless when happens. */
+     * cleared, so eventually there must be a candidate.
+     * There is a possible race condition causing multiple
+     * slaves to migrate at the same time, but this is unlikely to
+     * happen and relatively harmless when it does. */
     candidate = myself;
     di = dictGetSafeIterator(server.cluster->nodes);
     while((de = dictNext(di)) != NULL) {
@@ -3438,7 +3469,7 @@ void clusterHandleSlaveMigration(int max_slaves) {
  * the PAUSED flag, so that the slave will set mf_master_offset when receiving
  * a packet from the master with this flag set.
  *
- * The gaol of the manual failover is to perform a fast failover without
+ * The goal of the manual failover is to perform a fast failover without
  * data loss due to the asynchronous master-slave replication.
  * -------------------------------------------------------------------------- */
 
@@ -3574,7 +3605,7 @@ void clusterCron(void) {
             clusterLink *link = createClusterLink(node);
             link->conn = server.tls_cluster ? connCreateTLS() : connCreateSocket();
             connSetPrivateData(link->conn, link);
-            if (connConnect(link->conn, node->ip, node->cport, NET_FIRST_BIND_ADDR,
+            if (connConnect(link->conn, node->ip, node->cport, server.bind_source_addr,
                         clusterLinkConnectHandler) == -1) {
                 /* We got a synchronous error from connect before
                  * clusterSendPing() had a chance to be called.
@@ -3949,7 +3980,7 @@ void clusterUpdateState(void) {
      * master, after a reboot, without giving the cluster a chance to
      * reconfigure this node. Note that the delay is calculated starting from
      * the first call to this function and not since the server start, in order
-     * to don't count the DB loading time. */
+     * to not count the DB loading time. */
     if (first_call_time == 0) first_call_time = mstime();
     if (nodeIsMaster(myself) &&
         server.cluster->state == CLUSTER_FAIL &&
@@ -4201,7 +4232,7 @@ sds clusterGenNodeDescription(clusterNode *node, int use_pport) {
                     "connected" : "disconnected");
 
     /* Slots served by this instance. If we already have slots info,
-     * append it diretly, otherwise, generate slots only if it has. */
+     * append it directly, otherwise, generate slots only if it has. */
     if (node->slots_info) {
         ci = sdscatsds(ci, node->slots_info);
     } else if (node->numslots > 0) {
@@ -5035,7 +5066,7 @@ NULL
 
 /* Generates a DUMP-format representation of the object 'o', adding it to the
  * io stream pointed by 'rio'. This function can't fail. */
-void createDumpPayload(rio *payload, robj *o, robj *key) {
+void createDumpPayload(rio *payload, robj *o, robj *key, int dbid) {
     unsigned char buf[2];
     uint64_t crc;
 
@@ -5043,7 +5074,7 @@ void createDumpPayload(rio *payload, robj *o, robj *key) {
      * byte followed by the serialized object. This is understood by RESTORE. */
     rioInitWithBuffer(payload,sdsempty());
     serverAssert(rdbSaveObjectType(payload,o));
-    serverAssert(rdbSaveObject(payload,o,key));
+    serverAssert(rdbSaveObject(payload,o,key,dbid));
 
     /* Write the footer, this is how it looks like:
      * ----------------+---------------------+---------------+
@@ -5104,7 +5135,7 @@ void dumpCommand(client *c) {
     }
 
     /* Create the DUMP encoded representation. */
-    createDumpPayload(&payload,o,c->argv[1]);
+    createDumpPayload(&payload,o,c->argv[1],c->db->id);
 
     /* Transfer to the client */
     addReplyBulkSds(c,payload.io.buffer.ptr);
@@ -5176,7 +5207,7 @@ void restoreCommand(client *c) {
 
     rioInitWithBuffer(&payload,c->argv[3]->ptr);
     if (((type = rdbLoadObjectType(&payload)) == -1) ||
-        ((obj = rdbLoadObject(type,&payload,key->ptr)) == NULL))
+        ((obj = rdbLoadObject(type,&payload,key->ptr,c->db->id)) == NULL))
     {
         addReplyError(c,"Bad data format");
         return;
@@ -5204,6 +5235,13 @@ void restoreCommand(client *c) {
     dbAdd(c->db,key,obj);
     if (ttl) {
         setExpire(c,c->db,key,ttl);
+        if (!absttl) {
+            /* Propagate TTL as absolute timestamp */
+            robj *ttl_obj = createStringObjectFromLongLong(ttl);
+            rewriteClientCommandArgument(c,2,ttl_obj);
+            decrRefCount(ttl_obj);
+            rewriteClientCommandArgument(c,c->argc,shared.absttl);
+        }
     }
     objectSetLRUOrLFU(obj,lfu_freq,lru_idle,lru_clock,1000);
     signalModifiedKey(c,c->db,key);
@@ -5361,13 +5399,16 @@ void migrateCommand(client *c) {
             }
             j++;
             password = c->argv[j]->ptr;
+            redactClientCommandArgument(c,j);
         } else if (!strcasecmp(c->argv[j]->ptr,"auth2")) {
             if (moreargs < 2) {
                 addReplyErrorObject(c,shared.syntaxerr);
                 return;
             }
             username = c->argv[++j]->ptr;
+            redactClientCommandArgument(c,j);
             password = c->argv[++j]->ptr;
+            redactClientCommandArgument(c,j);
         } else if (!strcasecmp(c->argv[j]->ptr,"keys")) {
             if (sdslen(c->argv[3]->ptr) != 0) {
                 addReplyError(c,
@@ -5486,7 +5527,7 @@ try_again:
 
         /* Emit the payload argument, that is the serialized object using
          * the DUMP format. */
-        createDumpPayload(&payload,ov[j],kv[j]);
+        createDumpPayload(&payload,ov[j],kv[j],dbid);
         serverAssertWithInfo(c,NULL,
             rioWriteBulkString(&cmd,payload.io.buffer.ptr,
                                sdslen(payload.io.buffer.ptr)));
@@ -5697,6 +5738,10 @@ void readonlyCommand(client *c) {
 
 /* The READWRITE command just clears the READONLY command state. */
 void readwriteCommand(client *c) {
+    if (server.cluster_enabled == 0) {
+        addReplyError(c,"This instance has cluster support disabled");
+        return;
+    }
     c->flags &= ~CLIENT_READONLY;
     addReply(c,shared.ok);
 }
