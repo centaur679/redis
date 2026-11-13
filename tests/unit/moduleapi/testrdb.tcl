@@ -6,7 +6,7 @@
 # 1 << 3 - do not save data on aux callback
 set testmodule [file normalize tests/modules/testrdb.so]
 
-tags "modules" {
+tags "modules external:skip" {
     test {modules are able to persist types} {
         start_server [list overrides [list loadmodule "$testmodule"]] {
             r testrdb.set.key key1 value1
@@ -61,13 +61,13 @@ tags "modules" {
     # 7 == 0111 - use aux_save2 before and after key space with data
     test {modules are able to persist globals before and after} {
         set server_path [tmpdir "server.module-testrdb"]
-        start_server [list overrides [list loadmodule "$testmodule $test_case" "dir" $server_path] keep_persistence true] {
+        start_server [list overrides [list loadmodule "$testmodule $test_case" "dir" $server_path "save" "900 1"] keep_persistence true] {
             r testrdb.set.before global1
             r testrdb.set.after global2
             assert_equal "global1" [r testrdb.get.before]
             assert_equal "global2" [r testrdb.get.after]
         }
-        start_server [list overrides [list loadmodule "$testmodule $test_case" "dir" $server_path]] {
+        start_server [list overrides [list loadmodule "$testmodule $test_case" "dir" $server_path "save" "900 1"]] {
             assert_equal "global1" [r testrdb.get.before]
             assert_equal "global2" [r testrdb.get.after]
         }
@@ -80,11 +80,11 @@ tags "modules" {
     # 5 == 0101 - use aux_save2 after key space with data
     test {modules are able to persist globals just after} {
         set server_path [tmpdir "server.module-testrdb"]
-        start_server [list overrides [list loadmodule "$testmodule $test_case" "dir" $server_path] keep_persistence true] {
+        start_server [list overrides [list loadmodule "$testmodule $test_case" "dir" $server_path "save" "900 1"] keep_persistence true] {
             r testrdb.set.after global2
             assert_equal "global2" [r testrdb.get.after]
         }
-        start_server [list overrides [list loadmodule "$testmodule $test_case" "dir" $server_path]] {
+        start_server [list overrides [list loadmodule "$testmodule $test_case" "dir" $server_path "save" "900 1"]] {
             assert_equal "global2" [r testrdb.get.after]
         }
     }
@@ -116,6 +116,11 @@ tags "modules" {
                     $master config set dynamic-hz no
                     $replica config set dynamic-hz no
                     set start [clock clicks -milliseconds]
+                    # Generate small keys
+                    for {set k 0} {$k < 20000} {incr k} {
+                        r testrdb.set.key keysmall$k [string repeat A [expr {int(rand()*100)}]]
+                    }
+                    # Generate larger keys
                     for {set k 0} {$k < 30} {incr k} {
                         r testrdb.set.key key$k [string repeat A [expr {int(rand()*1000000)}]]
                     }

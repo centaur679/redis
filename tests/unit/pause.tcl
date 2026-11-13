@@ -1,3 +1,17 @@
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
+
 start_server {tags {"pause network"}} {
     test "Test read commands are not blocked by client pause" {
         r client PAUSE 100000 WRITE
@@ -26,14 +40,17 @@ start_server {tags {"pause network"}} {
         #   preserve most restrictive configuration among multiple settings.
         set rd [redis_deferring_client]
         $rd SET FOO BAR
+        $rd read
 
         set test_start_time [clock milliseconds]
         r client PAUSE 200 ALL
         r client PAUSE 20 WRITE
         after 50
         $rd get FOO
+        $rd read
         set elapsed [expr {[clock milliseconds]-$test_start_time}]
         assert_lessthan 200 $elapsed
+        $rd close
     }
 
     test "Test new pause time is smaller than old one, then old time preserved" {
@@ -83,7 +100,7 @@ start_server {tags {"pause network"}} {
         $rd2 close
     }
 
-    test "Test read/admin mutli-execs are not blocked by pause RO" {
+    test "Test read/admin multi-execs are not blocked by pause RO" {
         r SET FOO BAR
         r client PAUSE 100000 WRITE
         set rr [redis_client]
@@ -96,7 +113,7 @@ start_server {tags {"pause network"}} {
         $rr close
     }
 
-    test "Test write mutli-execs are blocked by pause RO" {
+    test "Test write multi-execs are blocked by pause RO" {
         set rd [redis_deferring_client]
         $rd MULTI
         assert_equal [$rd read] "OK"
@@ -174,7 +191,7 @@ start_server {tags {"pause network"}} {
         $rr close
     }
 
-    test "Test read-only scripts in mutli-exec are not blocked by pause RO" {
+    test "Test read-only scripts in multi-exec are not blocked by pause RO" {
         r SET FOO BAR
         r client PAUSE 100000 WRITE
         set rr [redis_client]
@@ -193,7 +210,7 @@ start_server {tags {"pause network"}} {
         $rr close
     }
 
-    test "Test write scripts in mutli-exec are blocked by pause RO" {
+    test "Test write scripts in multi-exec are blocked by pause RO" {
         set rd [redis_deferring_client]
         set rd2 [redis_deferring_client]
 
@@ -357,6 +374,56 @@ start_server {tags {"pause network"}} {
             }
             r get foo2
         } {bar2}
+    }
+
+    test "Test the randomkey command will not cause the server to get into an infinite loop during the client pause write" {
+        r flushall
+
+        r multi
+        r set key value px 3
+        r client pause 10000 write
+        r exec
+        
+        after 5
+
+        wait_for_condition 50 100 {
+            [r randomkey] == "key"
+        } else {
+            fail "execute randomkey failed, caused by the infinite loop"
+        }
+
+        r client unpause
+        assert_equal [r randomkey] {}
+    }
+
+    test "CLIENT UNBLOCK is not allow to unblock client blocked by CLIENT PAUSE" {
+        set rd1 [redis_deferring_client]
+        set rd2 [redis_deferring_client]
+        $rd1 client id
+        $rd2 client id
+        set client_id1 [$rd1 read]
+        set client_id2 [$rd2 read]
+
+        r del mylist
+        r client pause 100000 write
+        $rd1 blpop mylist 0
+        $rd2 blpop mylist 0
+        wait_for_blocked_clients_count 2 50 100
+
+        # This used to trigger a panic.
+        assert_equal 0 [r client unblock $client_id1 timeout]
+        # This used to return a UNBLOCKED error.
+        assert_equal 0 [r client unblock $client_id2 error]
+
+        # After the unpause, it must be able to unblock the client.
+        r client unpause
+        assert_equal 1 [r client unblock $client_id1 timeout]
+        assert_equal 1 [r client unblock $client_id2 error]
+        assert_equal {} [$rd1 read]
+        assert_error "UNBLOCKED*" {$rd2 read}
+
+        $rd1 close
+        $rd2 close
     }
 
     # Make sure we unpause at the end

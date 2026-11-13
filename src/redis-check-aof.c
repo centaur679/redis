@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-current, Redis Ltd.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -29,6 +29,7 @@
  */
 
 #include "server.h"
+
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <regex.h>
@@ -233,16 +234,18 @@ int checkSingleAof(char *aof_filename, char *aof_filepath, int last_file, int fi
     struct redis_stat sb;
     if (redis_fstat(fileno(fp),&sb) == -1) {
         printf("Cannot stat file: %s, aborting...\n", aof_filename);
+        fclose(fp);
         exit(1);
     }
 
     off_t size = sb.st_size;
     if (size == 0) {
+        fclose(fp);
         return AOF_CHECK_EMPTY;
     }
 
     if (preamble) {
-        char *argv[2] = {NULL, aof_filename};
+        char *argv[2] = {NULL, aof_filepath};
         if (redis_check_rdb_main(2, argv, fp) == C_ERR) {
             printf("RDB preamble of AOF file is not sane, aborting.\n");
             exit(1);
@@ -343,6 +346,7 @@ int fileIsRDB(char *filepath) {
     struct redis_stat sb;
     if (redis_fstat(fileno(fp), &sb) == -1) {
         printf("Cannot stat file: %s\n", filepath);
+        fclose(fp);
         exit(1);
     }
 
@@ -379,6 +383,7 @@ int fileIsManifest(char *filepath) {
     struct redis_stat sb;
     if (redis_fstat(fileno(fp), &sb) == -1) {
         printf("Cannot stat file: %s\n", filepath);
+        fclose(fp);
         exit(1);
     }
 
@@ -395,15 +400,20 @@ int fileIsManifest(char *filepath) {
                 break;
             } else {
                 printf("Cannot read file: %s\n", filepath);
+                fclose(fp);
                 exit(1);
             }
         }
 
-        /* Skip comments lines */
+        /* We will skip comments lines.
+         * At present, the manifest format is fixed, see aofInfoFormat.
+         * We will break directly as long as it encounters other items. */
         if (buf[0] == '#') {
             continue;
         } else if (!memcmp(buf, "file", strlen("file"))) {
             is_manifest = 1;
+        } else {
+            break;
         }
     }
 
@@ -426,6 +436,19 @@ input_file_type getInputFileType(char *filepath) {
         return AOF_RDB_PREAMBLE;
     } else {
         return AOF_RESP;
+    }
+}
+
+void printAofStyle(int ret, char *aofFileName, char *aofType) {
+    if (ret == AOF_CHECK_OK) {
+        printf("%s %s is valid\n", aofType, aofFileName);
+    } else if (ret == AOF_CHECK_EMPTY) {
+        printf("%s %s is empty\n", aofType, aofFileName);
+    } else if (ret == AOF_CHECK_TIMESTAMP_TRUNCATED) {
+        printf("Successfully truncated AOF %s to timestamp %ld\n",
+            aofFileName, to_timestamp);
+    } else if (ret == AOF_CHECK_TRUNCATED) {
+        printf("Successfully truncated AOF %s\n", aofFileName);
     }
 }
 
@@ -454,20 +477,11 @@ void checkMultiPartAof(char *dirpath, char *manifest_filepath, int fix) {
         sds aof_filename = am->base_aof_info->file_name;
         sds aof_filepath = makePath(dirpath, aof_filename);
         last_file = ++aof_num == total_num;
-        int aof_preable = fileIsRDB(aof_filepath);
+        int aof_preamble = fileIsRDB(aof_filepath);
 
-        printf("Start to check BASE AOF (%s format).\n", aof_preable ? "RDB":"RESP");
-        ret = checkSingleAof(aof_filename, aof_filepath, last_file, fix, aof_preable);
-        if (ret == AOF_CHECK_OK) {
-            printf("BASE AOF %s is valid\n", aof_filename);
-        } else if (ret == AOF_CHECK_EMPTY) {
-            printf("BASE AOF %s is empty\n", aof_filename);
-        } else if (ret == AOF_CHECK_TIMESTAMP_TRUNCATED) {
-            printf("Successfully truncated AOF %s to timestamp %ld\n",
-                aof_filename, to_timestamp);
-        } else if (ret == AOF_CHECK_TRUNCATED) {
-            printf("Successfully truncated AOF %s\n", aof_filename);
-        }
+        printf("Start to check BASE AOF (%s format).\n", aof_preamble ? "RDB":"RESP");
+        ret = checkSingleAof(aof_filename, aof_filepath, last_file, fix, aof_preamble);
+        printAofStyle(ret, aof_filename, (char *)"BASE AOF");
         sdsfree(aof_filepath);
     }
 
@@ -483,16 +497,7 @@ void checkMultiPartAof(char *dirpath, char *manifest_filepath, int fix) {
             sds aof_filepath = makePath(dirpath, aof_filename);
             last_file = ++aof_num == total_num;
             ret = checkSingleAof(aof_filename, aof_filepath, last_file, fix, 0);
-            if (ret == AOF_CHECK_OK) {
-                printf("INCR AOF %s is valid\n", aof_filename);
-            } else if (ret == AOF_CHECK_EMPTY) {
-                printf("INCR AOF %s is empty\n", aof_filename);
-            } else if (ret == AOF_CHECK_TIMESTAMP_TRUNCATED) {
-                printf("Successfully truncated AOF %s to timestamp %ld\n",
-                    aof_filename, to_timestamp);
-            } else if (ret == AOF_CHECK_TRUNCATED) {
-                printf("Successfully truncated AOF %s\n", aof_filename);
-            }
+            printAofStyle(ret, aof_filename, (char *)"INCR AOF");
             sdsfree(aof_filepath);
         }
     }
@@ -507,16 +512,7 @@ void checkMultiPartAof(char *dirpath, char *manifest_filepath, int fix) {
 void checkOldStyleAof(char *filepath, int fix, int preamble) {
     printf("Start checking Old-Style AOF\n");
     int ret = checkSingleAof(filepath, filepath, 1, fix, preamble);
-    if (ret == AOF_CHECK_OK) {
-        printf("AOF %s is valid\n", filepath);
-    } else if (ret == AOF_CHECK_EMPTY) {
-        printf("AOF %s is empty\n", filepath);
-    } else if (ret == AOF_CHECK_TIMESTAMP_TRUNCATED) {
-        printf("Successfully truncated AOF %s to timestamp %ld\n",
-            filepath, to_timestamp);
-    } else if (ret == AOF_CHECK_TRUNCATED) {
-        printf("Successfully truncated AOF %s\n", filepath);
-    }
+    printAofStyle(ret, filepath, (char *)"AOF");
 }
 
 int redis_check_aof_main(int argc, char **argv) {
@@ -528,6 +524,13 @@ int redis_check_aof_main(int argc, char **argv) {
     if (argc < 2) {
         goto invalid_args;
     } else if (argc == 2) {
+        if (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--version")) {
+            sds version = getVersion();
+            printf("redis-check-aof %s\n", version);
+            sdsfree(version);
+            exit(0);
+        }
+
         filepath = argv[1];
     } else if (argc == 3) {
         if (!strcmp(argv[1], "--fix")) {
@@ -550,6 +553,12 @@ int redis_check_aof_main(int argc, char **argv) {
             goto invalid_args;
         }
     } else {
+        goto invalid_args;
+    }
+
+    /* Check if filepath is longer than PATH_MAX */
+    if (strlen(filepath) > PATH_MAX) {
+        printf("Error: filepath is too long (exceeds PATH_MAX)\n");
         goto invalid_args;
     }
 

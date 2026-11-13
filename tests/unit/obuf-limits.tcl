@@ -1,4 +1,4 @@
-start_server {tags {"obuf-limits external:skip"}} {
+start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
     test {CONFIG SET client-output-buffer-limit} {
         set oldval [lindex [r config get client-output-buffer-limit] 1]
 
@@ -23,6 +23,10 @@ start_server {tags {"obuf-limits external:skip"}} {
         set res [lindex [r config get client-output-buffer-limit] 1]
         assert_equal $res "normal 1048576 2097152 60 slave 3145728 4194304 70 pubsub 5242880 6291456 80"
 
+        r config set client-output-buffer-limit "normal 18014398509481985kb 0 0 replica 0 0 0 pubsub 0 0 0"
+        set res [lindex [r config get client-output-buffer-limit] 1]
+        assert_equal $res "normal 18446744073709551615 0 0 slave 0 0 0 pubsub 0 0 0"
+
         # Set back to the original value.
         r config set client-output-buffer-limit $oldval
     }
@@ -37,7 +41,9 @@ start_server {tags {"obuf-limits external:skip"}} {
 
         set omem 0
         while 1 {
-            r publish foo bar
+            # The larger content size ensures that client.buf gets filled more quickly,
+            # allowing us to correctly observe the gradual increase of `omem`
+            r publish foo [string repeat bar 50]
             set clients [split [r client list] "\r\n"]
             set c [split [lindex $clients 1] " "]
             if {![regexp {omem=([0-9]+)} $c - omem]} break
@@ -149,15 +155,13 @@ start_server {tags {"obuf-limits external:skip"}} {
         r config set client-output-buffer-limit {normal 100000 0 0}
         set value [string repeat "x" 10000]
         r set bigkey $value
-        set rd1 [redis_deferring_client]
-        set rd2 [redis_deferring_client]
-        $rd2 client setname multicommands
-        assert_equal "OK" [$rd2 read]
+        set rd [redis_deferring_client]
+        $rd client setname multicommands
+        assert_equal "OK" [$rd read]
 
-        # Let redis sleep 1s firstly
-        $rd1 debug sleep 1
-        $rd1 flush
-        after 100
+        set server_pid [s process_id]
+        # Pause the server, so that the client's write will be buffered
+        pause_process $server_pid
 
         # Create a pipeline of commands that will be processed in one socket read.
         # It is important to use one write, in TLS mode independent writes seem
@@ -172,15 +176,23 @@ start_server {tags {"obuf-limits external:skip"}} {
             # One bigkey is 10k, total response size must be more than 100k
             append buf "get bigkey\r\n"
         }
-        $rd2 write $buf
-        $rd2 flush
-        after 100
+        $rd write $buf
+        $rd flush
 
-        # Reds must wake up if it can send reply
+        # Resume the server to process the pipeline in one go
+        resume_process $server_pid
+        # Make sure the pipeline of commands is processed
+        wait_for_condition 100 10 {
+            [expr {[regexp {calls=(\d+)} [cmdrstat get r] -> calls] ? $calls : 0}] >= 5
+        } else {
+            fail "the pipeline of commands commands is not processed"
+        }
+
+        # Redis must wake up if it can send reply
         assert_equal "PONG" [r ping]
         set clients [r client list]
         assert_no_match "*name=multicommands*" $clients
-        assert_equal {} [$rd2 rawread]
+        assert_equal {} [$rd rawread]
     }
 
     test {Execute transactions completely even if client output buffer limit is enforced} {
@@ -210,5 +222,119 @@ start_server {tags {"obuf-limits external:skip"}} {
         assert_equal {} [r get k1]
         assert_equal "v2" [r get k2]
         assert_equal "v3" [r get k3]
+    }
+
+    test "Obuf limit, HRANDFIELD with huge count stopped mid-run" {
+        r config set client-output-buffer-limit {normal 1000000 0 0}
+        r hset myhash a b
+        catch {r hrandfield myhash -999999999} e
+        assert_match "*I/O error*" $e
+        reconnect
+    }
+
+    test "Obuf limit, ZRANDMEMBER with a large positive count stopped mid-run" {
+        r config set client-output-buffer-limit {normal 0 0 0}
+        r del myzset
+        for {set i 0} {$i < 20000} {incr i 1000} {
+            set args {}
+            for {set j $i} {$j < $i + 1000} {incr j} { lappend args $j member:$j }
+            r zadd myzset {*}$args
+        }
+        assert_encoding btree myzset
+        set before [s client_output_buffer_limit_disconnections]
+        r config set client-output-buffer-limit {normal 65536 0 0}
+        # A sampling walk abandoned for a closing client must neither assert
+        # nor leak. Replies to a closing client are dropped, so this does not
+        # tell the early stop apart from a full walk.
+        catch {r zrandmember myzset 15000 withscores} e
+        assert_match "*I/O error*" $e
+        reconnect
+        assert_equal [expr {$before + 1}] [s client_output_buffer_limit_disconnections]
+        r config set client-output-buffer-limit {normal 0 0 0}
+        assert_equal 15000 [llength [r zrandmember myzset 15000]]
+        r del myzset
+    }
+
+    test "Obuf limit, KEYS stopped mid-run" {
+        r config set client-output-buffer-limit {normal 100000 0 0}
+        populate 1000 "long-key-name-prefix-of-100-chars-------------------------------------------------------------------"
+        catch {r keys *} e
+        assert_match "*I/O error*" $e
+        reconnect
+    }
+
+    test "zero-copy referenced reply bytes are reflected in memory stats" {
+        r flushdb
+        r config set client-output-buffer-limit {normal 0 0 0}
+        # Use a value large enough to trigger copy avoidance
+        set val_size 100000
+        r set bigkey [string repeat v $val_size]
+
+        # Use MULTI/EXEC so all observers see the zero-copy ref before it is sent.
+        r client setname refmem_test
+        r multi
+        r get bigkey      ;# adds zero-copy ref to output buffer
+        r client list     ;# per-client omem / omem-shared / omem-unshared / tot-mem
+        r info memory     ;# global mem_clients_normal_shared / mem_clients_normal_unshared
+        r memory stats    ;# clients.normal.shared and clients.normal.unshared
+        set res [r exec]
+        
+        # omem-shared tracks total shared reply bytes, key is still alive so omem-unshared must be 0.
+        set clients [split [string trim [lindex $res 1]] "\r\n"]
+        set c [lsearch -inline $clients *name=refmem_test*]
+        regexp {omem-shared=([0-9]+)} $c - omem_shared
+        regexp {omem-unshared=([0-9]+)} $c - omem_unshared
+        assert {$omem_shared >= $val_size}
+        assert_equal 0 $omem_unshared
+
+        # mem_clients_normal_shared is updated incrementally, so it doesn't reflect the reply yet;
+        # normal.unshared is 0 since the key is still in keyspace
+        set info_mem [lindex $res 2]
+        assert_equal 0 [getInfoProperty $info_mem mem_clients_normal_unshared]
+        set mem_stats [lindex $res 3]
+        assert_equal 0 [dict get $mem_stats clients.normal.unshared] ;# key still in keyspace
+
+        # After the reply is fully sent, the global counter must return to 0
+        wait_for_condition 50 10 {
+            [s mem_clients_normal_shared] == 0
+        } else {
+            fail "mem_clients_normal_shared did not return to 0 after reply was sent"
+        }
+    }
+
+    test "shared reply bytes are tracked as unshared after the key is deleted" {
+        r flushdb
+        r config set client-output-buffer-limit {normal 0 0 0}
+
+        set rr [redis_deferring_client]
+        $rr client setname test_client
+        $rr flush
+
+        # Repeatedly SET/GET/DEL a big key on a deferred client and poll CLIENT LIST
+        # until omem-unshared on test_client reflects the referenced bytes.
+        set val_size 100000
+        set deadline [expr {[clock milliseconds] + 5000}]
+        while {true} {
+            r set k [string repeat v $val_size]
+            $rr get k
+            $rr del k
+            $rr flush
+            after 10
+
+            set clients [split [r client list] "\r\n"]
+            set c [lsearch -inline $clients *name=test_client*]
+            regexp {omem-shared=([0-9]+)} $c - omem_shared
+            regexp {omem-unshared=([0-9]+)} $c - omem_unshared
+            if {$omem_unshared >= $val_size} {
+                assert_morethan_equal $omem_shared $omem_unshared
+                break
+            }
+
+            if {[clock milliseconds] > $deadline} {
+                fail "timed out waiting for omem-unshared to reflect unshared bytes"
+            }
+        }
+
+        $rr close
     }
 }

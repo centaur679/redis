@@ -1,25 +1,31 @@
 {
     "XREAD": {
-        "summary": "Return never seen elements in multiple streams, with IDs greater than the ones reported by the caller for each stream. Can block.",
-        "complexity": "For each stream mentioned: O(N) with N being the number of elements being returned, it means that XREAD-ing with a fixed COUNT is O(1). Note that when the BLOCK option is used, XADD will pay O(M) time in order to serve the M clients blocked on the stream getting new data.",
+        "summary": "Returns messages from multiple streams with IDs greater than the ones requested. Blocks until a message is available otherwise.",
         "group": "stream",
         "since": "5.0.0",
         "arity": -4,
         "function": "xreadCommand",
+        "history": [
+            [
+                "8.10.0",
+                "Added the `MAXCOUNT` and `MAXSIZE` options."
+            ]
+        ],
         "get_keys_function": "xreadGetKeys",
         "command_flags": [
             "BLOCKING",
-            "READONLY",
-            "BLOCKING"
+            "READONLY"
         ],
         "acl_categories": [
             "STREAM"
         ],
         "key_specs": [
             {
+                "notes": "Incomplete because a stream key named STREAMS (or options before it) can shift the STREAMS keyword; fall back to xreadGetKeys",
                 "flags": [
                     "RO",
-                    "ACCESS"
+                    "ACCESS",
+                    "INCOMPLETE"
                 ],
                 "begin_search": {
                     "keyword": {
@@ -42,6 +48,20 @@
                 "name": "count",
                 "type": "integer",
                 "optional": true
+            },
+            {
+                "token": "MAXCOUNT",
+                "name": "maxcount",
+                "type": "integer",
+                "optional": true,
+                "since": "8.10.0"
+            },
+            {
+                "token": "MAXSIZE",
+                "name": "maxsize",
+                "type": "integer",
+                "optional": true,
+                "since": "8.10.0"
             },
             {
                 "token": "BLOCK",
@@ -67,6 +87,43 @@
                     }
                 ]
             }
-        ]
+        ],
+        "reply_schema": {
+            "oneOf": [
+                {
+                    "description": "A map of key-value elements when each element composed of key name and the entries reported for that key",
+                    "type": "object",
+                    "patternProperties": {
+                        "^.*$": {
+                            "description": "The entries reported for that key",
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 2,
+                                "items": [
+                                    {
+                                        "description": "entry id",
+                                        "type": "string",
+                                        "pattern": "[0-9]+-[0-9]+"
+                                    },
+                                    {
+                                        "description": "array of field-value pairs",
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string"
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+                {
+                    "description": "If BLOCK option is given, and a timeout occurs, or there is no stream we can serve",
+                    "type": "null"
+                }
+            ]
+        }
     }
 }

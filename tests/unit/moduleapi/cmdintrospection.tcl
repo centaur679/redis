@@ -1,6 +1,6 @@
 set testmodule [file normalize tests/modules/cmdintrospection.so]
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
 
     # cmdintrospection.xadd mimics XADD with regards to how
@@ -37,6 +37,9 @@ start_server {tags {"modules"}} {
         dict unset redis_reply group
         dict unset module_reply group
         dict unset module_reply module
+        if {$::log_req_res} {
+            dict unset redis_reply reply_schema
+        }
 
         assert_equal $redis_reply $module_reply
     }

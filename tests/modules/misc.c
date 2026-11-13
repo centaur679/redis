@@ -5,8 +5,58 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 
 #define UNUSED(x) (void)(x)
+
+static int n_events = 0;
+
+static int KeySpace_NotificationModuleKeyMissExpired(RedisModuleCtx *ctx, int type, const char *event, RedisModuleString *key) {
+    UNUSED(ctx);
+    UNUSED(type);
+    UNUSED(event);
+    UNUSED(key);
+    n_events++;
+    return REDISMODULE_OK;
+}
+
+int test_clear_n_events(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    UNUSED(argv);
+    UNUSED(argc);
+    n_events = 0;
+    RedisModule_ReplyWithSimpleString(ctx, "OK");
+    return REDISMODULE_OK;
+}
+
+int test_get_n_events(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    UNUSED(argv);
+    UNUSED(argc);
+    RedisModule_ReplyWithLongLong(ctx, n_events);
+    return REDISMODULE_OK;
+}
+
+int test_open_key_no_effects(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    if (argc<2) {
+        RedisModule_WrongArity(ctx);
+        return REDISMODULE_OK;
+    }
+
+    int supportedMode = RedisModule_GetOpenKeyModesAll();
+    if (!(supportedMode & REDISMODULE_READ) || !(supportedMode & REDISMODULE_OPEN_KEY_NOEFFECTS)) {
+        RedisModule_ReplyWithError(ctx, "OpenKey modes are not supported");
+        return REDISMODULE_OK;
+    }
+
+    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_OPEN_KEY_NOEFFECTS);
+    if (!key) {
+        RedisModule_ReplyWithError(ctx, "key not found");
+        return REDISMODULE_OK;
+    }
+
+    RedisModule_CloseKey(key);
+    RedisModule_ReplyWithSimpleString(ctx, "OK");
+    return REDISMODULE_OK;
+}
 
 int test_call_generic(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
 {
@@ -16,7 +66,7 @@ int test_call_generic(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     }
 
     const char* cmdname = RedisModule_StringPtrLen(argv[1], NULL);
-    RedisModuleCallReply *reply = RedisModule_Call(ctx, cmdname, "v", argv+2, argc-2);
+    RedisModuleCallReply *reply = RedisModule_Call(ctx, cmdname, "v", argv+2, (size_t)argc-2);
     if (reply) {
         RedisModule_ReplyWithCallReply(ctx, reply);
         RedisModule_FreeCallReply(reply);
@@ -127,6 +177,41 @@ int test_keyexists(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     RedisModuleString *key = argv[1];
     int exists = RedisModule_KeyExists(ctx, key);
     return RedisModule_ReplyWithBool(ctx, exists);
+}
+
+const char *test_keytype_name(int type) {
+    switch (type) {
+    case REDISMODULE_KEYTYPE_EMPTY: return "empty";
+    case REDISMODULE_KEYTYPE_STRING: return "string";
+    case REDISMODULE_KEYTYPE_LIST: return "list";
+    case REDISMODULE_KEYTYPE_HASH: return "hash";
+    case REDISMODULE_KEYTYPE_SET: return "set";
+    case REDISMODULE_KEYTYPE_ZSET: return "zset";
+    case REDISMODULE_KEYTYPE_MODULE: return "module";
+    case REDISMODULE_KEYTYPE_STREAM: return "stream";
+    case REDISMODULE_KEYTYPE_ARRAY: return "array";
+    case REDISMODULE_KEYTYPE_BITMAP: return "bitmap";
+    default: return "unknown";
+    }
+}
+
+int test_keyinfo(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    if (argc != 2) return RedisModule_WrongArity(ctx);
+
+    RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
+    int type = RedisModule_KeyType(key);
+    size_t len = RedisModule_ValueLength(key);
+    size_t dma_len = 0;
+    char *dma = RedisModule_StringDMA(key, &dma_len, REDISMODULE_READ);
+    int truncate = RedisModule_StringTruncate(key, len);
+
+    RedisModule_ReplyWithArray(ctx, 4);
+    RedisModule_ReplyWithCString(ctx, test_keytype_name(type));
+    RedisModule_ReplyWithLongLong(ctx, (long long)len);
+    RedisModule_ReplyWithLongLong(ctx, dma != NULL);
+    RedisModule_ReplyWithLongLong(ctx, truncate == REDISMODULE_OK);
+    RedisModule_CloseKey(key);
+    return REDISMODULE_OK;
 }
 
 RedisModuleKey *open_key_or_reply(RedisModuleCtx *ctx, RedisModuleString *keyname, int mode) {
@@ -348,13 +433,21 @@ int test_rm_call(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
 
     const char* cmd = RedisModule_StringPtrLen(argv[1], NULL);
 
-    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, "Ev", argv + 2, argc - 2);
+    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, "Ev", argv + 2, (size_t)argc - 2);
     if(!rep){
         RedisModule_ReplyWithError(ctx, "NULL reply returned");
     }else{
         RedisModule_ReplyWithCallReply(ctx, rep);
         RedisModule_FreeCallReply(rep);
     }
+
+    return REDISMODULE_OK;
+}
+
+/* wrapper for RM_Call which also replicates the module command */
+int test_rm_call_replicate(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
+    test_rm_call(ctx, argv, argc);
+    RedisModule_ReplicateVerbatim(ctx);
 
     return REDISMODULE_OK;
 }
@@ -372,7 +465,7 @@ int test_rm_call_flags(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
     const char* flg = RedisModule_StringPtrLen(flags, NULL);
     const char* cmd = RedisModule_StringPtrLen(argv[2], NULL);
 
-    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, flg, argv + 3, argc - 3);
+    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, flg, argv + 3, (size_t)argc - 3);
     if(!rep){
         RedisModule_ReplyWithError(ctx, "NULL reply returned");
     }else{
@@ -446,11 +539,103 @@ final:
     return REDISMODULE_OK;
 }
 
+int test_malloc_api(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    UNUSED(argv);
+    UNUSED(argc);
+
+    void *p;
+
+    p = RedisModule_TryAlloc(1024);
+    memset(p, 0, 1024);
+    RedisModule_Free(p);
+
+    p = RedisModule_TryCalloc(1, 1024);
+    memset(p, 1, 1024);
+
+    p = RedisModule_TryRealloc(p, 5 * 1024);
+    memset(p, 1, 5 * 1024);
+    RedisModule_Free(p);
+
+    RedisModule_ReplyWithSimpleString(ctx, "OK");
+    return REDISMODULE_OK;
+}
+
+int test_keyslot(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    /* Static check of the ClusterKeySlot + ClusterKeySlotC + ClusterCanonicalKeyNameInSlot
+     * round-trip for all slots. */
+    for (unsigned int slot = 0; slot < 16384; slot++) {
+        const char *tag = RedisModule_ClusterCanonicalKeyNameInSlot(slot);
+        RedisModuleString *key = RedisModule_CreateStringPrintf(ctx, "x{%s}y", tag);
+        assert(slot == RedisModule_ClusterKeySlot(key));
+        size_t len;
+        const char *key_c = RedisModule_StringPtrLen(key, &len);
+        assert(slot == RedisModule_ClusterKeySlotC(key_c, len));
+        RedisModule_FreeString(ctx, key);
+    }
+    if (argc != 2){
+        return RedisModule_WrongArity(ctx);
+    }
+    unsigned int slot = RedisModule_ClusterKeySlot(argv[1]);
+    return RedisModule_ReplyWithLongLong(ctx, slot);
+}
+
+int only_reply_ok(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    REDISMODULE_NOT_USED(argv);
+    REDISMODULE_NOT_USED(argc);
+
+    RedisModule_ReplyWithSimpleString(ctx, "OK");
+    return REDISMODULE_OK;
+}
+
+/* Test command for RM_SignalModifiedKey. */
+int test_signalmodifiedkey(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    if (argc != 2) return RedisModule_WrongArity(ctx);
+
+    /* Manually signal that the key was modified */
+    RedisModule_SignalModifiedKey(ctx, argv[1]);
+    RedisModule_ReplyWithSimpleString(ctx, "OK");
+    return REDISMODULE_OK;
+}
+
+int test_used_memory_ratio(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    UNUSED(argv);
+    if (argc != 1) return RedisModule_WrongArity(ctx);
+    return RedisModule_ReplyWithDouble(ctx, RedisModule_GetUsedMemoryRatio());
+}
+
+int test_used_memory_ratio_estimate(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    UNUSED(argv);
+    if (argc != 1) return RedisModule_WrongArity(ctx);
+    return RedisModule_ReplyWithDouble(ctx, RedisModule_GetUsedMemoryRatioEstimate());
+}
+
+static void *used_memory_ratio_thread_main(void *arg) {
+    *(float *)arg = RedisModule_GetUsedMemoryRatioEstimate();
+    return NULL;
+}
+
+/* Calls RedisModule_GetUsedMemoryRatioEstimate() from a thread that does not
+ * hold the GIL. */
+int test_used_memory_ratio_estimate_bg(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    UNUSED(argv);
+    if (argc != 1) return RedisModule_WrongArity(ctx);
+    pthread_t tid;
+    float ratio = -1;
+    if (pthread_create(&tid, NULL, used_memory_ratio_thread_main, &ratio) != 0)
+        return RedisModule_ReplyWithError(ctx, "-ERR Can't start thread");
+    pthread_join(tid, NULL);
+    return RedisModule_ReplyWithDouble(ctx, ratio);
+}
+
 int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     REDISMODULE_NOT_USED(argv);
     REDISMODULE_NOT_USED(argc);
     if (RedisModule_Init(ctx,"misc",1,REDISMODULE_APIVER_1)== REDISMODULE_ERR)
         return REDISMODULE_ERR;
+
+    if(RedisModule_SubscribeToKeyspaceEvents(ctx, REDISMODULE_NOTIFY_KEY_MISS | REDISMODULE_NOTIFY_EXPIRED, KeySpace_NotificationModuleKeyMissExpired) != REDISMODULE_OK){
+        return REDISMODULE_ERR;
+    }
 
     if (RedisModule_CreateCommand(ctx,"test.call_generic", test_call_generic,"",0,0,0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
@@ -467,6 +652,8 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     if (RedisModule_CreateCommand(ctx,"test.randomkey", test_randomkey,"",0,0,0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
     if (RedisModule_CreateCommand(ctx,"test.keyexists", test_keyexists,"",1,1,1) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx,"test.keyinfo", test_keyinfo,"write",1,1,1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
     if (RedisModule_CreateCommand(ctx,"test.setlru", test_setlru,"",0,0,0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
@@ -496,6 +683,33 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     if (RedisModule_CreateCommand(ctx, "test.rm_call", test_rm_call,"allow-stale", 0, 0, 0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
     if (RedisModule_CreateCommand(ctx, "test.rm_call_flags", test_rm_call_flags,"allow-stale", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.rm_call_replicate", test_rm_call_replicate,"allow-stale", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.silent_open_key", test_open_key_no_effects,"", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.get_n_events", test_get_n_events,"", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.clear_n_events", test_clear_n_events,"", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.malloc_api", test_malloc_api,"", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.keyslot", test_keyslot, "", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.incompatible_cluster_cmd", only_reply_ok, "", 1, -1, 2) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.no_cluster_cmd", NULL, "no-cluster", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    RedisModuleCommand *parent = RedisModule_GetCommand(ctx, "test.no_cluster_cmd");
+    if (RedisModule_CreateSubcommand(parent, "set", only_reply_ok, "no-cluster", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.signalmodifiedkey", test_signalmodifiedkey, "write", 1, 1, 1) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.used_memory_ratio", test_used_memory_ratio, "", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.used_memory_ratio_estimate", test_used_memory_ratio_estimate, "", 0, 0, 0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    if (RedisModule_CreateCommand(ctx, "test.used_memory_ratio_estimate_bg", test_used_memory_ratio_estimate_bg, "", 0, 0, 0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
 
     return REDISMODULE_OK;

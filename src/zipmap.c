@@ -12,32 +12,12 @@
  *
  * --------------------------------------------------------------------------
  *
- * Copyright (c) 2009-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 /* Memory layout of a zipmap, for the map "foo" => "bar", "hello" => "world":
@@ -77,6 +57,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <assert.h>
 #include "zmalloc.h"
 #include "endianconv.h"
 
@@ -271,6 +252,7 @@ unsigned char *zipmapSet(unsigned char *zm, unsigned char *key, unsigned int kle
     /* Just write the key + value and we are done. */
     /* Key: */
     p += zipmapEncodeLength(p,klen);
+    assert(klen < freelen);
     memcpy(p,key,klen);
     p += klen;
     /* Value: */
@@ -405,6 +387,10 @@ int zipmapValidateIntegrity(unsigned char *zm, size_t size, int deep) {
 
         /* read the field name length */
         l = zipmapDecodeLength(p);
+        /* Sanity check: length < 254 must be encoded in 1 byte, not 5 bytes */
+        if (l < ZIPMAP_BIGLEN && s != 1)
+            return 0;
+
         p += s; /* skip the encoded field size */
         p += l; /* skip the field */
 
@@ -420,6 +406,9 @@ int zipmapValidateIntegrity(unsigned char *zm, size_t size, int deep) {
 
         /* read the value length */
         l = zipmapDecodeLength(p);
+        /* Sanity check: length < 254 must be encoded in 1 byte, not 5 bytes */
+        if (l < ZIPMAP_BIGLEN && s != 1)
+            return 0;
         p += s; /* skip the encoded value size*/
         e = *p++; /* skip the encoded free space (always encoded in one byte) */
         p += l+e; /* skip the value and free space */

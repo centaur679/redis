@@ -1,30 +1,10 @@
 /*
- * Copyright (c) 2009-2021, Redis Labs Ltd.
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 /* ----------------------------------------------------------------------------------------
@@ -35,7 +15,7 @@
  * callback represents a different reply type. Each callback gets a p_ctx that
  * was given to the parseReply function. The callbacks also give the protocol
  * (underlying blob) of the current reply and the size.
- *
+ *
  * Some callbacks also get the parser object itself:
  * - array_callback
  * - set_callback
@@ -55,12 +35,13 @@
  * ----------------------------------------------------------------------------------------
  */
 
+#include "fast_float_strtod.h"
 #include "resp_parser.h"
 #include "server.h"
 
 static int parseBulk(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     long long bulklen;
     parser->curr_location = p + 2; /* for \r\n */
 
@@ -79,7 +60,7 @@ static int parseBulk(ReplyParser *parser, void *p_ctx) {
 
 static int parseSimpleString(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     parser->curr_location = p + 2; /* for \r\n */
     parser->callbacks.simple_str_callback(p_ctx, proto+1, p-proto-1, proto, parser->curr_location - proto);
     return C_OK;
@@ -87,7 +68,7 @@ static int parseSimpleString(ReplyParser *parser, void *p_ctx) {
 
 static int parseError(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     parser->curr_location = p + 2; // for \r\n
     parser->callbacks.error_callback(p_ctx, proto+1, p-proto-1, proto, parser->curr_location - proto);
     return C_OK;
@@ -95,7 +76,7 @@ static int parseError(ReplyParser *parser, void *p_ctx) {
 
 static int parseLong(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     parser->curr_location = p + 2; /* for \r\n */
     long long val;
     string2ll(proto+1,p-proto-1,&val);
@@ -105,7 +86,7 @@ static int parseLong(ReplyParser *parser, void *p_ctx) {
 
 static int parseAttributes(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     long long len;
     string2ll(proto+1,p-proto-1,&len);
     p += 2;
@@ -116,7 +97,7 @@ static int parseAttributes(ReplyParser *parser, void *p_ctx) {
 
 static int parseVerbatimString(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     long long bulklen;
     parser->curr_location = p + 2; /* for \r\n */
     string2ll(proto+1,p-proto-1,&bulklen);
@@ -129,7 +110,7 @@ static int parseVerbatimString(ReplyParser *parser, void *p_ctx) {
 
 static int parseBigNumber(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     parser->curr_location = p + 2; /* for \r\n */
     parser->callbacks.big_number_callback(p_ctx, proto+1, p-proto-1, proto, parser->curr_location - proto);
     return C_OK;
@@ -137,7 +118,7 @@ static int parseBigNumber(ReplyParser *parser, void *p_ctx) {
 
 static int parseNull(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     parser->curr_location = p + 2; /* for \r\n */
     parser->callbacks.null_callback(p_ctx, proto, parser->curr_location - proto);
     return C_OK;
@@ -145,15 +126,12 @@ static int parseNull(ReplyParser *parser, void *p_ctx) {
 
 static int parseDouble(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     parser->curr_location = p + 2; /* for \r\n */
-    char buf[MAX_LONG_DOUBLE_CHARS+1];
     size_t len = p-proto-1;
     double d;
     if (len <= MAX_LONG_DOUBLE_CHARS) {
-        memcpy(buf,proto+1,len);
-        buf[len] = '\0';
-        d = strtod(buf,NULL); /* We expect a valid representation. */
+        d = fast_float_strtod(proto+1,len,NULL); /* We expect a valid representation. */
     } else {
         d = 0;
     }
@@ -163,7 +141,7 @@ static int parseDouble(ReplyParser *parser, void *p_ctx) {
 
 static int parseBool(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     parser->curr_location = p + 2; /* for \r\n */
     parser->callbacks.bool_callback(p_ctx, proto[1] == 't', proto, parser->curr_location - proto);
     return C_OK;
@@ -171,7 +149,7 @@ static int parseBool(ReplyParser *parser, void *p_ctx) {
 
 static int parseArray(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     long long len;
     string2ll(proto+1,p-proto-1,&len);
     p += 2;
@@ -186,7 +164,7 @@ static int parseArray(ReplyParser *parser, void *p_ctx) {
 
 static int parseSet(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     long long len;
     string2ll(proto+1,p-proto-1,&len);
     p += 2;
@@ -197,7 +175,7 @@ static int parseSet(ReplyParser *parser, void *p_ctx) {
 
 static int parseMap(ReplyParser *parser, void *p_ctx) {
     const char *proto = parser->curr_location;
-    char *p = strchr(proto+1,'\r');
+    const char *p = strchr(proto+1,'\r');
     long long len;
     string2ll(proto+1,p-proto-1,&len);
     p += 2;

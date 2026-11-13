@@ -1,4 +1,5 @@
-start_server {tags {"tracking network"}} {
+# logreqres:skip because it seems many of these tests rely heavily on RESP2
+start_server {tags {"tracking network logreqres:skip"}} {
     # Create a deferred client we'll use to redirect invalidation
     # messages to.
     set rd_redirection [redis_deferring_client]
@@ -229,22 +230,25 @@ start_server {tags {"tracking network"}} {
         # If a script doesn't call any read command, don't track any keys
         r EVAL "redis.call('set', 'key3{t}', 'bar')" 2 key1{t} key2{t} 
         $rd_sg MSET key2{t} 2 key1{t} 2
+        assert_equal "PONG" [r ping]
 
-        # If a script calls a read command, track all declared keys
-        r EVAL "redis.call('get', 'key3{t}')" 2 key1{t} key2{t} 
-        $rd_sg MSET key2{t} 2 key1{t} 2
+        # If a script calls a read command, just the read keys
+        r EVAL "redis.call('get', 'key2{t}')" 2 key1{t} key2{t}
+        $rd_sg MSET key2{t} 2 key3{t} 2
         assert_equal {invalidate key2{t}} [r read]
-        assert_equal {invalidate key1{t}} [r read]
+        assert_equal "PONG" [r ping]
 
         # RO variants work like the normal variants
-        r EVAL_RO "redis.call('ping')" 2 key1{t} key2{t} 
+
+        # If a RO script doesn't call any read command, don't track any keys
+        r EVAL_RO "redis.call('ping')" 2 key1{t} key2{t}
         $rd_sg MSET key2{t} 2 key1{t} 2
+        assert_equal "PONG" [r ping]
 
-        r EVAL_RO "redis.call('get', 'key1{t}')" 2 key1{t} key2{t} 
-        $rd_sg MSET key2{t} 3 key1{t} 3
+        # If a RO script calls a read command, just the read keys
+        r EVAL_RO "redis.call('get', 'key2{t}')" 2 key1{t} key2{t}
+        $rd_sg MSET key2{t} 2 key3{t} 2
         assert_equal {invalidate key2{t}} [r read]
-        assert_equal {invalidate key1{t}} [r read]
-
         assert_equal "PONG" [r ping]
     }
 
@@ -407,6 +411,18 @@ start_server {tags {"tracking network"}} {
         assert_match {ERR Prefix 'BARB'*'BAR'*} $output
 
         $r CLIENT TRACKING OFF
+    }
+
+    test {BCAST prefix self-overlap past first index reports error without enabling} {
+        # When any of the provided BCAST prefixes overlap with each other,
+        # CLIENT TRACKING ON must reply with a single error and leave tracking
+        # disabled, regardless of the position of the overlapping prefix in
+        # the argument list.
+        r CLIENT TRACKING OFF
+        catch {r CLIENT TRACKING ON BCAST PREFIX BAZ PREFIX FOOBAR PREFIX FOO} output
+        assert_match {ERR Prefix 'FOOBAR' overlaps with another provided prefix 'FOO'*} $output
+        # Tracking must not have been enabled after the overlap error.
+        assert_match {*flags off*} [r CLIENT TRACKINGINFO]
     }
 
     test {hdel deliver invalidate message after response in the same connection} {
@@ -739,6 +755,313 @@ start_server {tags {"tracking network"}} {
         assert_equal {} $prefixes
     }
 
+    test {Regression test for #11715} {
+        # This issue manifests when a client invalidates keys through the max key
+        # limit, which invalidates keys to get Redis below the limit, but no command is
+        # then executed. This can occur in several ways but the simplest is through 
+        # multi-exec which queues commands.
+        clean_all
+        r config set tracking-table-max-keys 2
+
+        # The cron will invalidate keys if we're above the limit, so disable it.
+        r debug pause-cron 1
+
+        # Set up a client that has listened to 2 keys and start a multi, this
+        # sets up the crash for later.
+        $rd HELLO 3
+        $rd read
+        $rd CLIENT TRACKING on
+        assert_match "OK" [$rd read]
+        $rd mget "1{tag}" "2{tag}"
+        assert_match "{} {}" [$rd read]
+        $rd multi
+        assert_match "OK" [$rd read]
+
+        # Reduce the tracking table keys to 1, this doesn't immediately take affect, but
+        # instead will apply on the next command.
+        r config set tracking-table-max-keys 1
+
+        # This command will get queued, so make sure this command doesn't crash.
+        $rd ping
+        $rd exec
+
+        # Validate we got some invalidation message and then the command was queued.
+        assert_match "invalidate *{tag}" [$rd read]
+        assert_match "QUEUED" [$rd read]
+        assert_match "PONG" [$rd read]
+
+        r debug pause-cron 0
+    } {OK} {needs:debug}
+
+    foreach resp {3 2} {
+        test "RESP$resp based basic invalidation with client reply off" {
+            # This entire test is mostly irrelevant for RESP2, but we run it anyway just for some extra coverage.
+            clean_all
+
+            $rd hello $resp
+            $rd read
+            $rd client tracking on
+            $rd read
+
+            $rd_sg set foo bar
+            $rd get foo
+            $rd read
+
+            $rd client reply off
+
+            $rd_sg set foo bar2
+
+            if {$resp == 3} {
+                assert_equal {invalidate foo} [$rd read]
+            } elseif {$resp == 2} { } ;# Just coverage
+
+            # Verify things didn't get messed up and no unexpected reply was pushed to the client.
+            $rd client reply on
+            assert_equal {OK} [$rd read]
+            $rd ping
+            assert_equal {PONG} [$rd read]
+        }
+    }
+
+    test {RESP3 based basic redirect invalidation with client reply off} {
+        clean_all
+
+        set rd_redir [redis_deferring_client]
+        $rd_redir hello 3
+        $rd_redir read
+
+        $rd_redir client id
+        set rd_redir_id [$rd_redir read]
+
+        $rd client tracking on redirect $rd_redir_id
+        $rd read
+
+        $rd_sg set foo bar
+        $rd get foo
+        $rd read
+
+        $rd_redir client reply off
+
+        $rd_sg set foo bar2
+        assert_equal {invalidate foo} [$rd_redir read]
+
+        # Verify things didn't get messed up and no unexpected reply was pushed to the client.
+        $rd_redir client reply on
+        assert_equal {OK} [$rd_redir read]
+        $rd_redir ping
+        assert_equal {PONG} [$rd_redir read]
+
+        $rd_redir close
+    }
+
+    test {RESP3 based basic tracking-redir-broken with client reply off} {
+        clean_all
+
+        $rd hello 3
+        $rd read
+        $rd client tracking on redirect $redir_id
+        $rd read
+
+        $rd_sg set foo bar
+        $rd get foo
+        $rd read
+
+        $rd client reply off
+
+        $rd_redirection quit
+        $rd_redirection read
+
+        $rd_sg set foo bar2
+
+        set res [lsearch -exact [$rd read] "tracking-redir-broken"]
+        assert_morethan_equal $res 0
+
+        # Verify things didn't get messed up and no unexpected reply was pushed to the client.
+        $rd client reply on
+        assert_equal {OK} [$rd read]
+        $rd ping
+        assert_equal {PONG} [$rd read]
+    }
+
+    # Intentionally use two clients authenticated as the same ACL user.
+    # This exercises reuse of the cached filtered BCAST reply for that user,
+    # while verifying both subscribers receive only keys allowed by the ACL.
+    test {BCAST ACL filtering - two clients same user see only permitted keys} {
+        clean_all
+
+        r ACL SETUSER shareduser on >pass123 ~public:* +@all
+        set c1 [redis_deferring_client]
+        set c2 [redis_deferring_client]
+
+        $c1 AUTH shareduser pass123
+        $c1 read
+
+        $c2 AUTH shareduser pass123
+        $c2 read
+
+        $c1 HELLO 3
+        $c1 read
+        $c2 HELLO 3
+        $c2 read
+
+        $c1 CLIENT TRACKING on BCAST PREFIX public: PREFIX admin:
+        assert_match {*OK*} [$c1 read]
+        $c2 CLIENT TRACKING on BCAST PREFIX public: PREFIX admin:
+        assert_match {*OK*} [$c2 read]
+
+        $rd_sg MSET public:a{t} 1 admin:b{t} 2
+
+        assert_equal [$c1 read] [list invalidate [list public:a{t}]]
+        assert_equal [$c2 read] [list invalidate [list public:a{t}]]
+
+        $c1 CLIENT TRACKING off
+        $c1 read
+        $c2 CLIENT TRACKING off
+        $c2 read
+        $c1 close
+        $c2 close
+        r ACL DELUSER shareduser
+    }
+
+    test {BCAST ACL filtering uses new user after re-AUTH} {
+        clean_all
+
+        r ACL SETUSER usr_a on >passA ~a:* +@all
+        r ACL SETUSER usr_b on >passB ~b:* +@all
+
+        set tc [redis_deferring_client]
+        $tc AUTH usr_a passA
+        $tc read
+
+        $tc HELLO 3
+        $tc read
+
+        $tc CLIENT TRACKING on BCAST PREFIX a: PREFIX b:
+        assert_match {*OK*} [$tc read]
+
+        # Write keys matching both prefixes.
+        $rd_sg SET a:1{t} val1
+        $rd_sg SET b:1{t} val1
+
+        # Under usr_a only a:* is visible; b:1 is filtered out, so the client
+        # receives a single invalidation for a:1.
+        assert_equal [$tc read] [list invalidate [list a:1{t}]]
+
+        # Re-AUTH as usr_b.
+        $tc AUTH usr_b passB
+        $tc read
+
+        # Write again.
+        $rd_sg SET a:2{t} val2
+        $rd_sg SET b:2{t} val2
+
+        # Now only b:* is visible; a:2 is filtered out.
+        assert_equal [$tc read] [list invalidate [list b:2{t}]]
+
+        $tc CLIENT TRACKING off
+        $tc read
+        $tc close
+        r ACL DELUSER usr_a
+        r ACL DELUSER usr_b
+    }
+
+    test {BCAST in-place ACL SETUSER flushes pending invalidations under old perms} {
+        clean_all
+
+        r ACL SETUSER setu on >setpass ~p:* +@all
+        set tc [redis_deferring_client]
+        $tc AUTH setu setpass
+        $tc read
+
+        $tc HELLO 3
+        $tc read
+
+        $tc CLIENT TRACKING on BCAST PREFIX p:
+        assert_match {*OK*} [$tc read]
+
+        # Modify a key the user can currently read AND revoke that access in
+        # the same event-loop iteration (MULTI/EXEC), so the invalidation is
+        # still pending when the user's permissions are overwritten in place.
+        # Without flushing under the old identity, the pending key would be
+        # re-filtered by the new (stricter) perms in beforeSleep and dropped.
+        $rd_sg MULTI
+        $rd_sg SET p:x{t} 1
+        $rd_sg ACL SETUSER setu resetkeys ~q:*
+        $rd_sg EXEC
+
+        assert_equal [$tc read] [list invalidate [list p:x{t}]]
+
+        $tc CLIENT TRACKING off
+        $tc read
+        $tc close
+        r ACL DELUSER setu
+    }
+
     $rd_redirection close
+    $rd_sg close
     $rd close
+}
+
+# Just some extra coverage for --log-req-res, because we do not
+# run the full tracking unit in that mode
+start_server {tags {"tracking network"}} {
+    test {Coverage: Basic CLIENT CACHING} {
+        set rd_redirection [redis_deferring_client]
+        $rd_redirection client id
+        set redir_id [$rd_redirection read]
+        assert_equal {OK} [r CLIENT TRACKING on OPTIN REDIRECT $redir_id]
+        assert_equal {OK} [r CLIENT CACHING yes]
+        r CLIENT TRACKING off
+    } {OK}
+
+    test {Coverage: Basic CLIENT REPLY} {
+        r CLIENT REPLY on
+    } {OK}
+
+    test {Coverage: Basic CLIENT TRACKINGINFO} {
+        r CLIENT TRACKINGINFO
+    } {flags off redirect -1 prefixes {}}
+
+    test {Coverage: Basic CLIENT GETREDIR} {
+        r CLIENT GETREDIR
+    } {-1}
+}
+
+# ACL LOAD rewrites the default user in place, so a default-user BCAST client
+# must still get invalidations accumulated under the pre-load permissions.
+set server_path [tmpdir "tracking.acl"]
+set fd [open $server_path/tracking.acl w]
+puts $fd "user default on nopass ~p:* &* +@all"
+close $fd
+start_server [list overrides [list "dir" $server_path "aclfile" "tracking.acl"] tags [list "tracking" "network" "logreqres:skip" "external:skip"]] {
+    test {BCAST ACL LOAD on default user flushes pending invalidations under old perms} {
+        set tc [redis_deferring_client]
+        $tc HELLO 3
+        $tc read
+
+        $tc CLIENT TRACKING on BCAST PREFIX p:
+        assert_match {*OK*} [$tc read]
+
+        # Rewrite the ACL file so the next ACL LOAD revokes default's access
+        # to p:* keys.
+        set fd [open $server_path/tracking.acl w]
+        puts $fd "user default on nopass ~q:* &* +@all"
+        close $fd
+
+        # Modify a p:* key and reload the (now restrictive) ACL in the same
+        # event-loop iteration, so the invalidation is still pending when the
+        # default user is overwritten in place. Without flushing under the old
+        # identity, the pending key would be re-filtered by the new perms in
+        # beforeSleep and dropped.
+        r MULTI
+        r SET p:x{t} 1
+        r ACL LOAD
+        r EXEC
+
+        assert_equal [$tc read] [list invalidate [list p:x{t}]]
+
+        $tc CLIENT TRACKING off
+        $tc read
+        $tc close
+    }
 }

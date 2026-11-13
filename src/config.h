@@ -1,34 +1,16 @@
 /*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #ifndef __CONFIG_H
 #define __CONFIG_H
+
+#include <sys/param.h>
 
 #ifdef __APPLE__
 #include <fcntl.h> // for fcntl(fd, F_FULLFSYNC)
@@ -40,13 +22,25 @@
 #include <fcntl.h>
 #endif
 
+#if defined(__APPLE__) && defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
+#define MAC_OS_10_6_DETECTED
+#endif
+
 /* Define redis_fstat to fstat or fstat64() */
-#if defined(__APPLE__) && !defined(MAC_OS_X_VERSION_10_6)
+#if defined(__APPLE__) && !defined(MAC_OS_10_6_DETECTED)
 #define redis_fstat fstat64
 #define redis_stat stat64
 #else
 #define redis_fstat fstat
 #define redis_stat stat
+#endif
+
+#ifndef CACHE_LINE_SIZE
+#if defined(__aarch64__) && defined(__APPLE__)
+#define CACHE_LINE_SIZE 128
+#else
+#define CACHE_LINE_SIZE 64
+#endif
 #endif
 
 /* Test for proc filesystem */
@@ -56,6 +50,7 @@
 #define HAVE_PROC_SMAPS 1
 #define HAVE_PROC_SOMAXCONN 1
 #define HAVE_PROC_OOM_SCORE_ADJ 1
+#define HAVE_EVENT_FD 1
 #endif
 
 /* Test for task_info() */
@@ -77,6 +72,11 @@
 #define HAVE_BACKTRACE 1
 #endif
 
+/* Linux only: timer_create, and the stack collector this bounds, are both Linux-only. */
+#ifdef __linux__
+#define HAVE_CRASH_WATCHDOG 1
+#endif
+
 /* MSG_NOSIGNAL. */
 #ifdef __linux__
 #define HAVE_MSG_NOSIGNAL 1
@@ -92,11 +92,25 @@
 #endif
 
 /* Test for accept4() */
-#ifdef __linux__
+#if defined(__linux__) || (defined(OpenBSD) && OpenBSD >= 201505) || \
+    defined(__FreeBSD__) || \
+    (defined(__NetBSD_Version__) && __NetBSD_Version__ >= 800000000) || \
+    (defined(__DragonFly__) && __DragonFly_version >= 400305)
 #define HAVE_ACCEPT4 1
 #endif
 
-#if (defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6)) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined (__NetBSD__)
+/* Detect for pipe2() */
+#if defined(__linux__) || \
+    defined(__FreeBSD__) || \
+    (defined(__OpenBSD__) && OpenBSD >= 201505) || \
+    (defined(__DragonFly_version) && __DragonFly_version >= 400106) || \
+    (defined(__NetBSD_Version__) && __NetBSD_Version__ >= 600000000)
+#define HAVE_PIPE2 1
+#endif
+
+/* Detect for kqueue */
+#if (defined(__APPLE__) && defined(MAC_OS_10_6_DETECTED)) || defined(__FreeBSD__) || \
+    defined(__OpenBSD__) || defined (__NetBSD__) || defined(__DragonFly__)
 #define HAVE_KQUEUE 1
 #endif
 
@@ -106,6 +120,25 @@
 #define HAVE_EVPORT 1
 #define HAVE_PSINFO 1
 #endif
+#endif
+
+/* Test for __builtin_prefetch()
+ * Supported in LLVM since 2.9: https://releases.llvm.org/2.9/docs/ReleaseNotes.html
+ * Supported in GCC since 3.1 but we use 4.8 given it's too old: https://gcc.gnu.org/gcc-3.1/changes.html. */
+#if defined(__clang__) && (__clang_major__ > 2 || (__clang_major__ == 2 && __clang_minor__ >= 9))
+#define HAS_BUILTIN_PREFETCH 1
+#elif defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 8))
+#define HAS_BUILTIN_PREFETCH 1
+#else
+#define HAS_BUILTIN_PREFETCH 0
+#endif
+
+#if HAS_BUILTIN_PREFETCH
+#define redis_prefetch_read(addr) __builtin_prefetch(addr, 0, 3)  /* Read with high locality */
+#define redis_prefetch_write(addr) __builtin_prefetch(addr, 1, 3) /* Write with high locality */
+#else
+#define redis_prefetch_read(addr) ((void)(addr))  /* No-op if unsupported */
+#define redis_prefetch_write(addr) ((void)(addr)) /* No-op if unsupported */
 #endif
 
 /* Define redis_fsync to fdatasync() in Linux and fsync() for all the rest */
@@ -131,7 +164,7 @@
 #endif
 #endif
 
-#if __GNUC__ >= 4
+#if __GNUC__ >= 5 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 5)
 #define redis_unreachable __builtin_unreachable
 #else
 #define redis_unreachable abort
@@ -152,6 +185,12 @@
 #endif
 #if !defined(REDIS_NO_SANITIZE)
 #define REDIS_NO_SANITIZE(sanitizer)
+#endif
+
+#if defined(__clang__)
+#define REDIS_NO_SANITIZE_MSAN(sanitizer) REDIS_NO_SANITIZE(sanitizer)
+#else
+#define REDIS_NO_SANITIZE_MSAN(sanitizer)
 #endif
 
 /* Define rdb_fsync_range to sync_file_range() on Linux, otherwise we use
@@ -293,7 +332,7 @@ void setproctitle(const char *fmt, ...);
 #include <kernel/OS.h>
 #define redis_set_thread_title(name) rename_thread(find_thread(0), name)
 #else
-#if (defined __APPLE__ && defined(MAC_OS_X_VERSION_10_7))
+#if (defined __APPLE__ && defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 1070)
 int pthread_setname_np(const char *name);
 #include <pthread.h>
 #define redis_set_thread_title(name) pthread_setname_np(name)
@@ -309,14 +348,53 @@ int pthread_setname_np(const char *name);
 void setcpuaffinity(const char *cpulist);
 #endif
 
-/* deprecate unsafe functions
- *
- * NOTE: We do not use the poison pragma since it
- * will error on stdlib definitions in files as well*/
-#if (__GNUC__ && __GNUC__ >= 4) && !defined __APPLE__
-int sprintf(char *str, const char *format, ...) __attribute__((deprecated("please avoid use of unsafe C functions. prefer use of snprintf instead")));
-char *strcpy(char *restrict dest, const char *src) __attribute__((deprecated("please avoid use of unsafe C functions. prefer use of redis_strlcpy instead")));
-char *strcat(char *restrict dest, const char *restrict src) __attribute__((deprecated("please avoid use of unsafe C functions. prefer use of redis_strlcat instead")));
+/* Test for posix_fadvise() */
+#if defined(__linux__) || defined(__FreeBSD__)
+#define HAVE_FADVISE
+#endif
+
+#if defined(__x86_64__) && ((defined(__GNUC__) && __GNUC__ > 5) || (defined(__clang__)))
+    #if defined(__has_attribute) && __has_attribute(target)
+        #define HAVE_POPCNT
+        #define ATTRIBUTE_TARGET_POPCNT __attribute__((target("popcnt")))
+    #else
+        #define ATTRIBUTE_TARGET_POPCNT
+    #endif
+#else
+    #define ATTRIBUTE_TARGET_POPCNT
+#endif
+
+/* Check if we can compile AVX2 code */
+#if defined (__x86_64__) && ((defined(__GNUC__) && __GNUC__ >= 5) || (defined(__clang__) && __clang_major__ >= 4))
+#if defined(__has_attribute) && __has_attribute(target)
+#define HAVE_AVX2
+#define ATTRIBUTE_TARGET_AVX2 __attribute__((target("avx2")))
+#define ATTRIBUTE_TARGET_AVX2_POPCOUNT __attribute__((target("avx2,popcnt")))
+#endif
+#endif
+
+/* Check if we can compile AVX512 code */
+#if defined (__x86_64__) && ((defined(__GNUC__) && __GNUC__ >= 5) || (defined(__clang__) && __clang_major__ >= 4))
+#if defined(__has_attribute) && __has_attribute(target)
+#define HAVE_AVX512
+#define ATTRIBUTE_TARGET_AVX512 __attribute__((target("avx512f")))
+#define ATTRIBUTE_TARGET_AVX512_POPCOUNT __attribute__((target("avx512f,avx512vpopcntdq")))
+#endif
+#endif
+
+/* Check if we can compile PCLMULQDQ (carry-less multiply) code */
+#if defined (__x86_64__) && ((defined(__GNUC__) && __GNUC__ >= 5) || (defined(__clang__) && __clang_major__ >= 4))
+#if defined(__has_attribute) && __has_attribute(target)
+#define HAVE_PCLMUL
+#define ATTRIBUTE_TARGET_PCLMUL __attribute__((target("pclmul")))
+#endif
+#endif
+
+/* Check for AArch64 (ARM v8) specific optimizations */
+#if defined(__aarch64__) && ((defined(__GNUC__) && __GNUC__ >= 5) || defined(__clang__))
+#if defined(__has_attribute) && __has_attribute(target)
+#define HAVE_AARCH64_NEON
+#endif
 #endif
 
 #endif

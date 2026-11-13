@@ -47,6 +47,15 @@ start_server {tags {"acl external:skip"}} {
         catch {r ACL SETUSER selector-syntax on (&* &fail)} e
         assert_match "*ERR Error in ACL SETUSER modifier '(*)*Adding a pattern after the*" $e
 
+        catch {r ACL SETUSER selector-syntax on (+PING (+SELECT (+DEL} e
+        assert_match "*ERR Unmatched parenthesis in acl selector*" $e
+
+        catch {r ACL SETUSER selector-syntax on (+PING (+SELECT (+DEL ) ) ) } e
+        assert_match "*ERR Error in ACL SETUSER modifier*" $e
+
+        catch {r ACL SETUSER selector-syntax on (+PING (+SELECT (+DEL ) } e
+        assert_match "*ERR Error in ACL SETUSER modifier*" $e
+
         assert_equal "" [r ACL GETUSER selector-syntax]
     }
 
@@ -106,6 +115,32 @@ start_server {tags {"acl external:skip"}} {
         catch {$r2 copy write read} err
         assert_match "*NOPERM*key*" $err
     }
+
+    test {Validate read and write permissions format - empty permission} {
+        catch {r ACL SETUSER key-permission-RW %~} err
+        set err
+    } {ERR Error in ACL SETUSER modifier '%~': Syntax error}
+
+    test {Validate read and write permissions format - empty selector} {
+        catch {r ACL SETUSER key-permission-RW %} err
+        set err
+    } {ERR Error in ACL SETUSER modifier '%': Syntax error}
+
+    test {Validate read and write permissions format - empty pattern} {
+        # Empty pattern results with R/W access to no key
+        r ACL SETUSER key-permission-RW on nopass %RW~ +@all
+        $r2 auth key-permission-RW password
+        catch {$r2 SET x 5} err
+        set err
+    } {NOPERM No permissions to access a key}
+
+    test {Validate read and write permissions format - no pattern} {
+        # No pattern results with R/W access to no key (currently we accept this syntax error)
+        r ACL SETUSER key-permission-RW on nopass %RW +@all
+        $r2 auth key-permission-RW password
+        catch {$r2 SET x 5} err
+        set err
+    } {NOPERM No permissions to access a key}
 
     test {Test separate read and write permissions on different selectors are not additive} {
         r ACL SETUSER key-permission-RW-selector on nopass "(%R~read* +@all)" "(%W~write* +@all)"
@@ -360,6 +395,55 @@ start_server {tags {"acl external:skip"}} {
         assert_equal "OK" [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M]
         assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUS read1 longitude latitude radius M STORE read2]
         assert_match {*has no permissions to access the 'write1' key*} [r ACL DRYRUN command-test GEORADIUS write1 longitude latitude radius M STORE write2]
+    }
+
+    test {Test GEORADIUS duplicate STORE is checked against the last key} {
+        r ACL setuser command-test +@all %R~read* %W~write* %RW~rw*
+
+        # Duplicate STORE/STOREDIST uses last-wins semantics (same as
+        # georadiusGeneric), so ACL must validate the last key. Otherwise a
+        # permitted first key would mask a forbidden second key.
+        assert_equal "OK" [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M STORE read1 STORE write2]
+        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M STORE write1 STORE read2]
+        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M STOREDIST write1 STOREDIST read2]
+
+        assert_equal "OK" [r ACL DRYRUN command-test GEORADIUSBYMEMBER read member radius M STORE read1 STORE write2]
+        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUSBYMEMBER read member radius M STORE write1 STORE read2]
+        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUSBYMEMBER read member radius M STOREDIST write1 STOREDIST read2]
+    }
+
+    test {Test SORT duplicate STORE is checked against the last key} {
+        r ACL setuser command-test +@all %R~read* %W~write* %RW~rw*
+
+        # Duplicate STORE uses last-wins semantics, so ACL must validate the
+        # last key. The earlier STORE argument can look like an option keyword
+        # (BY/GET/LIMIT) and must be skipped so a permitted first key doesn't
+        # mask a forbidden last key.
+        assert_equal "OK" [r ACL DRYRUN command-test SORT read STORE by STORE write2]
+        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test SORT read STORE by STORE read2]
+        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test SORT read STORE get STORE read2]
+        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test SORT read STORE limit STORE read2]
+    }
+
+    test {Test XREADGROUP STREAMS keyword is not confused with the consumer name} {
+        r ACL setuser command-test +@all %R~read* %W~write* %RW~rw*
+
+        # A consumer literally named "STREAMS" must not be mistaken for the
+        # STREAMS option, otherwise ACL validates the wrong argument.
+        assert_equal "OK" [r ACL DRYRUN command-test XREADGROUP NOACK GROUP g STREAMS STREAMS read2 >]
+        assert_match {*has no permissions to access the 'write2' key*} [r ACL DRYRUN command-test XREADGROUP NOACK GROUP g STREAMS STREAMS write2 >]
+        assert_match {*has no permissions to access the 'write2' key*} [r ACL DRYRUN command-test XREADGROUP COUNT 1 GROUP g STREAMS STREAMS write2 >]
+
+        # Options carrying an argument must be skipped when locating STREAMS.
+        assert_match {*has no permissions to access the 'write2' key*} [r ACL DRYRUN command-test XREADGROUP GROUP g consumer MAXCOUNT 10 STREAMS write2 >]
+        assert_match {*has no permissions to access the 'write2' key*} [r ACL DRYRUN command-test XREADGROUP GROUP g consumer CLAIM 100 STREAMS write2 >]
+        assert_match {*has no permissions to access the 'write2' key*} [r ACL DRYRUN command-test XREAD MAXSIZE 5 STREAMS write2 $]
+        assert_match {*has no permissions to access the 'write2' key*} [r ACL DRYRUN command-test XREAD MAXCOUNT 5 STREAMS write2 $]
+        assert_equal "OK" [r ACL DRYRUN command-test XREADGROUP GROUP g consumer MAXCOUNT 10 STREAMS read2 >]
+
+        # Sanity: a normal consumer name still validates the real stream key.
+        assert_equal "OK" [r ACL DRYRUN command-test XREADGROUP GROUP g consumer STREAMS read2 >]
+        assert_match {*has no permissions to access the 'write2' key*} [r ACL DRYRUN command-test XREADGROUP GROUP g consumer STREAMS write2 >]
     }
 
     # Existence test commands are not marked as access since they are the result

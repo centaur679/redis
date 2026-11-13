@@ -12,11 +12,12 @@ proc verify_list_edit_reply {reply argv} {
     }
 }
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
 
     test {Module list set, get, insert, delete} {
         r del k
+        assert_error {WRONGTYPE Operation against a key holding the wrong kind of value*} {r list.set k 1 xyz}
         r rpush k x
         # insert, set, get
         r list.insert k 0 foo
@@ -76,6 +77,41 @@ start_server {tags {"modules"}} {
         r list.getall k
     } {bar y foo}
 
+    test {Module list - encoding conversion while inserting} {
+        r config set list-max-listpack-size 4
+        r del k
+        r rpush k a b c d
+        assert_encoding listpack k
+
+        # Converts to quicklist after inserting.
+        r list.edit k dii foo bar
+        assert_encoding quicklist k
+        assert_equal [r list.getall k] {foo bar b c d}
+
+        # Converts to listpack after deleting three entries.
+        r list.edit k ddd e
+        assert_encoding listpack k
+        assert_equal [r list.getall k] {c d}
+    }
+
+    test {Module list - encoding conversion while replacing} {
+        r config set list-max-listpack-size -1
+        r del k
+        r rpush k x y z
+        assert_encoding listpack k
+
+        # Converts to quicklist after replacing.
+        set big [string repeat "x" 4096]
+        r list.edit k r $big
+        assert_encoding quicklist k
+        assert_equal [r list.getall k] "$big y z"
+
+        # Converts to listpack after deleting the big entry.
+        r list.edit k d
+        assert_encoding listpack k
+        assert_equal [r list.getall k] {y z}
+    }
+
     test {Module list - list entry and index should be updated when deletion} {
         set original_config [config_get_set list-max-listpack-size 1]
 
@@ -118,7 +154,101 @@ start_server {tags {"modules"}} {
         config_set list-max-listpack-size $original_config
     }
 
+    test {Module list push to an existing list wakes BLMOVEM EXACTLY} {
+        r del src dst
+        r rpush src 1
+        set rd [redis_deferring_client]
+        $rd blmovem src dst left right 0 exactly 3 bulk
+        wait_for_blocked_clients_count 1
+        r list.insert src -1 2   ;# RM_ListPush to the tail -> 1 2
+        r list.insert src 0 0    ;# RM_ListPush to the head -> 0 1 2
+        wait_for_blocked_clients_count 0
+        assert_equal {0 1 2} [$rd read]
+        assert_equal {0 1 2} [r lrange dst 0 -1]
+        assert_equal 0 [r exists src]
+        $rd close
+    }
+
+    test {Module list insert in the middle of a list wakes BLMOVEM EXACTLY} {
+        r del src dst
+        r rpush src 1 3
+        set rd [redis_deferring_client]
+        $rd blmovem src dst left right 0 exactly 3 bulk
+        wait_for_blocked_clients_count 1
+        r list.insert src 1 2    ;# listTypeInsert -> 1 2 3
+        wait_for_blocked_clients_count 0
+        assert_equal {1 2 3} [$rd read]
+        assert_equal {1 2 3} [r lrange dst 0 -1]
+        assert_equal 0 [r exists src]
+        $rd close
+    }
+
+    test {Module list - KEYSIZES is updated as expected} {
+        proc run_cmd_verify_hist {cmd expOutput {retries 1}} {
+            proc K {} {return [string map { "db0_distrib_lists_items" "db0_LIST" "# Keysizes" "" " " "" "\n" "" "\r" "" } [r info keysizes] ]}
+            uplevel 1 $cmd    
+            wait_for_condition 50 $retries {
+                $expOutput eq [K]
+            } else { fail "Expected: \n`$expOutput`\n Actual:\n`[K]`.\nFailed after command: $cmd" }
+        }
+
+        r select 0
+
+        # RedisModule_ListPush & RedisModule_ListDelete
+        run_cmd_verify_hist {r flushall} {}
+        run_cmd_verify_hist {r list.insert L1 0 foo} {db0_LIST:1=1}
+        run_cmd_verify_hist {r list.insert L1 0 bla} {db0_LIST:2=1}
+        run_cmd_verify_hist {r list.delete L1 0} {db0_LIST:1=1}
+        run_cmd_verify_hist {r list.delete L1 0} {}
+        
+
+        # RedisModule_ListSet & RedisModule_ListDelete
+        run_cmd_verify_hist {r list.insert L1 0 foo} {db0_LIST:1=1}
+        run_cmd_verify_hist {r list.set L1 0 bar} {db0_LIST:1=1}
+        run_cmd_verify_hist {r list.set L1 0 baz} {db0_LIST:1=1}
+        run_cmd_verify_hist {r list.delete L1 0} {}
+
+        # Check lazy expire
+        r debug set-active-expire 0
+        run_cmd_verify_hist {r list.insert L1 0 foo} {db0_LIST:1=1}
+        run_cmd_verify_hist {r pexpire L1 1} {db0_LIST:1=1}
+        run_cmd_verify_hist {after 5} {db0_LIST:1=1}        
+        r debug set-active-expire 1
+        run_cmd_verify_hist {after 5} {} 50
+    }
+    
     test "Unload the module - list" {
         assert_equal {OK} [r module unload list]
+    }
+}
+
+# A basic test that exercises a module's list commands under cluster mode.
+# Currently, many module commands are never run even once in a clustered setup.
+# This test helps ensure that basic module functionality works correctly and that
+# the KEYSIZES histogram remains accurate and that insert & delete was tested.
+set testmodule [file normalize tests/modules/list.so]
+set modules [list loadmodule $testmodule]
+start_cluster 2 2 [list tags {external:skip cluster modules} config_lines [list loadmodule $testmodule enable-debug-command yes]] {
+    test "Module list - KEYSIZES is updated correctly in cluster mode" {
+        for {set srvid -2} {$srvid <= 0} {incr srvid} {
+            set instance [srv $srvid client]
+            # Assert consistency after each command
+            $instance DEBUG KEYSIZES-HIST-ASSERT 1
+    
+            for {set i 0} {$i < 50} {incr i} {
+                for {set j 0} {$j < 4} {incr j} {
+                    catch {$instance list.insert "list:$i" $j "item:$j"} e
+                    if {![string match "OK" $e]} {assert_match "*MOVED*" $e}
+                }
+            }
+            for {set i 0} {$i < 50} {incr i} {
+                for {set j 0} {$j < 4} {incr j} {
+                    catch {$instance list.delete "list:$i" 0} e
+                    if {![string match "OK" $e]} {assert_match "*MOVED*" $e}
+                }
+            }
+            # Verify also that instance is responsive and didn't crash on assert
+            assert_equal [$instance dbsize] 0
+        }
     }
 }

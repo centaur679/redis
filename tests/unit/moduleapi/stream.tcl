@@ -1,7 +1,9 @@
 set testmodule [file normalize tests/modules/stream.so]
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
+    # Also cover the INFO Streams bookkeeping: the module stream API.
+    arm_stream_stats_assert
 
     test {Module stream add and delete} {
         r del mystream
@@ -60,6 +62,23 @@ start_server {tags {"modules"}} {
         set result [r stream.addn mystream $n field value]
         assert_equal $result $n
     }
+
+    test {Module stream XADD big fields doesn't create empty key} {
+        set original_proto [config_get_set proto-max-bulk-len 2147483647] ;#2gb
+        set original_query [config_get_set client-query-buffer-limit 2147483647] ;#2gb
+
+        r del mystream
+        r write "*4\r\n\$10\r\nstream.add\r\n\$8\r\nmystream\r\n\$5\r\nfield\r\n"
+        catch {
+            write_big_bulk 1073741824 ;#1gb
+        } err
+        assert {$err eq "ERR StreamAdd failed"}
+        assert_equal 0 [r exists mystream]
+
+        # restore defaults
+        r config set proto-max-bulk-len $original_proto
+        r config set client-query-buffer-limit $original_query
+    } {OK} {large-memory}
 
     test {Module stream iterator} {
         r del mystream
@@ -152,6 +171,30 @@ start_server {tags {"modules"}} {
         assert_equal 100   [r stream.trim mystream minid ~ +]
         assert_equal 0     [r xlen mystream]
     }
+
+    # Regression: the module stream API (RM_StreamAdd / RM_StreamDelete /
+    # RM_StreamIteratorDelete / RM_StreamTrimBy*) must keep the keysizes entries
+    # histogram in sync, exactly like the XADD/XDEL/XTRIM command handlers. With
+    # DEBUG KEYSIZES-HIST-ASSERT enabled, the server validates the histogram
+    # against the keyspace after every command and panics on any mismatch.
+    test {Module stream API keeps the keysizes histogram consistent} {
+        r DEBUG KEYSIZES-HIST-ASSERT 1
+        r del mystream
+        # RM_StreamAdd (single and bulk)
+        r stream.add mystream item 1 value a
+        set id [r stream.add mystream item 2 value b]
+        r stream.addn mystream 50 field value
+        # RM_StreamDelete
+        r stream.delete mystream $id
+        # RM_StreamIteratorDelete (stream.range deletes the "selfdestruct" entry)
+        r xadd mystream * selfdestruct yes
+        r stream.range mystream - +
+        # RM_StreamTrimByLength then RM_StreamTrimByID (down to an empty stream)
+        r stream.trim mystream maxlen = 5
+        r stream.trim mystream minid = +
+        assert_equal 0 [r xlen mystream]
+        r DEBUG KEYSIZES-HIST-ASSERT 0
+    } {OK} {needs:debug}
 
     test "Unload the module - stream" {
         assert_equal {OK} [r module unload stream]

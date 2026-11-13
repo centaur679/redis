@@ -14,6 +14,16 @@ start_server {tags {"slowlog"} overrides {slowlog-log-slower-than 1000000}} {
         assert_equal [r slowlog len] 1
     } {} {needs:debug}
 
+    test {SLOWLOG - zero max length is correctly handled} {
+        r SLOWLOG reset
+        r config set slowlog-max-len 0
+        r config set slowlog-log-slower-than 0
+        for {set i 0} {$i < 100} {incr i} {
+            r ping
+        }
+        r slowlog len
+    } {0}
+
     test {SLOWLOG - max entries is correctly handled} {
         r config set slowlog-log-slower-than 0
         r config set slowlog-max-len 10
@@ -24,8 +34,11 @@ start_server {tags {"slowlog"} overrides {slowlog-log-slower-than 1000000}} {
     } {10}
 
     test {SLOWLOG - GET optional argument to limit output len works} {
-        llength [r slowlog get 5]
-    } {5}
+
+        assert_equal 5  [llength [r slowlog get 5]]
+        assert_equal 10 [llength [r slowlog get -1]]
+        assert_equal 10 [llength [r slowlog get 20]]
+    }
 
     test {SLOWLOG - RESET subcommand works} {
         r config set slowlog-log-slower-than 100000
@@ -37,32 +50,131 @@ start_server {tags {"slowlog"} overrides {slowlog-log-slower-than 1000000}} {
         r client setname foobar
         r debug sleep 0.2
         set e [lindex [r slowlog get] 0]
-        assert_equal [llength $e] 6
+        assert_equal [llength $e] 8
         if {!$::external} {
-            assert_equal [lindex $e 0] 105
+            assert_equal [lindex $e 0] 106
         }
         assert_equal [expr {[lindex $e 2] > 100000}] 1
         assert_equal [lindex $e 3] {debug sleep 0.2}
         assert_equal {foobar} [lindex $e 5]
+        assert_equal [lindex $e 6] 3
+        # debug sleep blocks on a syscall rather than burning CPU, so the
+        # executing-thread CPU time (field 7) should be far below the
+        # wall-clock duration (field 2).
+        assert_equal [expr {[lindex $e 7] < [lindex $e 2]}] 1
+    } {} {needs:debug}
+
+    test {SLOWLOG - off-CPU blocked command is counted and logged} {
+        r config set slowlog-log-slower-than 100000
+        # Earlier tests' DEBUG SLEEP calls also log this line; wait out the
+        # one-second rate limit so this test's line is not suppressed.
+        after 1100
+        set loglines [count_log_lines 0]
+        set before [s slow_command_off_cpu_events]
+        r debug sleep 0.2
+        wait_for_log_messages 0 {"*Slow command off-CPU*"} $loglines 50 100
+        assert_morethan_equal [s slow_command_off_cpu_events] [expr {$before + 1}]
+    } {} {needs:debug external:skip}
+
+    test {SLOWLOG - CPU-bound command gets a non-zero CPU estimate} {
+        r config set slowlog-log-slower-than 0
+        r slowlog reset
+        # Long enough to pass the 10ms measurement floor.
+        r eval {local i = 0 while i < 10000000 do i = i + 1 end return i} 0
+        set e [lindex [r slowlog get] 0]
+        assert_match {eval *} [lindex $e 3]
+        # No ratio assertion: how much of it ran on-CPU depends on the host.
+        assert_morethan [lindex $e 7] 0
+    }
+
+    test {SLOWLOG - off-CPU time before a command is not blamed on it} {
+        # Compare CPU estimates, which don't depend on host load (wall time does):
+        # the same EVAL alone, then after 75ms of sleeps in the same window (five
+        # 15ms sleeps, each under the threshold so none moves the checkpoint).
+        # If the sleeps were blamed on it, its estimate would drop by ~75ms.
+        set script {local i = 0 while i < 10000000 do i = i + 1 end return i}
+        r config set slowlog-log-slower-than 20000
+        r slowlog reset
+        r eval $script 0
+        set alone [lindex [lindex [r slowlog get 1] 0] 7]
+        r slowlog reset
+        r multi
+        for {set i 0} {$i < 5} {incr i} { r debug sleep 0.015 }
+        r eval $script 0
+        r exec
+        set e [lindex [r slowlog get 1] 0]
+        assert_match {eval *} [lindex $e 3]
+        assert_morethan [lindex $e 7] [expr {$alone - 37000}]
+    } {} {needs:debug}
+
+    test {SLOWLOG - on-CPU subcommand does not mask a later off-CPU one in EXEC} {
+        r config set slowlog-log-slower-than 10000
+        r slowlog reset
+        set before [s slow_command_off_cpu_events]
+        r multi
+        r eval {local i = 0 while i < 3000000 do i = i + 1 end return i} 0
+        r debug sleep 0.05
+        r exec
+        set e [lindex [r slowlog get 1] 0]
+        assert_match {debug sleep *} [lindex $e 3]
+        # Measured (0 means not measured) and mostly off-CPU.
+        assert {[lindex $e 7] > 0 && [lindex $e 7] < [lindex $e 2] / 2}
+        # At least the sleep; on a loaded host the EVAL can be preempted too.
+        assert_morethan_equal [s slow_command_off_cpu_events] [expr {$before + 1}]
+    } {} {needs:debug}
+
+    test {SLOWLOG - off-cpu-tracking no skips CPU measurement} {
+        r config set slowlog-log-slower-than 10000
+        r config set off-cpu-tracking no
+        r slowlog reset
+        set cmd_before [s slow_command_off_cpu_events]
+        set el_before [s eventloop_off_cpu_events]
+        r debug sleep 0.05
+        set e [lindex [r slowlog get 1] 0]
+        assert_match {debug sleep *} [lindex $e 3]
+        assert_equal 0 [lindex $e 7]
+        # Turning it on after an idle period must not report that period.
+        after 200
+        r config set off-cpu-tracking yes
+        r ping
+        assert_equal $cmd_before [s slow_command_off_cpu_events]
+        assert_equal $el_before [s eventloop_off_cpu_events]
+        # And it measures again.
+        r debug sleep 0.05
+        set e [lindex [r slowlog get 1] 0]
+        assert_morethan [lindex $e 7] 0
     } {} {needs:debug}
 
     test {SLOWLOG - Certain commands are omitted that contain sensitive information} {
+        r config set slowlog-max-len 100
         r config set slowlog-log-slower-than 0
         r slowlog reset
         catch {r acl setuser "slowlog test user" +get +set} _
+        r config set masteruser ""
         r config set masterauth ""
+        r config set requirepass ""
+        r config set tls-key-file-pass ""
+        r config set tls-client-key-file-pass ""
         r acl setuser slowlog-test-user +get +set
+        r acl getuser slowlog-test-user
+        r acl deluser slowlog-test-user non-existing-user
         r config set slowlog-log-slower-than 0
         r config set slowlog-log-slower-than -1
-        set slowlog_resp [r slowlog get]
+        set slowlog_resp [r slowlog get -1]
 
         # Make sure normal configs work, but the two sensitive
         # commands are omitted or redacted
-        assert_equal 5 [llength $slowlog_resp]
-        assert_equal {slowlog reset} [lindex [lindex $slowlog_resp 4] 3]
+        assert_equal 11 [llength $slowlog_resp]
+        assert_equal {slowlog reset} [lindex [lindex $slowlog_resp 10] 3]
+        assert_equal {acl setuser (redacted) (redacted) (redacted)} [lindex [lindex $slowlog_resp 9] 3]
+        assert_equal {config set masteruser (redacted)} [lindex [lindex $slowlog_resp 8] 3]
+        assert_equal {config set masterauth (redacted)} [lindex [lindex $slowlog_resp 7] 3]
+        assert_equal {config set requirepass (redacted)} [lindex [lindex $slowlog_resp 6] 3]
+        assert_equal {config set tls-key-file-pass (redacted)} [lindex [lindex $slowlog_resp 5] 3]
+        assert_equal {config set tls-client-key-file-pass (redacted)} [lindex [lindex $slowlog_resp 4] 3]
         assert_equal {acl setuser (redacted) (redacted) (redacted)} [lindex [lindex $slowlog_resp 3] 3]
-        assert_equal {config set masterauth (redacted)} [lindex [lindex $slowlog_resp 2] 3]
-        assert_equal {acl setuser (redacted) (redacted) (redacted)} [lindex [lindex $slowlog_resp 1] 3]
+        assert_equal {acl getuser (redacted)} [lindex [lindex $slowlog_resp 2] 3]
+        assert_equal {acl deluser (redacted) (redacted)} [lindex [lindex $slowlog_resp 1] 3]
         assert_equal {config set slowlog-log-slower-than 0} [lindex [lindex $slowlog_resp 0] 3]
     } {} {needs:repl}
 
@@ -199,5 +311,340 @@ start_server {tags {"slowlog"} overrides {slowlog-log-slower-than 1000000}} {
         assert_equal 1 [llength [r slowlog get 1]]
         assert_equal 3 [llength [r slowlog get -1]]
         assert_equal 3 [llength [r slowlog get 3]]
+    }
+    
+     test {SLOWLOG - blocking command is reported only after unblocked} {
+        # Cleanup first
+        r del mylist
+        # create a test client
+        set rd [redis_deferring_client]
+        
+        # config the slowlog and reset
+        r config set slowlog-log-slower-than 0
+        r config set slowlog-max-len 110
+        r slowlog reset
+        
+        $rd BLPOP mylist 0
+        wait_for_blocked_clients_count 1 50 20
+        assert_equal 0 [llength [regexp -all -inline (?=BLPOP) [r slowlog get]]]
+        
+        r LPUSH mylist 1
+        wait_for_blocked_clients_count 0 50 20
+        assert_equal 1 [llength [regexp -all -inline (?=BLPOP) [r slowlog get]]]
+        
+        $rd close
+    }
+
+    test {SLOWLOG - INFO STATS slowlog metrics with no slowlog entries} {
+        r config set slowlog-log-slower-than 1000000
+        r config resetstat
+        r slowlog reset
+
+        r ping
+        r get foo
+
+        set info [r info stats]
+        assert_equal 0 [getInfoProperty $info slowlog_commands_count]
+        assert_equal {0.00} [getInfoProperty $info slowlog_commands_time_ms_max]
+        assert_equal {0.00} [getInfoProperty $info slowlog_commands_time_ms_sum]
+    }
+
+    test {SLOWLOG - INFO STATS slowlog metrics accumulate with slow commands} {
+        r config set slowlog-log-slower-than 100000
+        r config resetstat
+        r slowlog reset
+
+        r debug sleep 0.2
+        set info [r info stats]
+        assert_equal 1 [getInfoProperty $info slowlog_commands_count]
+        set sum1 [getInfoProperty $info slowlog_commands_time_ms_sum]
+        set max1 [getInfoProperty $info slowlog_commands_time_ms_max]
+        assert_morethan $sum1 190
+        assert_morethan $max1 190
+
+        r debug sleep 0.3
+        set info [r info stats]
+        assert_equal 2 [getInfoProperty $info slowlog_commands_count]
+        set sum2 [getInfoProperty $info slowlog_commands_time_ms_sum]
+        set max2 [getInfoProperty $info slowlog_commands_time_ms_max]
+        assert_morethan $sum2 490
+        assert_morethan $max2 290
+    } {} {needs:debug}
+
+    test {SLOWLOG - INFO STATS slowlog metrics survive SLOWLOG RESET} {
+        r config set slowlog-log-slower-than 100000
+        r config resetstat
+        r slowlog reset
+
+        r debug sleep 0.2
+        set info [r info stats]
+        set count_before [getInfoProperty $info slowlog_commands_count]
+        assert_equal 1 $count_before
+
+        r slowlog reset
+        assert_equal 0 [r slowlog len]
+
+        set info [r info stats]
+        assert_equal 1 [getInfoProperty $info slowlog_commands_count]
+        assert_morethan [getInfoProperty $info slowlog_commands_time_ms_sum] 0
+    } {} {needs:debug}
+
+    test {SLOWLOG - INFO STATS slowlog metrics reset with CONFIG RESETSTAT} {
+        r config set slowlog-log-slower-than 100000
+        r config resetstat
+        r slowlog reset
+
+        r debug sleep 0.2
+        set info [r info stats]
+        assert_equal 1 [getInfoProperty $info slowlog_commands_count]
+        assert_morethan_equal [getInfoProperty $info slow_command_off_cpu_events] 1
+        assert_morethan_equal [getInfoProperty $info eventloop_off_cpu_events] 1
+
+        r config resetstat
+        set info [r info stats]
+        assert_equal 0 [getInfoProperty $info slowlog_commands_count]
+        assert_equal {0.00} [getInfoProperty $info slowlog_commands_time_ms_max]
+        assert_equal {0.00} [getInfoProperty $info slowlog_commands_time_ms_sum]
+        assert_equal 0 [getInfoProperty $info slow_command_off_cpu_events]
+        assert_equal 0 [getInfoProperty $info eventloop_off_cpu_events]
+    } {} {needs:debug}
+
+    test {SLOWLOG - INFO COMMANDSTATS shows slowlog metrics for slow commands} {
+        r config set slowlog-log-slower-than 100000
+        r config resetstat
+        r slowlog reset
+
+        r debug sleep 0.2
+        r debug sleep 0.3
+
+        set cmdstat [cmdrstat debug r]
+        assert_match {*slowlog_count=2*} $cmdstat
+        assert_match {*slowlog_time_ms_sum=*} $cmdstat
+        assert_match {*slowlog_time_ms_max=*} $cmdstat
+
+        regexp {slowlog_count=(\d+)} $cmdstat -> sl_count
+        regexp {slowlog_time_ms_sum=([0-9.]+)} $cmdstat -> sl_sum
+        regexp {slowlog_time_ms_max=([0-9.]+)} $cmdstat -> sl_max
+        assert_equal 2 $sl_count
+        assert_morethan $sl_sum 490
+        assert_morethan $sl_max 290
+    } {} {needs:debug}
+
+    test {SLOWLOG - INFO COMMANDSTATS slowlog metrics only on commands that are slow} {
+        r config set slowlog-log-slower-than 100000
+        r config resetstat
+        r slowlog reset
+
+        r set mykey myvalue
+        r get mykey
+        r debug sleep 0.2
+
+        set cmdstat_set [cmdrstat set r]
+        assert_no_match {*slowlog_count*} $cmdstat_set
+
+        set cmdstat_get [cmdrstat get r]
+        assert_no_match {*slowlog_count*} $cmdstat_get
+
+        set cmdstat_debug [cmdrstat debug r]
+        assert_match {*slowlog_count=1*} $cmdstat_debug
+        assert_match {*slowlog_time_ms_sum=*} $cmdstat_debug
+        assert_match {*slowlog_time_ms_max=*} $cmdstat_debug
+    } {} {needs:debug}
+
+    # Helper: return the argv (field index 3) of the most recent slowlog
+    # entry whose first token matches $cmd (case-insensitive). Skips entries
+    # generated by CONFIG SET / SLOWLOG GET that are interleaved with the
+    # command we actually want to inspect.
+    proc latest_slowlog_argv_for {cmd} {
+        foreach e [r slowlog get] {
+            set argv [lindex $e 3]
+            if {[string equal -nocase [lindex $argv 0] $cmd]} {
+                return $argv
+            }
+        }
+        return {}
+    }
+
+    test {SLOWLOG - slowlog-entry-max-argc and slowlog-entry-max-string-len defaults} {
+        # Defaults must match the legacy hard-coded constants
+        # (SLOWLOG_ENTRY_MAX_ARGC=32, SLOWLOG_ENTRY_MAX_STRING=128).
+        assert_equal 32  [lindex [r config get slowlog-entry-max-argc] 1]
+        assert_equal 128 [lindex [r config get slowlog-entry-max-string-len] 1]
+    }
+
+    test {SLOWLOG - slowlog-entry-max-argc enforces minimum value of 2} {
+        assert_error "*argument must be between*" {r config set slowlog-entry-max-argc 1}
+        r config set slowlog-entry-max-argc 2
+        assert_equal 2 [lindex [r config get slowlog-entry-max-argc] 1]
+    }
+
+    test {SLOWLOG - slowlog-entry-max-string-len enforces minimum value of 1} {
+        assert_error "*argument must be between*" {r config set slowlog-entry-max-string-len 0}
+        r config set slowlog-entry-max-string-len 1
+        assert_equal 1 [lindex [r config get slowlog-entry-max-string-len] 1]
+    }
+
+    test {SLOWLOG - slowlog-entry-max-argc=2 preserves command name and adds trim marker} {
+        r slowlog reset
+        r config set slowlog-entry-max-string-len 128
+
+        # The minimum argc of 2 exists so that the command name is preserved
+        # and the trim marker can still be written into the last slot.
+        r config set slowlog-log-slower-than 0
+        r config set slowlog-entry-max-argc 2
+        r sadd myset a b c d
+        # 6 args total, slargc=2: marker == argc - slargc + 1 == 5.
+        assert_equal {sadd {... (5 more arguments)}} [latest_slowlog_argv_for sadd]
+    }
+
+    test {SLOWLOG - custom slowlog-entry-max-argc trims correctly} {
+        r config set slowlog-log-slower-than 0
+        r config set slowlog-entry-max-argc 5
+
+        # argc > limit: trimmed with marker in the last slot.
+        r slowlog reset
+        r sadd myset a b c d e f g h
+        assert_equal {sadd myset a b {... (6 more arguments)}} \
+            [latest_slowlog_argv_for sadd]
+
+        # argc == limit: no marker, logged as-is.
+        r slowlog reset
+        r sadd myset a b c
+        assert_equal {sadd myset a b c} [latest_slowlog_argv_for sadd]
+
+        # argc < limit: no marker, logged as-is.
+        r slowlog reset
+        r sadd myset a
+        assert_equal {sadd myset a} [latest_slowlog_argv_for sadd]
+    }
+
+    test {SLOWLOG - custom slowlog-entry-max-string-len trims string args} {
+        r slowlog reset
+        r config set slowlog-log-slower-than 0
+        r config set slowlog-entry-max-argc 32
+        r config set slowlog-entry-max-string-len 16
+
+        # String longer than limit: trimmed with "... (N more bytes)" suffix.
+        r set mykey [string repeat A 20]
+        set expected "set mykey {[string repeat A 16]... (4 more bytes)}"
+        assert_equal $expected [latest_slowlog_argv_for set]
+
+        # String length == limit: no suffix, logged as-is.
+        r slowlog reset
+        r set mykey [string repeat B 16]
+        assert_equal "set mykey [string repeat B 16]" \
+            [latest_slowlog_argv_for set]
+
+        # String shorter than limit: logged as-is.
+        r slowlog reset
+        r set mykey short
+        assert_equal {set mykey short} [latest_slowlog_argv_for set]
+    }
+
+    test {SLOWLOG - runtime config change applies only to subsequent entries} {
+        r config set slowlog-log-slower-than 0
+        r config set slowlog-entry-max-string-len 128
+        r slowlog reset
+
+        set arg [string repeat C 50]
+
+        # First SET is logged with the old (default) limit -> not trimmed.
+        # Use short key names so the new (smaller) limit cannot trim them
+        # when we look for the entry later.
+        r set k1 $arg
+
+        set old_entry_argv [latest_slowlog_argv_for set]
+        assert_equal "set k1 $arg" $old_entry_argv
+
+        # Lower the limit and log another entry.
+        r config set slowlog-entry-max-string-len 8
+        r mset k2{x} v1 k3{x} $arg
+
+        # The new entry must be trimmed...
+        set new_entry_argv [latest_slowlog_argv_for mset]
+        assert_equal "mset k2{x} v1 k3{x} {[string repeat C 8]... (42 more bytes)}" \
+            $new_entry_argv
+
+        # ... while the old one remains untouched
+        set old_entry_argv_again [latest_slowlog_argv_for set]
+        assert_equal "set k1 $arg" $old_entry_argv_again
+    }
+
+    test {SLOWLOG - command argument count is tracked when truncated} {
+        r config set slowlog-log-slower-than 0
+        r slowlog reset
+        # Run a command with 33 arguments (sadd + set + 31 items)
+        r sadd set 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33
+        set e [lindex [r slowlog get] end-1]
+        assert_equal [lindex $e 6] 33
+    }
+}
+
+# Real CPU starvation: pin the server and a few busy loops to one CPU and drop
+# the server to the lowest priority, so it's preempted many times while it runs.
+# Own server, because renice can't be undone unprivileged.
+set system_name [string tolower [exec uname -s]]
+if {$system_name eq {linux} && ![catch {exec which taskset renice}]} {
+    start_server {tags {"slowlog external:skip"}} {
+        set pid [srv 0 pid]
+        set fd [open "/proc/$pid/status" r]
+        regexp {Cpus_allowed_list:\s*([0-9]+)} [read $fd] -> starve_cpu
+        close $fd
+        exec taskset -cp $starve_cpu $pid
+        exec renice -n 19 -p $pid
+
+        # Appends each pid as it starts, so a partial start is still cleaned up.
+        proc start_busy_loops {cpu pidsvar} {
+            upvar $pidsvar pids
+            for {set i 0} {$i < 3} {incr i} {
+                lappend pids [exec taskset -c $cpu sh -c {while :; do :; done} &]
+            }
+        }
+        proc stop_busy_loops {pids} {
+            foreach p $pids {catch {exec kill $p}}
+        }
+
+        test {SLOWLOG - CPU starvation is detected for a preempted command} {
+            r config set slowlog-log-slower-than 1000
+            set before [s slow_command_off_cpu_events]
+            set busy {}
+            set err [catch {
+                start_busy_loops $starve_cpu busy
+                r eval {local i = 0 while i < 1000000 do i = i + 1 end return i} 0
+                set e [lindex [r slowlog get 1] 0]
+            } msg]
+            stop_busy_loops $busy
+            if {$err} {error $msg}
+
+            assert_match {eval *} [lindex $e 3]
+            # Mostly off-CPU: the estimated CPU is well under half the duration.
+            assert {[lindex $e 7] < [lindex $e 2] / 2}
+            assert_morethan [s slow_command_off_cpu_events] $before
+        }
+
+        test {SLOWLOG - CPU starvation between fast commands is detected per event-loop cycle} {
+            # SETs are too short for the slowlog; the cycle check catches it. One
+            # wakeup needs enough work (10 x 1000 SETs) to be preempted mid-cycle.
+            # Some SETs may still be preempted, so the per-command counter isn't checked.
+            r config set slowlog-log-slower-than 1000
+            set before [s eventloop_off_cpu_events]
+            set buf {}
+            for {set i 0} {$i < 1000} {incr i} { append buf "SET k$i v\r\n" }
+            set clients {}
+            for {set c 0} {$c < 10} {incr c} { lappend clients [redis_deferring_client] }
+            set busy {}
+            set err [catch {
+                start_busy_loops $starve_cpu busy
+                foreach rd $clients { $rd write $buf; $rd flush }
+                foreach rd $clients {
+                    for {set i 0} {$i < 1000} {incr i} { $rd read }
+                }
+            } msg]
+            stop_busy_loops $busy
+            foreach rd $clients { $rd close }
+            if {$err} {error $msg}
+
+            assert_morethan [s eventloop_off_cpu_events] $before
+        }
     }
 }

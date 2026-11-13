@@ -1,12 +1,18 @@
 {
     "ZUNIONSTORE": {
-        "summary": "Add multiple sorted sets and store the resulting sorted set in a new key",
+        "summary": "Stores the union of multiple sorted sets in a key.",
         "complexity": "O(N)+O(M log(M)) with N being the sum of the sizes of the input sorted sets, and M being the number of elements in the resulting sorted set.",
         "group": "sorted_set",
         "since": "2.0.0",
         "arity": -4,
         "function": "zunionstoreCommand",
         "get_keys_function": "zunionInterDiffStoreGetKeys",
+        "history": [
+            [
+                "8.8.0",
+                "Added `COUNT` aggregate option."
+            ]
+        ],
         "command_flags": [
             "WRITE",
             "DENYOOM"
@@ -52,6 +58,10 @@
                 }
             }
         ],
+        "reply_schema": {
+            "description": "The number of elements in the resulting sorted set.",
+            "type": "integer"
+        },
         "arguments": [
             {
                 "name": "destination",
@@ -95,6 +105,12 @@
                         "name": "max",
                         "type": "pure-token",
                         "token": "MAX"
+                    },
+                    {
+                        "name": "count",
+                        "type": "pure-token",
+                        "token": "COUNT",
+                        "since": "8.8.0"
                     }
                 ]
             }

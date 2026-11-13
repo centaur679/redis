@@ -64,7 +64,8 @@ start_server {tags {"scripting"}} {
     } {hello1}
 
     test {FUNCTION - test replace argument with failure keeps old libraries} {
-         catch {r function create LUA test REPLACE {error}}
+        catch {r function load REPLACE [get_function_code LUA test test {error}]} e
+        assert_match {ERR Error compiling function*} $e
         r fcall test 0
     } {hello1}
 
@@ -291,6 +292,31 @@ start_server {tags {"scripting"}} {
         assert_match {{library_name test engine LUA functions {{name test description {} flags {}}}}} [r function list]
         r function flush sync
         assert_match {} [r function list]
+    }
+
+    test {FUNCTION - async function flush rebuilds Lua VM without causing race condition between main and lazyfree thread} {
+        # LAZYFREE_THRESHOLD is 64
+        for {set i 0} {$i < 1000} {incr i} {
+            r function load [get_function_code lua test$i test$i {local a = 1 while true do a = a + 1 end}]
+        }
+        assert_morethan [s used_memory_vm_functions] 100000
+        r config resetstat
+        r function flush async
+        assert_lessthan [s used_memory_vm_functions] 40000
+
+        # Wait for the completion of lazy free for both functions and engines.
+        set start_time [clock seconds]
+        while {1} {
+            # Tests for race conditions between async function flushes and main thread Lua VM operations.
+            r function load REPLACE [get_function_code lua test test {local a = 1 while true do a = a + 1 end}]
+            if {[s lazyfreed_objects] == 1001 || [expr {[clock seconds] - $start_time}] > 5} {
+                break
+            }
+        }
+        if {[s lazyfreed_objects] != 1001} {
+            error "Timeout or unexpected number of lazyfreed_objects: [s lazyfreed_objects]"
+        }
+        assert_match {{library_name test engine LUA functions {{name test description {} flags {}}}}} [r function list]
     }
 
     test {FUNCTION - test function wrong argument} {
@@ -534,25 +560,55 @@ start_server {tags {"scripting"}} {
         assert_equal [r fcall f2 0] {3}
     }
 
-    test {LIBRARIES - test registration function name collision on same library} {
-        catch {
-            r function load replace {#!lua name=lib2
-                redis.register_function(
-                    'f1',
-                    function(keys, args)
-                        return 1
-                    end
-                )
-                redis.register_function(
-                    'f1',
-                    function(keys, args)
-                        return 1
-                    end
-                )
+    foreach name {foo Foo FOO} {
+        test "LIBRARIES - last registration replaces duplicate function $name" {
+            r function load [format {#!lua name=lib_case
+                redis.register_function{
+                    function_name='foo',
+                    callback=function() return 'first' end,
+                    description='first',
+                    flags={'no-writes'}
+                }
+                redis.register_function{
+                    function_name='%s',
+                    callback=function() return 'last' end,
+                    description='last'
+                }
+            } $name]
+            set library [lindex [r function list libraryname lib_case] 0]
+            assert_equal [list [list name $name description last flags {}]] [dict get $library functions]
+            foreach call_name {foo Foo FOO} {
+                assert_equal last [r fcall $call_name 0]
             }
-        } e
-        set _ $e
-    } {*Function already exists in the library*}
+            r function delete lib_case
+            assert_error {*Function not found*} {r fcall foo 0}
+        }
+    }
+
+    test {LIBRARIES - registration failure after overwriting a function preserves replaced library} {
+        r function load [get_function_code lua lib_case foo {return 'original'}]
+        set original [r function list libraryname lib_case withcode]
+        assert_error {*second argument to redis.register_function must be a function*} {
+            r function load replace {#!lua name=lib_case
+                redis.register_function('foo', function() return 1 end)
+                redis.register_function('FoO', function() return 2 end)
+                redis.register_function('bar', 'not a function')
+            }
+        }
+        assert_equal $original [r function list libraryname lib_case withcode]
+        assert_equal original [r fcall FOO 0]
+        r function delete lib_case
+    }
+
+    test {LIBRARIES - reject function names differing only by case across libraries} {
+        r function load [get_function_code lua lib_case foo {return 'original'}]
+        assert_error {*Function FoO already exists*} {
+            r function load [get_function_code lua lib_case_other FoO {return 'new'}]
+        }
+        assert_equal {} [r function list libraryname lib_case_other]
+        assert_equal original [r fcall FoO 0]
+        r function delete lib_case
+    }
 
     test {LIBRARIES - test registration with no argument} {
         catch {
@@ -994,6 +1050,15 @@ start_server {tags {"scripting"}} {
 
         r config set maxmemory 0
     } {OK} {needs:config-maxmemory}
+
+    test {FUNCTION - test function list with CRLF injection attempt} {
+        r function flush
+
+        # This test verifies that CRLF characters are properly handled
+        # to prevent protocol injection attacks when using FUNCTION LIST.
+        # The error message should have CRLF replaced with spaces.
+        assert_error {*Unknown argument X  +INJECTED*} {r function list "X\r\n+INJECTED"}
+    }
 }
 
 start_server {tags {"scripting"}} {
@@ -1183,6 +1248,32 @@ start_server {tags {"scripting"}} {
         set _ $e
     } {ERR Invalid metadata value given: foo=bar}
 
+    foreach {field shebang} {
+        engine {#!"lua%s" name=metadata_test}
+        name {#!lua name="metadata_test%s"}
+        option {#!lua name=metadata_test "bad=%s"}
+    } {
+        test "FUNCTION - Reject CR and LF in library metadata - $field" {
+            # Quoted metadata decodes escapes, including hex and NUL bytes.
+            foreach symbols [list {\r} {\n} {\r\n+INJECTED\r\n} \
+                                  {\x0d} {\x0a} {\x0d\x0a+INJECTED\x0d\x0a} \
+                                  {\x00\r} {\x00\n} "\r"] {
+                set code "[format $shebang $symbols]\nredis.register_function('metadata_test', function() return 1 end)"
+                assert_error {ERR Invalid symbols in library metadata} {
+                    r function load $code
+                }
+                # An injected reply must not be left on the connection.
+                assert_equal PONG [r ping]
+            }
+        }
+    }
+
+    test {FUNCTION - Quoted library metadata with CRLF line endings} {
+        assert_equal metadata_test [r function load "#!\"lua\" name=\"metadata_test\"\r\nredis.register_function('metadata_test', function() return 1 end)"]
+        assert_equal 1 [r fcall metadata_test 0]
+        r function delete metadata_test
+    } {OK}
+
     test {FUNCTION - function test no name} {
          catch {r function load replace {#!lua
             redis.register_function('foo', function() return 1 end)
@@ -1230,4 +1321,34 @@ start_server {tags {"scripting"}} {
         set _ $e
     } {*Script attempted to access nonexistent global variable 'getmetatable'*}
 
+}
+
+# Generated by unstable e336bde4: registers foo before Foo, returning
+# 'lowercase' and 'capitalized' respectively. The last registration wins.
+set server_path [tmpdir "server.function-case-collision"]
+file copy tests/assets/function-case-collision.rdb $server_path
+start_server [list tags {scripting external:skip} overrides [list dir $server_path dbfilename function-case-collision.rdb]] {
+    test {FUNCTION - legacy RDB loading keeps the last case insensitive registration} {
+        assert_equal {{library_name case_collision engine LUA functions {{name Foo description {} flags {}}}}} [r function list]
+        foreach name {foo Foo FOO} {
+            assert_equal capitalized [r fcall $name 0]
+        }
+        assert_equal 1 [dict get [r function stats] engines LUA functions_count]
+    }
+
+    test {FUNCTION - legacy duplicate registrations survive save and reload} {
+        r debug reload
+        assert_equal capitalized [r fcall foo 0]
+        assert_equal 1 [dict get [r function stats] engines LUA functions_count]
+    } {} {needs:debug}
+
+    test {FUNCTION - legacy duplicate registrations survive dump and restore} {
+        set payload [r function dump]
+        r function flush
+        assert_equal OK [r function restore $payload]
+        assert_equal capitalized [r fcall FOO 0]
+        assert_equal 1 [dict get [r function stats] engines LUA functions_count]
+        r function delete case_collision
+        assert_equal {} [r function list]
+    }
 }

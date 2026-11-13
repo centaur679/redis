@@ -8,6 +8,11 @@ start_server {tags {"bitops"}} {
         set results
     } {0 -100 101}
 
+    test {BITFIELD signed i64 SET handles positive values} {
+        r del bits
+        r bitfield bits set i64 0 32 get i64 0
+    } {0 32}
+
     test {BITFIELD unsigned SET and GET basics} {
         r del bits
         set results {}
@@ -17,6 +22,22 @@ start_server {tags {"bitops"}} {
         set results
     } {0 255 100}
 
+    test {BITFIELD signed SET and GET together} {
+        r del bits
+        set results [r bitfield bits set i8 0 255 set i8 0 100 get i8 0]
+    } {0 -1 100}
+ 
+    test {BITFIELD unsigned with SET, GET and INCRBY arguments} {
+        r del bits
+        set results [r bitfield bits set u8 0 255 incrby u8 0 100 get u8 0]
+    } {0 99 99}
+
+    test {BITFIELD with only key as argument} {
+        r del bits
+        set result [r bitfield bits]
+        assert {$result eq {}}
+    }
+
     test {BITFIELD #<idx> form} {
         r del bits
         set results {}
@@ -25,6 +46,15 @@ start_server {tags {"bitops"}} {
         r bitfield bits set u8 #2 67
         r get bits
     } {ABC}
+
+    test {BITFIELD #<idx> form rejects offsets that overflow when scaled by type width} {
+        assert_error {*ERR bit offset is not an integer or out of range*} {
+            r bitfield_ro bits get i64 #144115188075855872
+        }
+        assert_error {*ERR bit offset is not an integer or out of range*} {
+            r bitfield bits get i64 #144115188075855872
+        }
+    }
 
     test {BITFIELD basic INCRBY form} {
         r del bits
@@ -135,6 +165,21 @@ start_server {tags {"bitops"}} {
         }
     }
 
+    test {BITFIELD OVERFLOW FAIL accounts for string growth} {
+        r del bits
+        r set bits {}
+        set dirty [s rdb_changes_since_last_save]
+        set result [r bitfield bits overflow fail set u1 63 2]
+        assert_equal {} [lindex $result 0]
+        assert_equal 8 [r strlen bits]
+        assert_equal [expr {$dirty + 1}] [s rdb_changes_since_last_save]
+
+        set dirty [s rdb_changes_since_last_save]
+        set result [r bitfield bits overflow fail set u1 0 2]
+        assert_equal {} [lindex $result 0]
+        assert_equal $dirty [s rdb_changes_since_last_save]
+    }
+
     test {BITFIELD overflow wrap fuzzing} {
         for {set j 0} {$j < 1000} {incr j} {
             set bits [expr {[randomInt 64]+1}]
@@ -198,6 +243,16 @@ start_server {tags {"bitops"}} {
         }
         r del mystring
     }
+
+    test {BITFIELD_RO with only key as argument} {
+        set res [r bitfield_ro bits]
+        assert {$res eq {}}
+    }
+
+    test {BITFIELD_RO fails when write option is used} {
+        catch {r bitfield_ro bits set u8 0 100 get u8 0} err
+        assert_match {*ERR BITFIELD_RO only supports the GET subcommand*} $err
+    }
 }
 
 start_server {tags {"repl external:skip"}} {
@@ -224,7 +279,29 @@ start_server {tags {"repl external:skip"}} {
             assert_equal 100 [$slave bitfield_ro bits get u8 0]
         }
 
-        test {BITFIELD_RO fails when write option is used} {
+        test {BITFIELD OVERFLOW FAIL growth is replicated} {
+            $master del bitfield-fail-created bitfield-fail-grown
+            $master set bitfield-fail-grown {}
+            wait_for_ofs_sync $master $slave
+
+            set created_result [$master bitfield bitfield-fail-created overflow fail set u1 0 2]
+            set grown_result [$master bitfield bitfield-fail-grown overflow fail set u1 63 2]
+            assert_equal {} [lindex $created_result 0]
+            assert_equal {} [lindex $grown_result 0]
+            wait_for_ofs_sync $master $slave
+
+            assert_equal 1 [$slave strlen bitfield-fail-created]
+            assert_equal "\x00" [$slave get bitfield-fail-created]
+            assert_equal 8 [$slave strlen bitfield-fail-grown]
+            assert_equal [string repeat "\x00" 8] [$slave get bitfield-fail-grown]
+        }
+
+        test {BITFIELD_RO with only key as argument on read-only replica} {
+            set res [$slave bitfield_ro bits]
+            assert {$res eq {}}
+        }
+
+        test {BITFIELD_RO fails when write option is used on read-only replica} {
             catch {$slave bitfield_ro bits set u8 0 100 get u8 0} err
             assert_match {*ERR BITFIELD_RO only supports the GET subcommand*} $err
         }

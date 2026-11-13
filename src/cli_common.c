@@ -1,35 +1,17 @@
 /* CLI (command line interface) common methods
  * 
- * Copyright (c) 2020, Redis Labs
+ * Copyright (c) 2020-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "fmacros.h"
 #include "cli_common.h"
+#include "version.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -43,13 +25,109 @@
 #ifdef USE_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509.h>
 #include <hiredis_ssl.h>
 #endif
 
 #define UNUSED(V) ((void) V)
 
+char *redisGitSHA1(void);
+char *redisGitDirty(void);
+
+/* Validate a space-separated list of expected TLS peer names as given to
+ * --tls-expected-peer-name, before any connection is attempted. Mirrors the
+ * server's isValidTlsExpectedPeerName(): spaces are the only separators, so any
+ * other whitespace would be handed to OpenSSL as part of a name and silently
+ * never match a real SAN. An IP address must be the sole name: OpenSSL keeps a
+ * single expected IP, and combining it with DNS names requires BOTH to match
+ * (X509_VERIFY_PARAM ANDs the two kinds), which is never what a
+ * match-any-of-these list means. A name beginning with a dot is legitimate
+ * OpenSSL syntax for a parent domain (it matches any subdomain at any depth);
+ * like the server, we accept it but report how many such entries there are so
+ * the caller can warn about the wider scope. */
+const char *cliValidateExpectedPeerNames(const char *names, int *parent_domain_entries) {
+    if (parent_domain_entries) *parent_domain_entries = 0;
+
+    for (const char *p = names; *p; p++) {
+        if (*p != ' ' && isspace((unsigned char)*p))
+            return "expected peer names must not contain whitespace other than "
+                   "spaces separating names";
+    }
+
+    int count = 0, nnames = 0, nips = 0, ndots = 0;
+    sds *tokens = sdssplitlen(names, strlen(names), " ", 1, &count);
+    if (tokens == NULL)
+        return "out of memory while parsing expected peer names";
+
+    for (int i = 0; i < count; i++) {
+        if (sdslen(tokens[i]) == 0) continue; /* runs of spaces */
+        nnames++;
+        if (tlsIsIPAddressLiteral(tokens[i])) nips++;
+        else if (tokens[i][0] == '.') ndots++;
+    }
+    sdsfreesplitres(tokens, count);
+
+    if (nnames == 0)
+        return "expected peer names contain no usable name";
+    if (nips > 0 && nnames > 1)
+        return "an IP address must be the only expected peer name";
+
+    if (parent_domain_entries) *parent_domain_entries = ndots;
+    return NULL;
+}
+
+#if defined(USE_OPENSSL) && CLI_TLS_SUPPORTS_VERIFY_NAME
+/* Bind the SSL object to the expected peer identity(-ies): the server
+ * certificate must carry one of the space-separated `names` (DNS names, or a
+ * single IP address literal; see tlsVerifyParamAddIdentity() for how each kind
+ * is matched) in addition to chaining to the trusted CA. Applied per SSL object
+ * rather than on the shared SSL_CTX: the context is a process-wide static, while
+ * the identity is a per-connection property (e.g. each node the cluster manager
+ * dials). The names have been validated by cliValidateExpectedPeerNames().
+ * Returns REDIS_OK, or REDIS_ERR with *err set. */
+static int cliSSLSetVerifyNames(SSL *ssl, const char *names, const char **err) {
+    X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
+
+    int count = 0;
+    sds *tokens = sdssplitlen(names, strlen(names), " ", 1, &count);
+    if (tokens == NULL) {
+        *err = "Out of memory while parsing expected peer names";
+        return REDIS_ERR;
+    }
+
+    /* The first name replaces the expected host list, each subsequent one is
+     * appended, so a match against any listed name succeeds. */
+    int applied = 0, first = 1, ok = 1;
+    for (int i = 0; i < count; i++) {
+        if (sdslen(tokens[i]) == 0) continue; /* runs of spaces */
+        int r = tlsVerifyParamAddIdentity(param, tokens[i], sdslen(tokens[i]), first);
+        first = 0;
+        if (r != 1) {
+            ok = 0;
+            break;
+        }
+        applied++;
+    }
+    sdsfreesplitres(tokens, count);
+
+    if (!ok || applied == 0) {
+        *err = "Failed to set the expected peer certificate name(s)";
+        return REDIS_ERR;
+    }
+    return REDIS_OK;
+}
+#endif
+
 /* Wrapper around redisSecureConnection to avoid hiredis_ssl dependencies if
  * not building with TLS support.
+ *
+ * Besides the CA chain, the server certificate's identity is verified by
+ * default (the equivalent of libpq's "verify-full"): it must carry the name
+ * given to --sni, or else the host that was dialed (an IP or a DNS name), or
+ * the explicit --tls-expected-peer-name. --no-verify-hostname drops back to
+ * chain-only validation ("verify-ca"), --insecure to none. A unix socket has no
+ * name to verify against, so only --sni or --tls-expected-peer-name can bind
+ * such a connection to an identity.
  */
 int cliSecureConnection(redisContext *c, cliSSLconfig config, const char **err) {
 #ifdef USE_OPENSSL
@@ -95,6 +173,14 @@ int cliSecureConnection(redisContext *c, cliSSLconfig config, const char **err) 
             goto error;
         }
 #endif
+#if CLI_TLS_SUPPORTS_GROUPS
+        if (config.groups) {
+            if (!cliSslCtxSetGroupsList(ssl_ctx, config.groups)) {
+                *err = "Error while configuring TLS groups";
+                goto error;
+            }
+        }
+#endif
     }
 
     SSL *ssl = SSL_new(ssl_ctx);
@@ -103,13 +189,83 @@ int cliSecureConnection(redisContext *c, cliSSLconfig config, const char **err) 
         return REDIS_ERR;
     }
 
-    if (config.sni && !SSL_set_tlsext_host_name(ssl, config.sni)) {
+    /* SNI: the explicit --sni value, else the dialed host when it is a DNS name
+     * (SNI cannot carry an IP literal). Redis itself serves a single certificate
+     * and ignores SNI; announcing the name is for a TLS proxy or load balancer
+     * in front of it, which may route by SNI or present the certificate issued
+     * for that name -- the identity verified below. c->tcp.host is NULL for
+     * unix-socket connections. */
+    const char *sni = config.sni;
+    if (sni == NULL && c->tcp.host && !tlsIsIPAddressLiteral(c->tcp.host))
+        sni = c->tcp.host;
+    if (sni && !SSL_set_tlsext_host_name(ssl, sni)) {
         *err = "Failed to configure SNI";
         SSL_free(ssl);
         return REDIS_ERR;
     }
 
-    return redisInitiateSSL(c, ssl);
+    /* Identity verification. Most explicit source wins: the configured
+     * expected name(s), then the declared server name, then the dialed host.
+     * Skipped entirely under --insecure (nothing is verified at all, so a name
+     * check could not run) or --no-verify-hostname. */
+    const char *identity = NULL;
+    if (!config.skip_cert_verify && !config.skip_hostname_verify) {
+        identity = config.expected_peer_name;
+        if (identity == NULL) identity = config.sni;
+        if (identity == NULL) identity = c->tcp.host;
+        if (identity && identity[0] == '\0') identity = NULL;
+    }
+    if (identity) {
+#if CLI_TLS_SUPPORTS_VERIFY_NAME
+        if (cliSSLSetVerifyNames(ssl, identity, err) != REDIS_OK) {
+            SSL_free(ssl);
+            return REDIS_ERR;
+        }
+#else
+        /* Compiled out (TLS_NO_PEER_NAME_VERIFICATION). An explicit request
+         * that cannot be honored must fail, not silently degrade; the implicit
+         * default degrades to chain-only validation, but says so once, like the
+         * server does for tls-expected-peer-name. */
+        if (config.expected_peer_name) {
+            *err = "Peer certificate name verification is disabled in this build "
+                   "(TLS_NO_PEER_NAME_VERIFICATION), so --tls-expected-peer-name "
+                   "cannot be honored";
+            SSL_free(ssl);
+            return REDIS_ERR;
+        }
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "Warning: this build cannot verify the server "
+                "certificate's identity (TLS_NO_PEER_NAME_VERIFICATION); only "
+                "the CA chain is verified.\n");
+        }
+        identity = NULL;
+#endif
+    }
+
+    if (redisInitiateSSL(c, ssl) == REDIS_OK) return REDIS_OK;
+
+    /* Handshake failed. hiredis does not take ownership of the SSL object in
+     * that case, so it is ours to free; before that, turn an identity mismatch
+     * into an actionable message instead of OpenSSL's bare "certificate verify
+     * failed". (Static buffer: connections are established from one thread,
+     * as the static ssl_ctx above already assumes.) */
+#if CLI_TLS_SUPPORTS_VERIFY_NAME
+    long vres = SSL_get_verify_result(ssl);
+    if (identity && (vres == X509_V_ERR_HOSTNAME_MISMATCH || vres == X509_V_ERR_IP_ADDRESS_MISMATCH)) {
+        static char errbuf[512];
+        snprintf(errbuf, sizeof(errbuf),
+            "%s: the server certificate does not carry the expected identity '%s'. "
+            "Reissue it with that name in its Subject Alternative Name, verify a "
+            "different name with --tls-expected-peer-name, or verify only the CA "
+            "chain with --no-verify-hostname",
+            X509_verify_cert_error_string(vres), identity);
+        *err = errbuf;
+    }
+#endif
+    SSL_free(ssl);
+    return REDIS_ERR;
 
 error:
     SSL_CTX_free(ssl_ctx);
@@ -191,7 +347,7 @@ ssize_t cliWriteConn(redisContext *c, const char *buf, size_t buf_len)
 
 /* Wrapper around OpenSSL (libssl and libcrypto) initialisation
  */
-int cliSecureInit()
+int cliSecureInit(void)
 {
 #ifdef USE_OPENSSL
     ERR_load_crypto_strings();
@@ -339,11 +495,18 @@ void parseRedisUri(const char *uri, const char* tool_name, cliConnInfo *connInfo
     /* Extract user info. */
     if ((userinfo = strchr(curr,'@'))) {
         if ((username = strchr(curr, ':')) && username < userinfo) {
-            connInfo->user = percentDecode(curr, username - curr);
+            /* Free any value previously set via --user / -a (later
+             * parameters override earlier ones) and use NULL for an
+             * explicitly empty component, so cliAuth() falls back to the
+             * legacy single-argument AUTH (empty username) or skips AUTH
+             * entirely (empty password) instead of sending an empty ACL
+             * component, which the server rejects. */
+            sdsfree(connInfo->user);
+            connInfo->user = (username > curr) ? percentDecode(curr, username - curr) : NULL;
             curr = username + 1;
         }
-
-        connInfo->auth = percentDecode(curr, userinfo - curr);
+        sdsfree(connInfo->auth);
+        connInfo->auth = (userinfo > curr) ? percentDecode(curr, userinfo - curr) : NULL;
         curr = userinfo + 1;
     }
     if (curr == end) return;
@@ -352,9 +515,19 @@ void parseRedisUri(const char *uri, const char* tool_name, cliConnInfo *connInfo
     path = strchr(curr, '/');
     if (*curr != '/') {
         host = path ? path - 1 : end;
-        if ((port = strchr(curr, ':'))) {
-            connInfo->hostport = atoi(port + 1);
-            host = port - 1;
+        if (*curr == '[') {
+            curr += 1;
+            if ((port = strchr(curr, ']'))) {
+                if (*(port+1) == ':') {
+                    connInfo->hostport = atoi(port + 2);
+                }
+                host = port - 1;
+            }
+        } else {
+            if ((port = strchr(curr, ':'))) {
+                connInfo->hostport = atoi(port + 1);
+                host = port - 1;
+            }
         }
         sdsfree(connInfo->hostip);
         connInfo->hostip = sdsnewlen(curr, host - curr + 1);
@@ -395,4 +568,35 @@ sds escapeJsonString(sds s, const char *p, size_t len) {
         p++;
     }
     return sdscatlen(s,"\"",1);
+}
+
+sds cliVersion(void) {
+    sds version = sdscatprintf(sdsempty(), "%s", REDIS_VERSION);
+
+    /* Add git commit and working tree status when available. */
+    if (strtoll(redisGitSHA1(),NULL,16)) {
+        version = sdscatprintf(version, " (git:%s", redisGitSHA1());
+        if (strtoll(redisGitDirty(),NULL,10))
+            version = sdscatprintf(version, "-dirty");
+        version = sdscat(version, ")");
+    }
+    return version;
+}
+
+/* This is a wrapper to call redisConnect or redisConnectWithTimeout. */
+redisContext *redisConnectWrapper(const char *ip, int port, const struct timeval tv) {
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+        return redisConnect(ip, port);
+    } else {
+        return redisConnectWithTimeout(ip, port, tv);
+    }
+}
+
+/* This is a wrapper to call redisConnectUnix or redisConnectUnixWithTimeout. */
+redisContext *redisConnectUnixWrapper(const char *path, const struct timeval tv) {
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+        return redisConnectUnix(path);
+    } else {
+        return redisConnectUnixWithTimeout(path, tv);
+    }
 }

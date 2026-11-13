@@ -100,7 +100,7 @@ start_server {tags {"string"}} {
 
         assert_equal 1 [r setnx x 20]
         assert_equal 20 [r get x]
-    }
+    } {} {debug_defrag:skip}
 
     test "GETEX EX option" {
         r del foo
@@ -150,6 +150,14 @@ start_server {tags {"string"}} {
         catch {r getex foo non-existent-option} ex
         set ex
     } {*syntax*}
+
+    test "GETEX and GET expired key or not exist" {
+        r del foo
+        r set foo bar px 1
+        after 2
+        assert_equal {} [r getex foo]
+        assert_equal {} [r get foo]
+    }
 
     test "GETEX no arguments" {
          set ex {}
@@ -226,6 +234,11 @@ start_server {tags {"string"}} {
         assert_error {*wrong number of arguments for 'msetnx' command} {r msetnx x{t} 20 y{t} "foo bar" z{t}}
     }
 
+    test {MSET with already existing - same key twice} {
+        r set x{t} x
+        list [r mset x{t} xxx x{t} yyy] [r get x{t}]
+    } {OK yyy}
+
     test {MSETNX with already existent key} {
         list [r msetnx x1{t} xxx y2{t} yyy x{t} 20] [r exists x1{t}] [r exists y2{t}]
     } {0 0 0}
@@ -233,6 +246,176 @@ start_server {tags {"string"}} {
     test {MSETNX with not existing keys} {
         list [r msetnx x1{t} xxx y2{t} yyy] [r get x1{t}] [r get y2{t}]
     } {1 xxx yyy}
+
+    test {MSETNX with not existing keys - same key twice} {
+        r del x1{t}
+        list [r msetnx x1{t} xxx x1{t} yyy] [r get x1{t}]
+    } {1 yyy}
+
+    test {MSETNX with already existing keys - same key twice} {
+        list [r msetnx x1{t} xxx x1{t} zzz] [r get x1{t}]
+    } {0 yyy}
+
+    test {MSET spanning multiple prefetch batches (batch size 16)} {
+        # Exercise the batched prefetch loop across the 16-key boundary.
+        # Test sizes chosen to hit: last batch only (16), boundary+1 (17),
+        # two full batches (32), and partial-tail (33, 40).
+        foreach n {16 17 32 33 40} {
+            r flushdb
+            set cmd [list mset]
+            for {set i 0} {$i < $n} {incr i} {
+                lappend cmd "k:${i}{t}" "v:$i"
+            }
+            assert_equal [r {*}$cmd] "OK"
+            for {set i 0} {$i < $n} {incr i} {
+                assert_equal [r get "k:${i}{t}"] "v:$i"
+            }
+        }
+    }
+
+    test {MSET overwrites expired keys across batch boundary} {
+        # Regression test for dict-pointer staleness across batches
+        # (see src/t_string.c:prefetchKeysBatch). When lookupKeyWrite in
+        # batch 1 expires a pre-existing key, under cluster mode the slot
+        # dict may be freed (KVSTORE_FREE_EMPTY_DICTS) and recreated
+        # mid-command; msetGenericCommand must re-fetch the slot dict per
+        # batch. This test exercises the same code path in standalone mode.
+        r flushdb
+        r debug set-active-expire 0
+        for {set i 0} {$i < 8} {incr i} {
+            r set "k:${i}{t}" "old:$i" px 1
+        }
+        after 20
+        set cmd [list mset]
+        for {set i 0} {$i < 20} {incr i} {
+            lappend cmd "k:${i}{t}" "new:$i"
+        }
+        assert_equal [r {*}$cmd] "OK"
+        for {set i 0} {$i < 20} {incr i} {
+            assert_equal [r get "k:${i}{t}"] "new:$i"
+        }
+        r debug set-active-expire 1
+    } {OK} {needs:debug}
+
+    test {MSETEX - all expiration flags} {
+        # Test each expiration type separately (EX, PX, EXAT, PXAT)
+        set future_sec [expr [clock seconds] + 10]
+        set future_ms [expr [clock milliseconds] + 10000]
+
+        # Test EX and PX with separate commands (each applies to all keys in that command)
+        r msetex 2 ex:key1{t} val1 ex:key2{t} val2 ex 5
+        r msetex 2 px:key1{t} val1 px:key2{t} val2 px 5000
+
+        # Test EXAT and PXAT with separate commands
+        r msetex 2 exat:key1{t} val3 exat:key2{t} val4 exat $future_sec
+        r msetex 2 pxat:key1{t} val3 pxat:key2{t} val4 pxat $future_ms
+
+        assert_morethan [r ttl ex:key1{t}] 0
+        assert_morethan [r pttl px:key1{t}] 0
+        assert_morethan [r ttl exat:key1{t}] 0
+        assert_morethan [r pttl pxat:key1{t}] 0
+    }
+
+    test {MSETEX - KEEPTTL preserves existing TTL} {
+        r setex keepttl:key{t} 100 oldval
+        set old_ttl [r ttl keepttl:key{t}]
+        r msetex 1 keepttl:key{t} newval keepttl
+        assert_equal [r get keepttl:key{t}] "newval"
+        assert_morethan [r ttl keepttl:key{t}] [expr $old_ttl - 5]
+    }
+
+    test {MSETEX - NX/XX conditions and return values} {
+        r del nx:new{t} nx:new2{t} xx:existing{t} xx:nonexist{t}
+        r set xx:existing{t} oldval
+
+        assert_equal [r msetex 2 nx:new{t} val1 nx:new2{t} val2 nx ex 10] 1
+        assert_equal [r msetex 1 xx:existing{t} newval nx ex 10] 0
+        assert_equal [r msetex 1 xx:nonexist{t} newval xx ex 10] 0
+        assert_equal [r msetex 1 xx:existing{t} newval xx ex 10] 1
+        assert_equal [r get nx:new{t}] "val1"
+        assert_equal [r get xx:existing{t}] "newval"
+    }
+
+    test {MSETEX - flexible argument parsing} {
+        r del flex:1{t} flex:2{t}
+        # Test flags before and after KEYS
+        r msetex 2 flex:1{t} val1 flex:2{t} val2 ex 3 nx 
+        r msetex 2 flex:3{t} val3 flex:4{t} val4 px 3000 xx
+
+        assert_equal [r get flex:1{t}] "val1"
+        assert_equal [r get flex:2{t}] "val2"
+        assert_morethan [r ttl flex:1{t}] 0
+        assert_equal [r exists flex:3{t}] 0
+        assert_equal [r exists flex:4{t}] 0
+    }
+
+    test {MSETEX - error cases} {
+        assert_error {*wrong number of arguments*} {r msetex}
+        assert_error {*invalid numkeys value*} {r msetex key1 val1 ex 10}
+        assert_error {*wrong number of key-value pairs*} {r msetex 2 key1{t} val1 key2{t}}
+        assert_error {*syntax error*} {r msetex 1 key1 val1 invalid_flag}
+    }
+
+    test {MSETEX - overflow protection in numkeys} {
+        # Test that large numkeys values don't cause integer overflow
+        # This tests the fix for potential overflow in kv_count_long * 2
+        assert_error {*invalid numkeys value*} {r msetex 2147483648 key1 val1 ex 10}
+        assert_error {*wrong number of key-value pairs*} {r msetex 2147483647 key1 val1 ex 10}
+    }
+
+    test {MSETEX - mutually exclusive flags} {
+        # NX and XX are mutually exclusive
+        assert_error {*syntax error*} {r msetex 2 key1{t} val1 key2{t} val2 nx xx ex 10}
+
+        # Multiple expiration flags are mutually exclusive
+        assert_error {*syntax error*} {r msetex 2 key1{t} val1 key2{t} val2 ex 10 px 5000}
+        assert_error {*syntax error*} {r msetex 2 key1{t} val1 key2{t} val2 exat 1735689600 pxat 1735689600000}
+
+        # KEEPTTL conflicts with expiration flags
+        assert_error {*syntax error*} {r msetex 2 key1{t} val1 key2{t} val2 keepttl ex 10}
+        assert_error {*syntax error*} {r msetex 2 key1{t} val1 key2{t} val2 keepttl px 5000}
+    }
+
+    test {MSETEX - repeated EX/PX of the same unit, last wins} {
+        r del dup:key{t}
+        r msetex 1 dup:key{t} val ex 10 ex 100
+        assert_range [r ttl dup:key{t}] 90 100
+
+        r del dup:key{t}
+        r msetex 1 dup:key{t} val px 10000 px 100000
+        assert_range [r ttl dup:key{t}] 90 100
+
+        # Repeated expire options with NX in between
+        r del dup:key{t}
+        r msetex 1 dup:key{t} val ex 10 nx ex 100
+        assert_range [r ttl dup:key{t}] 90 100
+    }
+
+    test {MSETEX - EX/PX are propagated as a single PXAT} {
+        r del repl:nx{t}
+        set repl [attach_to_replication_stream]
+        r msetex 2 repl:key1{t} v1 repl:key2{t} v2 ex 100
+        r msetex 1 repl:key1{t} v3 px 100000 xx
+        r msetex 1 repl:key1{t} v4 ex 10 ex 100
+        r msetex 1 repl:key1{t} v5 px 10000 px 100000
+        r msetex 1 repl:nx{t} v6 ex 10 nx ex 100
+        r msetex 1 repl:key1{t} v7 px 10000 xx px 100000
+        foreach expected {
+            {select *}
+            {msetex 2 repl:key1{t} v1 repl:key2{t} v2 PXAT *}
+            {msetex 1 repl:key1{t} v3 XX PXAT *}
+            {msetex 1 repl:key1{t} v4 PXAT *}
+            {msetex 1 repl:key1{t} v5 PXAT *}
+            {msetex 1 repl:nx{t} v6 NX PXAT *}
+            {msetex 1 repl:key1{t} v7 XX PXAT *}
+        } {
+            set command [read_from_replication_stream $repl]
+            # The timestamp wildcard must not hide extra expiration options.
+            assert_equal [llength $expected] [llength $command]
+            assert_match $expected $command
+        }
+        close_replication_stream $repl
+    } {} {needs:repl}
 
     test "STRLEN against non-existing key" {
         assert_equal 0 [r strlen notakey]
@@ -429,6 +612,11 @@ start_server {tags {"string"}} {
         assert_equal "" [r getrange mykey 0 -1]
     }
 
+    test "GETRANGE against wrong key type" {
+        r lpush lkey1 "list"
+        assert_error {WRONGTYPE Operation against a key holding the wrong kind of value*} {r getrange lkey1 0 -1}
+    }
+
     test "GETRANGE against string value" {
         r set mykey "Hello World"
         assert_equal "Hell" [r getrange mykey 0 3]
@@ -437,6 +625,12 @@ start_server {tags {"string"}} {
         assert_equal "" [r getrange mykey 5 3]
         assert_equal " World" [r getrange mykey 5 5000]
         assert_equal "Hello World" [r getrange mykey -5000 10000]
+        assert_equal "H" [r getrange mykey 0 -100]
+        assert_equal "" [r getrange mykey 1 -100]
+        assert_equal "" [r getrange mykey -1 -100]
+        assert_equal "H" [r getrange mykey -100 -99]
+        assert_equal "H" [r getrange mykey -100 -100]
+        assert_equal "" [r getrange mykey -100 -101]
     }
 
     test "GETRANGE against integer-encoded value" {
@@ -447,6 +641,12 @@ start_server {tags {"string"}} {
         assert_equal "" [r getrange mykey 5 3]
         assert_equal "4" [r getrange mykey 3 5000]
         assert_equal "1234" [r getrange mykey -5000 10000]
+        assert_equal "1" [r getrange mykey 0 -100]
+        assert_equal "" [r getrange mykey 1 -100]
+        assert_equal "" [r getrange mykey -1 -100]
+        assert_equal "1" [r getrange mykey -100 -99]
+        assert_equal "1" [r getrange mykey -100 -100]
+        assert_equal "" [r getrange mykey -100 -101]
     }
 
     test "GETRANGE fuzzing" {
@@ -459,6 +659,27 @@ start_server {tags {"string"}} {
             assert_equal [string range $bin $_start $_end] [r getrange bin $start $end]
         }
     }
+
+    test "Coverage: SUBSTR" {
+        r set key abcde
+        assert_equal "a" [r substr key 0 0]
+        assert_equal "abcd" [r substr key 0 3]
+        assert_equal "bcde" [r substr key -4 -1]
+        assert_equal "" [r substr key -1 -3]
+        assert_equal "" [r substr key 7 8]
+        assert_equal "" [r substr nokey 0 1]
+    }
+    
+if {[string match {*jemalloc*} [s mem_allocator]]} {
+    test {trim on SET with big value} {
+        # set a big value to trigger increasing the query buf
+        r set key [string repeat A 100000] 
+        # set a smaller value but > PROTO_MBULK_BIG_ARG (32*1024) Redis will try to save the query buf itself on the DB.
+        r set key [string repeat A 33000]
+        # asset the value was trimmed
+        assert {[r memory usage key] < 42000}; # 42K to count for Jemalloc's additional memory overhead. 
+    }
+} ;# if jemalloc
 
     test {Extended SET can detect syntax errors} {
         set e {}
@@ -496,6 +717,14 @@ start_server {tags {"string"}} {
         list $old_value $new_value
     } {{} bar}
 
+    test {Extended SET GET option accepts repeated GET tokens} {
+        r del foo
+        r set foo bar
+        set old_value [r set foo baz GET GET]
+        set new_value [r get foo]
+        list $old_value $new_value
+    } {bar baz}
+
     test {Extended SET GET option with XX} {
         r del foo
         r set foo bar
@@ -526,6 +755,21 @@ start_server {tags {"string"}} {
         list $old_value $new_value
     } {bar bar}
 
+    test {Extended SET GET option with a past expiration time and no previous value} {
+        r del foo
+        r debug set-active-expire 0
+        set now [clock milliseconds]
+        set expiredkeys [s expired_keys]
+        set old_value [r set foo baz GET PXAT [expr $now-3000]]
+        assert_equal $old_value {}
+        # Verify that expired_keys was incremented, even though
+        # the key was not added to the DB actually.
+        assert_equal [expr $expiredkeys + 1] [s expired_keys]
+        catch {r debug object foo} e
+        r debug set-active-expire 1
+        set e
+    } {ERR no such key} {needs:debug}
+
     test {Extended SET GET with incorrect type should result in wrong type error} {
       r del foo
       r rpush foo waffle
@@ -548,6 +792,16 @@ start_server {tags {"string"}} {
         assert {$ttl <= 10 && $ttl > 5}
     }
 
+    test {Extended SET PX option with a TTL that overflows when added to the current time} {
+        r del foo
+        r set foo bar
+        assert_error "ERR invalid expire time in 'set' command" {
+            r set foo baz px 9223372036854775807
+        }
+        assert_equal bar [r get foo]
+        assert_equal -1 [r pttl foo]
+    }
+
     test "Extended SET EXAT option" {
         r del foo
         r set foo bar exat [expr [clock seconds] + 10]
@@ -559,6 +813,43 @@ start_server {tags {"string"}} {
         r set foo bar pxat [expr [clock milliseconds] + 10000]
         assert_range [r ttl foo] 5 10
     }
+
+    test {Extended SET PXAT option with a past expiration time} {
+        r set foo bar
+        r debug set-active-expire 0
+        set now [clock milliseconds]
+        set expiredkeys [s expired_keys]
+        r set foo baz PXAT [expr $now-3000]
+        # Verify that expired_keys was incremented, even though
+        # the key was not added to the DB actually.
+        assert_equal [expr $expiredkeys + 1] [s expired_keys]
+        catch {r debug object foo} e
+        r debug set-active-expire 1
+        set e
+    } {ERR no such key} {needs:debug}
+
+    test {SET PXAT with a past expiration time will propagate it as DEL or UNLINK} {
+        r flushall
+        r set foo foo
+        r set bar bar
+        set repl [attach_to_replication_stream]
+
+        # Keys that have expired timestamp will be deleted immediately
+        set now [clock milliseconds]
+        r config set lazyfree-lazy-server-del no
+        assert_equal {OK} [r set foo foo PXAT [expr $now-3000]]
+        r config set lazyfree-lazy-server-del yes
+        assert_equal {OK} [r set bar bar PXAT [expr $now-3000]]
+
+        # Verify the propagate of DEL and UNLINK.
+        assert_replication_stream $repl {
+            {select *}
+            {del foo}
+            {unlink bar}
+        }
+        close_replication_stream $repl
+    } {} {needs:repl}
+
     test {Extended SET using multiple options at once} {
         r set foo val
         assert {[r set foo bar xx px 10000] eq {OK}}
@@ -598,4 +889,922 @@ start_server {tags {"string"}} {
     test {LCS indexes with match len and minimum match len} {
         dict get [r LCS virus1{t} virus2{t} IDX WITHMATCHLEN MINMATCHLEN 5] matches
     } {{{1 222} {13 234} 222}}
+
+    test {SETRANGE with huge offset} {
+        foreach value {9223372036854775807 2147483647} {
+            catch {[r setrange K $value A]} res
+            # expecting a different error on 32 and 64 bit systems
+            if {![string match "*string exceeds maximum allowed size*" $res] && ![string match "*out of range*" $res]} {
+                assert_equal $res "expecting an error"
+           }
+        }
+    }
+
+    test {APPEND modifies the encoding from int to raw} {
+        r del foo
+        r set foo 1
+        assert_encoding "int" foo
+        r append foo 2
+
+        set res {}
+        lappend res [r get foo]
+        assert_encoding "raw" foo
+        
+        r set bar 12
+        assert_encoding "int" bar
+        lappend res [r get bar]
+    } {12 12}
+    
+    # coverage for kvobjComputeSize
+    test {MEMORY USAGE - STRINGS} {
+        set sizes {1 5 8 15 16 17 31 32 33 63 64 65 127 128 129 255 256 257}
+        set hdrsize [expr {[s arch_bits] == 32 ? 12 : 16}]
+        
+        foreach ksize $sizes {
+            set key [string repeat "k" $ksize]
+            # OBJ_ENCODING_EMBSTR, OBJ_ENCODING_RAW        
+            foreach vsize $sizes {
+                set value [string repeat "v" $vsize]                        
+                r set $key $value
+                set memory_used [r memory usage $key]
+                set min [expr $hdrsize + $ksize + $vsize] 
+                assert_lessthan_equal $min $memory_used
+                set max [expr {32 > $min ? 64 : [expr $min * 2]}]
+                assert_morethan_equal $max $memory_used
+            }
+            
+            # OBJ_ENCODING_INT
+            foreach value {1 100 10000 10000000} {
+                r set $key $value
+                set min [expr $hdrsize + $ksize]
+                assert_lessthan_equal $min [r memory usage $key]
+            }
+        }
+    }
+    
+    if {[string match {*jemalloc*} [s mem_allocator]]} {
+        test {Check MEMORY USAGE for embedded key strings with jemalloc} {
+        
+            proc expected_mem {key val with_expire exp_mem_usage exp_debug_sdslen} {
+                r del $key
+                r set $key $val
+                if {$with_expire} { r expire $key 5678315 }
+                assert_equal $exp_mem_usage [r memory usage $key]
+                assert_equal $exp_debug_sdslen [r debug sdslen $key]
+            }
+            
+            if {[s arch_bits] == 64} {  
+                # 16 (kvobj) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 5 (val) + 1 (\0) = 32bytes
+                expected_mem x234 y2345 0 32 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 32, val_sds_len:5, val_sds_avail:0, val_zmalloc: 0"
+                # 16 (kvobj) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 6 (val) + 1 (\0) = 33bytes
+                expected_mem x234 y23456 0 40 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 40, val_sds_len:6, val_sds_avail:7, val_zmalloc: 0"
+                # 16 (kvobj) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 13 (val) + 1 (\0) = 40bytes
+                expected_mem x234 y234561234567 0 40 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 40, val_sds_len:13, val_sds_avail:0, val_zmalloc: 0"
+                # 16 (kvobj) + 8 (expiry) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 13 (val) + 1 (\0) = 48bytes
+                expected_mem x234 y234561234567 1 48 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 48, val_sds_len:13, val_sds_avail:0, val_zmalloc: 0"
+            } else {
+                # 12 (kvobj) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 9 (val) + 1 (\0) = 32bytes
+                expected_mem x234 y23456789 0 32 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 32, val_sds_len:9, val_sds_avail:0, val_zmalloc: 0"
+                # 12 (kvobj) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 10 (val) + 1 (\0) = 33bytes
+                expected_mem x234 y234567890 0 40 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 40, val_sds_len:10, val_sds_avail:7, val_zmalloc: 0"
+                # 12 (kvobj) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 17 (val) + 1 (\0) = 40bytes 
+                expected_mem x234 y2345678901234567 0 40 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 40, val_sds_len:17, val_sds_avail:0, val_zmalloc: 0"
+                # 12 (kvobj) + 8 (expiry) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 17 (val) + 1 (\0) = 48bytes
+                expected_mem x234 y2345678901234567 1 48 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 48, val_sds_len:17, val_sds_avail:0, val_zmalloc: 0"
+            }
+        } {} {needs:debug}
+    }
+
+    test {DIGEST basic usage with plain string} {
+        r set mykey "hello world"
+        set digest [r digest mykey]
+        # Ensure reply is exactly 16 hex characters (works across all Tcl versions)
+        assert {[string length $digest] == 16 && [string is xdigit -strict $digest]}
+    }
+
+    test {DIGEST with empty string} {
+        r set mykey ""
+        set digest [r digest mykey]
+        assert {[string length $digest] == 16 && [string is xdigit -strict $digest]}
+    }
+
+    test {DIGEST with integer-encoded value} {
+        r set mykey 12345
+        assert_encoding int mykey
+        set digest [r digest mykey]
+        assert {[string length $digest] == 16 && [string is xdigit -strict $digest]}
+    }
+
+    test {DIGEST with negative integer} {
+        r set mykey -999
+        assert_encoding int mykey
+        set digest [r digest mykey]
+        assert {[string length $digest] == 16 && [string is xdigit -strict $digest]}
+    }
+
+    test {DIGEST returns consistent hash for same value} {
+        r set mykey "test string"
+        set digest1 [r digest mykey]
+        set digest2 [r digest mykey]
+        assert_equal $digest1 $digest2
+    }
+
+    test {DIGEST returns same hash for same content in different keys} {
+        r set key1 "identical"
+        r set key2 "identical"
+        set digest1 [r digest key1]
+        set digest2 [r digest key2]
+        assert_equal $digest1 $digest2
+    }
+
+    test {DIGEST returns different hash for different values} {
+        r set key1 "value1"
+        r set key2 "value2"
+        set digest1 [r digest key1]
+        set digest2 [r digest key2]
+        assert {$digest1 != $digest2}
+    }
+
+    test {DIGEST with binary data} {
+        r set mykey "\x00\x01\x02\x03\xff\xfe"
+        set digest [r digest mykey]
+        assert {[string length $digest] == 16 && [string is xdigit -strict $digest]}
+    }
+
+    test {DIGEST with unicode characters} {
+        r set mykey "Hello 世界"
+        set digest [r digest mykey]
+        assert {[string length $digest] == 16 && [string is xdigit -strict $digest]}
+    }
+
+    test {DIGEST with very long string} {
+        set longstring [string repeat "Lorem ipsum dolor sit amet. " 1000]
+        r set mykey $longstring
+        set digest [r digest mykey]
+        assert {[string length $digest] == 16 && [string is xdigit -strict $digest]}
+    }
+
+    test {DIGEST against non-existing key} {
+        r del nonexistent
+        assert_equal {} [r digest nonexistent]
+    }
+
+    test {DIGEST against wrong type (list)} {
+        r del mylist
+        r lpush mylist "element"
+        assert_error "*WRONGTYPE*" {r digest mylist}
+    }
+
+    test {DIGEST against wrong type (hash)} {
+        r del myhash
+        r hset myhash field value
+        assert_error "*WRONGTYPE*" {r digest myhash}
+    }
+
+    test {DIGEST against wrong type (set)} {
+        r del myset
+        r sadd myset member
+        assert_error "*WRONGTYPE*" {r digest myset}
+    }
+
+    test {DIGEST against wrong type (zset)} {
+        r del myzset
+        r zadd myzset 1 member
+        assert_error "*WRONGTYPE*" {r digest myzset}
+    }
+
+    test {DIGEST wrong number of arguments} {
+        assert_error "*wrong number of arguments*" {r digest}
+        assert_error "*wrong number of arguments*" {r digest key1 key2}
+    }
+
+    test {DIGEST with special characters and whitespace} {
+        r set mykey "  spaces  \t\n\r"
+        set digest [r digest mykey]
+        assert {[string length $digest] == 16 && [string is xdigit -strict $digest]}
+    }
+
+    test {DIGEST consistency across SET operations} {
+        r set mykey "original"
+        set digest1 [r digest mykey]
+
+        r set mykey "changed"
+        set digest2 [r digest mykey]
+        assert {$digest1 != $digest2}
+
+        r set mykey "original"
+        set digest3 [r digest mykey]
+        assert_equal $digest1 $digest3
+    }
+
+    test {DELEX basic usage without conditions} {
+        r set mykey "hello"
+        assert_equal 1 [r delex mykey]
+
+        r hset myhash f v
+        assert_equal 1 [r delex myhash]
+
+        r zadd mystr 1 m
+        assert_equal 1 [r delex mystr]
+    }
+
+    test {DELEX basic usage with IFEQ} {
+        r set mykey "hello"
+        assert_equal 1 [r delex mykey IFEQ "hello"]
+        assert_equal 0 [r exists mykey]
+
+        r set mykey "hello"
+        assert_equal 0 [r delex mykey IFEQ "world"]
+        assert_equal 1 [r exists mykey]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {DELEX basic usage with IFNE} {
+        r set mykey "hello"
+        assert_equal 1 [r delex mykey IFNE "world"]
+        assert_equal 0 [r exists mykey]
+
+        r set mykey "hello"
+        assert_equal 0 [r delex mykey IFNE "hello"]
+        assert_equal 1 [r exists mykey]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {DELEX basic usage with IFDEQ} {
+        r set mykey "hello"
+        set digest [r digest mykey]
+        assert_equal 1 [r delex mykey IFDEQ $digest]
+        assert_equal 0 [r exists mykey]
+
+        r set mykey "hello"
+        set wrong_digest [format %016x [expr ([scan [r digest mykey] %x] + 1) & 0xffffffffffffffff]]
+        assert_equal 0 [r delex mykey IFDEQ $wrong_digest]
+        assert_equal 1 [r exists mykey]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {DELEX basic usage with IFDNE} {
+        r set mykey "hello"
+        set wrong_digest [format %016x [expr ([scan [r digest mykey] %x] + 1) & 0xffffffffffffffff]]
+        assert_equal 1 [r delex mykey IFDNE $wrong_digest]
+        assert_equal 0 [r exists mykey]
+
+        r set mykey "hello"
+        set digest [r digest mykey]
+        assert_equal 0 [r delex mykey IFDNE $digest]
+        assert_equal 1 [r exists mykey]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {DELEX with non-existing key} {
+        r del nonexistent
+        assert_equal 0 [r delex nonexistent IFEQ "hello"]
+        assert_equal 0 [r delex nonexistent IFNE "hello"]
+        assert_equal 0 [r delex nonexistent IFDEQ 1234567890]
+        assert_equal 0 [r delex nonexistent IFDNE 1234567890]
+    }
+
+    test {DELEX with empty string value} {
+        r set mykey ""
+        assert_equal 1 [r delex mykey IFEQ ""]
+        assert_equal 0 [r exists mykey]
+
+        r set mykey ""
+        assert_equal 0 [r delex mykey IFEQ "notempty"]
+        assert_equal 1 [r exists mykey]
+    }
+
+    test {DELEX with integer-encoded value} {
+        r set mykey 12345
+        assert_encoding int mykey
+        assert_equal 1 [r delex mykey IFEQ "12345"]
+        assert_equal 0 [r exists mykey]
+
+        r set mykey 12345
+        assert_encoding int mykey
+        assert_equal 0 [r delex mykey IFEQ "54321"]
+        assert_equal 1 [r exists mykey]
+    }
+
+    test {DELEX with negative integer} {
+        r set mykey -999
+        assert_encoding int mykey
+        assert_equal 1 [r delex mykey IFEQ "-999"]
+        assert_equal 0 [r exists mykey]
+    }
+
+    test {DELEX with binary data} {
+        r set mykey "\x00\x01\x02\x03\xff\xfe"
+        assert_equal 1 [r delex mykey IFEQ "\x00\x01\x02\x03\xff\xfe"]
+        assert_equal 0 [r exists mykey]
+
+        r set mykey "\x00\x01\x02\x03\xff\xfe"
+        assert_equal 0 [r delex mykey IFEQ "\x00\x01\x02\x03\xff\xff"]
+        assert_equal 1 [r exists mykey]
+    }
+
+    test {DELEX with unicode characters} {
+        r set mykey "Hello 世界"
+        assert_equal 1 [r delex mykey IFEQ "Hello 世界"]
+        assert_equal 0 [r exists mykey]
+
+        r set mykey "Hello 世界"
+        assert_equal 0 [r delex mykey IFEQ "Hello World"]
+        assert_equal 1 [r exists mykey]
+    }
+
+    test {DELEX with very long string} {
+        set longstring [string repeat "Lorem ipsum dolor sit amet. " 1000]
+        r set mykey $longstring
+        assert_equal 1 [r delex mykey IFEQ $longstring]
+        assert_equal 0 [r exists mykey]
+    }
+
+    test {DELEX against wrong type} {
+        r del mylist
+        r lpush mylist "element"
+        assert_error "*ERR*" {r delex mylist IFEQ "element"}
+
+        r del myhash
+        r hset myhash field value
+        assert_error "*ERR*" {r delex myhash IFEQ "value"}
+
+        r del myset
+        r sadd myset member
+        assert_error "*ERR*" {r delex myset IFEQ "member"}
+
+        r del myzset
+        r zadd myzset 1 member
+        assert_error "*ERR*" {r delex myzset IFEQ "member"}
+    }
+
+    test {DELEX wrong number of arguments} {
+        r del key1
+        assert_error "*wrong number of arguments*" {r delex key1 IFEQ}
+   
+        r set key1 x
+        assert_error "*wrong number of arguments*" {r delex key1 IFEQ}
+        assert_error "*wrong number of arguments*" {r delex key1 IFEQ value1 extra}
+    }
+
+    test {DELEX invalid condition} {
+        r set mykey "hello"
+        assert_error "*Invalid condition*" {r delex mykey INVALID "hello"}
+        assert_error "*Invalid condition*" {r delex mykey IF "hello"}
+        assert_error "*Invalid condition*" {r delex mykey EQ "hello"}
+    }
+
+    test {DELEX frees like DEL under lazyfree-lazy-user-del} {
+        set orig_user [lindex [r config get lazyfree-lazy-user-del] 1]
+        set orig_server [lindex [r config get lazyfree-lazy-server-del] 1]
+
+        # A hashtable-encoded hash is freed in many allocations, so it exceeds
+        # LAZYFREE_THRESHOLD and shows whether the free happened in background.
+        foreach {user_del server_del} {yes no no yes} {
+            r config set lazyfree-lazy-user-del $user_del
+            r config set lazyfree-lazy-server-del $server_del
+            set is_async_user_del [expr {[lindex [r config get lazyfree-lazy-user-del] 1] eq "yes"}]
+
+            foreach cmd {del delex} {
+                r del big
+                for {set i 0} {$i < 1024} {incr i} {
+                    r hset big $i value
+                }
+                assert_encoding hashtable big
+
+                wait_lazyfree_done r
+                set before [s lazyfreed_objects]
+                r $cmd big
+                wait_lazyfree_done r
+                assert_equal [expr {$before + $is_async_user_del}] [s lazyfreed_objects]
+            }
+        }
+
+        r config set lazyfree-lazy-user-del $orig_user
+        r config set lazyfree-lazy-server-del $orig_server
+    }
+
+    test {DELEX with special characters and whitespace} {
+        r set mykey "  spaces  \t\n\r"
+        assert_equal 1 [r delex mykey IFEQ "  spaces  \t\n\r"]
+        assert_equal 0 [r exists mykey]
+    }
+
+    test {DELEX digest consistency with same content} {
+        r set key1 "identical"
+        r set key2 "identical"
+        set digest1 [r digest key1]
+        set digest2 [r digest key2]
+        assert_equal $digest1 $digest2
+
+        # Both should be deletable with the same digest
+        assert_equal 1 [r delex key1 IFDEQ $digest2]
+        assert_equal 1 [r delex key2 IFDEQ $digest1]
+    }
+
+    test {DELEX digest with different content} {
+        r set key1 "value1"
+        r set key2 "value2"
+        set digest1 [r digest key1]
+        set digest2 [r digest key2]
+        assert {$digest1 != $digest2}
+
+        # Should not be able to delete with wrong digest
+        assert_equal 0 [r delex key1 IFDEQ $digest2]
+        assert_equal 0 [r delex key2 IFDEQ $digest1]
+
+        # Should be able to delete with correct digest
+        assert_equal 1 [r delex key1 IFDEQ $digest1]
+        assert_equal 1 [r delex key2 IFDEQ $digest2]
+    }
+
+    test {DELEX propagate as DEL command to replica} {
+        r flushall
+        set repl [attach_to_replication_stream]
+        r set foo bar
+        r delex foo IFEQ bar
+        assert_replication_stream $repl {
+            {select *}
+            {set foo bar}
+            {del foo}
+        }
+        close_replication_stream $repl
+    } {} {needs:repl}
+
+    test {DELEX does not propagate when condition not met} {
+        r flushall
+        set repl [attach_to_replication_stream]
+        r set foo bar
+        r delex foo IFEQ baz
+        r set foo bar2
+        assert_replication_stream $repl {
+            {select *}
+            {set foo bar}
+            {set foo bar2}
+        }
+        close_replication_stream $repl
+    } {} {needs:repl}
+
+    test {DELEX with integer that looks like string} {
+        # Set as integer
+        r set key1 123
+        assert_encoding int key1
+        assert_equal 1 [r delex key1 IFEQ "123"]
+        assert_equal 0 [r exists key1]
+
+        # Set as string
+        r set key2 "123"
+        assert_equal 1 [r delex key2 IFEQ "123"]
+        assert_equal 0 [r exists key2]
+    }
+
+    test {Extended SET with IFEQ - key exists and matches} {
+        r set mykey "hello"
+        assert_equal "OK" [r set mykey "world" IFEQ "hello"]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFEQ - key exists but doesn't match} {
+        r set mykey "hello"
+        assert_equal {} [r set mykey "world" IFEQ "different"]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {Extended SET with IFEQ - key doesn't exist} {
+        r del mykey
+        assert_equal {} [r set mykey "world" IFEQ "hello"]
+        assert_equal 0 [r exists mykey]
+    }
+
+    test {Extended SET with IFNE - key exists and doesn't match} {
+        r set mykey "hello"
+        assert_equal "OK" [r set mykey "world" IFNE "different"]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFNE - key exists and matches} {
+        r set mykey "hello"
+        assert_equal {} [r set mykey "world" IFNE "hello"]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {Extended SET with IFNE - key doesn't exist} {
+        r del mykey
+        assert_equal "OK" [r set mykey "world" IFNE "hello"]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFDEQ - key exists and digest matches} {
+        r set mykey "hello"
+        set digest [r digest mykey]
+        assert_equal "OK" [r set mykey "world" IFDEQ $digest]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFDEQ - key exists but digest doesn't match} {
+        r set mykey "hello"
+        set wrong_digest [format %016x [expr ([scan [r digest mykey] %x] + 1) & 0xffffffffffffffff]]
+        assert_equal {} [r set mykey "world" IFDEQ $wrong_digest]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {Extended SET with IFDEQ - key doesn't exist} {
+        r del mykey
+        set digest 1234567890
+        assert_equal {} [r set mykey "world" IFDEQ $digest]
+        assert_equal 0 [r exists mykey]
+    }
+
+    test {Extended SET with IFDNE - key exists and digest doesn't match} {
+        r set mykey "hello"
+        set wrong_digest [format %016x [expr ([scan [r digest mykey] %x] + 1) & 0xffffffffffffffff]]
+        assert_equal "OK" [r set mykey "world" IFDNE $wrong_digest]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFDNE - key exists and digest matches} {
+        r set mykey "hello"
+        set digest [r digest mykey]
+        assert_equal {} [r set mykey "world" IFDNE $digest]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {Extended SET with IFDNE - key doesn't exist} {
+        r del mykey
+        set digest 1234567890
+        assert_equal "OK" [r set mykey "world" IFDNE $digest]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFEQ and GET - key exists and matches} {
+        r set mykey "hello"
+        assert_equal "hello" [r set mykey "world" IFEQ "hello" GET]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFEQ and GET - key exists but doesn't match} {
+        r set mykey "hello"
+        assert_equal "hello" [r set mykey "world" IFEQ "different" GET]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {Extended SET with IFEQ and GET - key doesn't exist} {
+        r del mykey
+        assert_equal {} [r set mykey "world" IFEQ "hello" GET]
+        assert_equal 0 [r exists mykey]
+    }
+
+    test {Extended SET with IFNE and GET - key exists and doesn't match} {
+        r set mykey "hello"
+        assert_equal "hello" [r set mykey "world" IFNE "different" GET]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFNE and GET - key exists and matches} {
+        r set mykey "hello"
+        assert_equal "hello" [r set mykey "world" IFNE "hello" GET]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {Extended SET with IFNE and GET - key doesn't exist} {
+        r del mykey
+        assert_equal {} [r set mykey "world" IFNE "hello" GET]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFDEQ and GET - key exists and digest matches} {
+        r set mykey "hello"
+        set digest [r digest mykey]
+        assert_equal "hello" [r set mykey "world" IFDEQ $digest GET]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFDEQ and GET - key exists but digest doesn't match} {
+        r set mykey "hello"
+        set wrong_digest [format %016x [expr ([scan [r digest mykey] %x] + 1) & 0xffffffffffffffff]]
+        assert_equal "hello" [r set mykey "world" IFDEQ $wrong_digest GET]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {Extended SET with IFDEQ and GET - key doesn't exist} {
+        r del mykey
+        set digest 1234567890
+        assert_equal {} [r set mykey "world" IFDEQ $digest GET]
+        assert_equal 0 [r exists mykey]
+    }
+
+    test {Extended SET with IFDNE and GET - key exists and digest doesn't match} {
+        r set mykey "hello"
+        set wrong_digest [format %016x [expr ([scan [r digest mykey] %x] + 1) & 0xffffffffffffffff]]
+        assert_equal "hello" [r set mykey "world" IFDNE $wrong_digest GET]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFDNE and GET - key exists and digest matches} {
+        r set mykey "hello"
+        set digest [r digest mykey]
+        assert_equal "hello" [r set mykey "world" IFDNE $digest GET]
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {Extended SET with IFDNE and GET - key doesn't exist} {
+        r del mykey
+        set digest 1234567890
+        assert_equal {} [r set mykey "world" IFDNE $digest GET]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with IFEQ and expiration} {
+        r set mykey "hello"
+        assert_equal "OK" [r set mykey "world" IFEQ "hello" EX 10]
+        assert_equal "world" [r get mykey]
+        assert_range [r ttl mykey] 5 10
+    }
+
+    test {Extended SET with IFNE and expiration} {
+        r set mykey "hello"
+        assert_equal "OK" [r set mykey "world" IFNE "different" EX 10]
+        assert_equal "world" [r get mykey]
+        assert_range [r ttl mykey] 5 10
+    }
+
+    test {Extended SET with IFDEQ and expiration} {
+        r set mykey "hello"
+        set digest [r digest mykey]
+        assert_equal "OK" [r set mykey "world" IFDEQ $digest EX 10]
+        assert_equal "world" [r get mykey]
+        assert_range [r ttl mykey] 5 10
+    }
+
+    test {Extended SET with IFDNE and expiration} {
+        r set mykey "hello"
+        set wrong_digest [format %016x [expr ([scan [r digest mykey] %x] + 1) & 0xffffffffffffffff]]
+        assert_equal "OK" [r set mykey "world" IFDNE $wrong_digest EX 10]
+        assert_equal "world" [r get mykey]
+        assert_range [r ttl mykey] 5 10
+    }
+
+    test {Extended SET with IFEQ against wrong type} {
+        r del mylist
+        r lpush mylist "element"
+        assert_error "*WRONGTYPE*" {r set mylist "value" IFEQ "element"}
+    }
+
+    test {Extended SET with IFNE against wrong type} {
+        r del myhash
+        r hset myhash field value
+        assert_error "*WRONGTYPE*" {r set myhash "value" IFNE "value"}
+    }
+
+    test {Extended SET with IFDEQ against wrong type} {
+        r del myset
+        r sadd myset member
+        assert_error "*WRONGTYPE*" {r set myset "value" IFDEQ 1234567890}
+    }
+
+    test {Extended SET with IFDNE against wrong type} {
+        r del myzset
+        r zadd myzset 1 member
+        assert_error "*WRONGTYPE*" {r set myzset "value" IFDNE 1234567890}
+    }
+
+    test {Extended SET with integer-encoded value and IFEQ} {
+        r set mykey 12345
+        assert_encoding int mykey
+        assert_equal "OK" [r set mykey "world" IFEQ "12345"]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with integer-encoded value and IFNE} {
+        r set mykey 12345
+        assert_encoding int mykey
+        assert_equal "OK" [r set mykey "world" IFNE "54321"]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with binary data and IFEQ} {
+        r set mykey "\x00\x01\x02\x03\xff\xfe"
+        assert_equal "OK" [r set mykey "world" IFEQ "\x00\x01\x02\x03\xff\xfe"]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with unicode characters and IFEQ} {
+        r set mykey "Hello 世界"
+        assert_equal "OK" [r set mykey "world" IFEQ "Hello 世界"]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with empty string and IFEQ} {
+        r set mykey ""
+        assert_equal "OK" [r set mykey "world" IFEQ ""]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with empty string and IFNE} {
+        r set mykey ""
+        assert_equal {} [r set mykey "world" IFNE ""]
+        assert_equal "" [r get mykey]
+    }
+
+    test {Extended SET case insensitive conditions} {
+        r set mykey "hello"
+        assert_equal "OK" [r set mykey "world" ifeq "hello"]
+        assert_equal "world" [r get mykey]
+        
+        r set mykey "hello"
+        assert_equal "OK" [r set mykey "world" IfEq "hello"]
+        assert_equal "world" [r get mykey]
+        
+        r set mykey "hello"
+        assert_equal "OK" [r set mykey "world" IFEQ "hello"]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with special characters and IFEQ} {
+        r set mykey "  spaces  \t\n\r"
+        assert_equal "OK" [r set mykey "world" IFEQ "  spaces  \t\n\r"]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET digest consistency with same content} {
+        r set key1 "identical"
+        r set key2 "identical"
+        set digest1 [r digest key1]
+        set digest2 [r digest key2]
+        assert_equal $digest1 $digest2
+        
+        # Both should be settable with the same digest
+        assert_equal "OK" [r set key1 "new1" IFDEQ $digest1]
+        assert_equal "OK" [r set key2 "new2" IFDEQ $digest2]
+        assert_equal "new1" [r get key1]
+        assert_equal "new2" [r get key2]
+    }
+
+    test {Extended SET digest with different content} {
+        r set key1 "value1"
+        r set key2 "value2"
+        set digest1 [r digest key1]
+        set digest2 [r digest key2]
+        assert {$digest1 != $digest2}
+        
+        # Should not be able to set with wrong digest
+        assert_equal {} [r set key1 "new1" IFDEQ $digest2]
+        assert_equal {} [r set key2 "new2" IFDEQ $digest1]
+        assert_equal "value1" [r get key1]
+        assert_equal "value2" [r get key2]
+        
+        # Should be able to set with correct digest
+        assert_equal "OK" [r set key1 "new1" IFDEQ $digest1]
+        assert_equal "OK" [r set key2 "new2" IFDEQ $digest2]
+        assert_equal "new1" [r get key1]
+        assert_equal "new2" [r get key2]
+    }
+
+    test {Extended SET with very long string and IFEQ} {
+        set longstring [string repeat "Lorem ipsum dolor sit amet. " 1000]
+        r set mykey $longstring
+        assert_equal "OK" [r set mykey "world" IFEQ $longstring]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET with negative digest} {
+        r set mykey "test"
+        set digest [r digest mykey]
+        set wrong_digest [format %016x [expr ([scan [r digest mykey] %x] + 1) & 0xffffffffffffffff]]
+        assert_equal "OK" [r set mykey "world" IFDNE $wrong_digest]
+        assert_equal "world" [r get mykey]
+    }
+
+    test {Extended SET - mutually exclusive flags} {
+        r set mykey "hello"
+
+        assert_error "*syntax error*" {r set mykey "world" NX IFEQ "hello"}
+        assert_error "*syntax error*" {r set mykey "world" IFEQ "hello" NX}
+
+        assert_error "*syntax error*" {r set mykey "world" XX IFEQ "hello"}
+        assert_error "*syntax error*" {r set mykey "world" IFEQ "hello" XX}
+
+        assert_error "*syntax error*" {r set mykey "world" NX IFNE "hello"}
+        assert_error "*syntax error*" {r set mykey "world" IFNE "hello" NX}
+
+        assert_error "*syntax error*" {r set mykey "world" XX IFNE "hello"}
+        assert_error "*syntax error*" {r set mykey "world" IFNE "hello" XX}
+
+        assert_error "*syntax error*" {r set mykey "world" NX IFDEQ 0123456789abcdef}
+        assert_error "*syntax error*" {r set mykey "world" IFDEQ 0123456789abcdef NX}
+
+        assert_error "*syntax error*" {r set mykey "world" XX IFDNE 0123456789abcdef}
+        assert_error "*syntax error*" {r set mykey "world" IFDNE 0123456789abcdef XX}
+
+        # IF* conditions are mutually exclusive with each other
+        assert_error "*syntax error*" {r set mykey "world" IFEQ "hello" IFNE "world"}
+        assert_error "*syntax error*" {r set mykey "world" IFNE "world" IFEQ "hello"}
+        assert_error "*syntax error*" {r set mykey "world" IFEQ "hello" IFDEQ 0123456789abcdef}
+        assert_error "*syntax error*" {r set mykey "world" IFDEQ 0123456789abcdef IFDNE fedcba9876543210}
+
+        assert_equal "hello" [r get mykey]
+    }
+
+    test {DIGEST always returns exactly 16 hex characters with leading zeros} {
+        # Test with a value that produces a digest with leading zeros
+        r set foo "v8lf0c11xh8ymlqztfd3eeq16kfn4sspw7fqmnuuq3k3t75em5wdizgcdw7uc26nnf961u2jkfzkjytls2kwlj7626sd"
+        # Verify it matches the expected value with leading zeros
+        assert_equal "00006c38adf31777" [r digest foo]
+    }
+
+    test {IFDEQ/IFDNE reject digest with incorrect format} {
+        r set mykey "test"
+        set digest [r digest mykey]
+
+        # Test with too short digest (15 chars)
+        set short_digest [string range $digest 1 end]
+        assert_error "*must be exactly 16 hexadecimal characters*" {r set mykey "new" IFDEQ $short_digest}
+        assert_error "*must be exactly 16 hexadecimal characters*" {r set mykey "new" IFDNE $short_digest}
+        assert_error "*must be exactly 16 hexadecimal characters*" {r delex mykey IFDEQ $short_digest}
+        assert_error "*must be exactly 16 hexadecimal characters*" {r delex mykey IFDNE $short_digest}
+
+        # Test with too long digest (17 chars)
+        set long_digest "0${digest}"
+        assert_error "*must be exactly 16 hexadecimal characters*" {r set mykey "new" IFDEQ $long_digest}
+        assert_error "*must be exactly 16 hexadecimal characters*" {r set mykey "new" IFDNE $long_digest}
+        assert_error "*must be exactly 16 hexadecimal characters*" {r delex mykey IFDEQ $long_digest}
+        assert_error "*must be exactly 16 hexadecimal characters*" {r delex mykey IFDNE $long_digest}
+
+        # Test with empty digest
+        assert_error "*must be exactly 16 hexadecimal characters*" {r set mykey "new" IFDEQ ""}
+        assert_error "*must be exactly 16 hexadecimal characters*" {r set mykey "new" IFDNE ""}
+        assert_error "*must be exactly 16 hexadecimal characters*" {r delex mykey IFDEQ ""}
+        assert_error "*must be exactly 16 hexadecimal characters*" {r delex mykey IFDNE ""}
+    }
+
+    test {IFDEQ/IFDNE accepts uppercase hex digits (case-insensitive)} {
+        # Test SET IFDEQ with uppercase
+        r set mykey "hello"
+        set digest [r digest mykey]
+        set upper_digest [string toupper $digest]
+        assert_equal "OK" [r set mykey "world" IFDEQ $upper_digest]
+        assert_equal "world" [r get mykey]
+
+        # Test SET IFDEQ with uppercase
+        r set mykey "hello"
+        set digest [r digest mykey]
+        set upper_digest [string toupper $digest]
+        assert_equal "" [r set mykey "world" IFDNE $upper_digest]
+        assert_equal "hello" [r get mykey]
+
+        # Test DELEX IFDEQ with uppercase
+        r set mykey "hello"
+        set upper_digest [string toupper [r digest mykey]]
+        assert_equal 1 [r delex mykey IFDEQ $upper_digest]
+        assert_equal 0 [r exists mykey]
+
+        # Test DELEX IFDNE with uppercase
+        r set mykey "hello"
+        set upper_digest [string toupper [r digest mykey]]
+        assert_equal 0 [r delex mykey IFDNE $upper_digest]
+        assert_equal 1 [r exists mykey]
+    }
+}
+
+start_server {tags {"string" "external:skip"} overrides {appendonly yes auto-aof-rewrite-percentage 0}} {
+    test {MSETEX - repeated EX/PX and NX/XX survive AOF reload} {
+        waitForBgrewriteaof r
+        # Each MSETEX repeats an expire option of the same unit (the last one
+        # wins), with NX or XX before, between or after the two options.
+        set commands {
+            {msetex 2 k1{t} v1 k2{t} v2 nx ex 10 ex 100}
+            {msetex 2 k3{t} v1 k4{t} v2 ex 10 nx ex 100}
+            {msetex 2 k5{t} v1 k6{t} v2 ex 10 ex 100 nx}
+            {msetex 2 k7{t} v1 k8{t} v2 xx ex 10 ex 100}
+            {msetex 2 k9{t} v1 k10{t} v2 ex 10 xx ex 100}
+            {msetex 2 k11{t} v1 k12{t} v2 ex 10 ex 100 xx}
+            {msetex 2 k13{t} v1 k14{t} v2 nx px 10000 px 100000}
+            {msetex 2 k15{t} v1 k16{t} v2 px 10000 nx px 100000}
+            {msetex 2 k17{t} v1 k18{t} v2 px 10000 px 100000 nx}
+            {msetex 2 k19{t} v1 k20{t} v2 xx px 10000 px 100000}
+            {msetex 2 k21{t} v1 k22{t} v2 px 10000 xx px 100000}
+            {msetex 2 k23{t} v1 k24{t} v2 px 10000 px 100000 xx}
+        }
+        set expected {}
+        foreach cmd $commands {
+            set pairs [lrange $cmd 2 5]
+            # XX only sets keys that already exist.
+            if {"xx" in $cmd} {
+                r mset [lindex $pairs 0] old [lindex $pairs 2] old
+            }
+            assert_equal 1 [r {*}$cmd]
+            foreach {key value} $pairs {
+                assert_equal $value [r get $key]
+                assert_range [r ttl $key] 98 100
+                lappend expected $key $value [r pexpiretime $key]
+            }
+        }
+
+        # Every value and absolute expire time must survive an AOF reload.
+        r debug loadaof
+        foreach {key value expire} $expected {
+            assert_equal $value [r get $key]
+            assert_equal $expire [r pexpiretime $key]
+        }
+    } {} {needs:debug}
 }

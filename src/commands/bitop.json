@@ -1,6 +1,6 @@
 {
     "BITOP": {
-        "summary": "Perform bitwise operations between strings",
+        "summary": "Performs bitwise operations on multiple strings, and stores the result.",
         "complexity": "O(N)",
         "group": "bitmap",
         "since": "2.6.0",
@@ -75,6 +75,26 @@
                         "name": "not",
                         "type": "pure-token",
                         "token": "NOT"
+                    },
+                    {
+                        "name": "diff",
+                        "type": "pure-token",
+                        "token": "DIFF"
+                    },
+                    {
+                        "name": "diff1",
+                        "type": "pure-token",
+                        "token": "DIFF1"
+                    },
+                    {
+                        "name": "andor",
+                        "type": "pure-token",
+                        "token": "ANDOR"
+                    },
+                    {
+                        "name": "one",
+                        "type": "pure-token",
+                        "token": "ONE"
                     }
                 ]
             },
@@ -89,6 +109,11 @@
                 "key_spec_index": 1,
                 "multiple": true
             }
-        ]
+        ],
+        "reply_schema": {
+            "description": "the size of the string stored in the destination key, that is equal to the size of the longest input string",
+            "type": "integer",
+            "minimum": 0
+        }
     }
 }

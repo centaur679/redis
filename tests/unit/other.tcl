@@ -6,6 +6,40 @@ start_server {tags {"other"}} {
         } {ok}
     }
 
+    test {Coverage: HELP commands} {
+        assert_match "*OBJECT <subcommand> *" [r OBJECT HELP]
+        assert_match "*MEMORY <subcommand> *" [r MEMORY HELP]
+        assert_match "*PUBSUB <subcommand> *" [r PUBSUB HELP]
+        assert_match "*SLOWLOG <subcommand> *" [r SLOWLOG HELP]
+        assert_match "*CLIENT <subcommand> *" [r CLIENT HELP]
+        assert_match "*COMMAND <subcommand> *" [r COMMAND HELP]
+        assert_match "*CONFIG <subcommand> *" [r CONFIG HELP]
+        assert_match "*FUNCTION <subcommand> *" [r FUNCTION HELP]
+        assert_match "*MODULE <subcommand> *" [r MODULE HELP]
+        assert_match "*HOTKEYS <subcommand> *" [r HOTKEYS HELP]
+    }
+
+    test {Coverage: MEMORY MALLOC-STATS} {
+        if {[string match {*jemalloc*} [s mem_allocator]]} {
+            assert_match "*jemalloc*" [r memory malloc-stats]
+        }
+    }
+
+    test {Coverage: MEMORY PURGE} {
+        if {[string match {*jemalloc*} [s mem_allocator]]} {
+            assert_equal {OK} [r memory purge]
+        }
+    }
+    
+    test {je_malloc_conf compile-time tuning is active} {
+        # Verify je_malloc_conf in src/zmalloc.c overrides jemalloc defaults:
+        # (tcache_nslots_small_max: 200, lg_tcache_nslots_mul: 1).
+        if {[string match {*jemalloc*} [s mem_allocator]]} {
+            assert_equal 1000 [r debug mallctl opt.tcache_nslots_small_max]
+            assert_equal 3    [r debug mallctl opt.lg_tcache_nslots_mul]
+        }
+    } {} {needs:debug}
+
     test {SAVE - make sure there are all the types as values} {
         # Wait for a background saving in progress to terminate
         waitForBgsave r
@@ -49,6 +83,20 @@ start_server {tags {"other"}} {
             r config set save "3600 1 300 100 60 10000"
             r set key value
             r flushall
+            assert_equal [s rdb_changes_since_last_save] 0
+        }
+
+        test {FLUSHALL and bgsave} {
+            r config set save "3600 1 300 100 60 10000"
+            r set x y
+            r bgsave
+            r set x y
+            r multi
+            r debug sleep 1
+            # by the time we'll get to run flushall, the child will finish,
+            # but the parent will be unaware of it, and it could wrongly set the dirty counter.
+            r flushall
+            r exec
             assert_equal [s rdb_changes_since_last_save] 0
         }
     }
@@ -100,7 +148,8 @@ start_server {tags {"other"}} {
         if {$::accurate} {set numops 10000} else {set numops 1000}
         test {Check consistency of different data types after a reload} {
             r flushdb
-            createComplexDataset r $numops usetag
+            # TODO: integrate usehexpire following next commit that will support replication
+            createComplexDataset r $numops {usetag usehexpire}
             if {$::ignoredigest} {
                 set _ 1
             } else {
@@ -187,7 +236,7 @@ start_server {tags {"other"}} {
             } else {
                 set fd2 [socket [srv host] [srv port]]
             }
-            fconfigure $fd2 -encoding binary -translation binary
+            fconfigure $fd2 -translation binary
             if {!$::singledb} {
                 puts -nonewline $fd2 "SELECT 9\r\n"
                 flush $fd2
@@ -336,7 +385,7 @@ start_server {tags {"other external:skip"}} {
         r config set save ""
         r config set rdb-key-save-delay 1000000
 
-        populate 4096 "" 1
+        populate 4095 "" 1
         r bgsave
         wait_for_condition 10 100 {
             [s rdb_bgsave_in_progress] eq 1
@@ -349,12 +398,14 @@ start_server {tags {"other external:skip"}} {
         assert_no_match "*table size: 8192*" [r debug HTSTATS 9]
         exec kill -9 [get_child_pid 0]
         waitForBgsave r
-        after 200 ;# waiting for serverCron
 
         # Hash table should rehash since there is no child process,
-        # size is power of two and over 4098, so it is 8192
-        r set k3 v3
-        assert_match "*table size: 8192*" [r debug HTSTATS 9]
+        # size is power of two and over 4096, so it is 8192
+        wait_for_condition 50 100 {
+            [string match "*table size: 8192*" [r debug HTSTATS 9]]
+        } else {
+            fail "hash table did not rehash after child process killed"
+        }
     } {} {needs:debug needs:local-process}
 }
 
@@ -380,13 +431,14 @@ start_server {tags {"other external:skip"}} {
             assert_match "*/redis-server" [lindex $cmdline 1]
             
             if {$::tls} {
-                set expect_port 0
+                set expect_port [srv 0 pport]
                 set expect_tls_port [srv 0 port]
+                set port [srv 0 pport]
             } else {
                 set expect_port [srv 0 port]
                 set expect_tls_port 0
+                set port [srv 0 port]
             }
-            set port [srv 0 port]
 
             assert_equal "$::host:$port" [lindex $cmdline 2]
             assert_equal $expect_port [lindex $cmdline 3]
@@ -401,3 +453,291 @@ start_server {tags {"other external:skip"}} {
     }
 }
 
+start_cluster 1 0 {tags {"other external:skip cluster slow"}} {
+    r config set dynamic-hz no hz 500
+    test "Redis can trigger resizing" {
+        r flushall
+        # hashslot(foo) is 12182
+        for {set j 1} {$j <= 128} {incr j} {
+            r set "{foo}$j" a
+        }
+        assert_match "*table size: 128*" [r debug HTSTATS 0]
+
+        # disable resizing, the reason for not using slow bgsave is because
+        # it will hit the dict_force_resize_ratio.
+        r debug dict-resizing 0
+
+        # delete data to have lot's (96%) of empty buckets
+        for {set j 1} {$j <= 123} {incr j} {
+            r del "{foo}$j"
+        }
+        assert_match "*table size: 128*" [r debug HTSTATS 0]
+
+        # enable resizing
+        r debug dict-resizing 1
+
+        # waiting for serverCron to resize the tables
+        wait_for_condition 1000 10 {
+            [string match {*table size: 8*} [r debug HTSTATS 0]]
+        } else {
+            puts [r debug HTSTATS 0]
+            fail "hash tables weren't resize."
+        }
+    } {} {needs:debug}
+
+    test "Redis can rewind and trigger smaller slot resizing" {
+        # hashslot(foo) is 12182
+        # hashslot(alice) is 749, smaller than hashslot(foo),
+        # attempt to trigger a resize on it, see details in #12802.
+        for {set j 1} {$j <= 128} {incr j} {
+            r set "{alice}$j" a
+        }
+
+        # disable resizing, the reason for not using slow bgsave is because
+        # it will hit the dict_force_resize_ratio.
+        r debug dict-resizing 0
+
+        for {set j 1} {$j <= 123} {incr j} {
+            r del "{alice}$j"
+        }
+
+        # enable resizing
+        r debug dict-resizing 1
+
+        # waiting for serverCron to resize the tables
+        wait_for_condition 1000 10 {
+            [string match {*table size: 16*} [r debug HTSTATS 0]]
+        } else {
+            puts [r debug HTSTATS 0]
+            fail "hash tables weren't resize."
+        }
+    } {} {needs:debug}
+}
+
+start_server {tags {"other external:skip"}} {
+    test "Redis can resize empty dict" {
+        # Write and then delete 128 keys, creating an empty dict
+        r flushall
+        
+        # Add one key to the db just to create the dict and get its initial size
+        r set x 1
+        set initial_size [dict get [r memory stats] db.9 overhead.hashtable.main] 
+        
+        # Now add 128 keys and then delete them
+        for {set j 1} {$j <= 128} {incr j} {
+            r set $j{b} a
+        }
+        
+        for {set j 1} {$j <= 128} {incr j} {
+            r del $j{b}
+        }
+        
+        # dict must have expanded. Verify it eventually shrinks back to its initial size.
+        wait_for_condition 100 50 {
+            [dict get [r memory stats] db.9 overhead.hashtable.main] == $initial_size
+        } else {
+            fail "dict did not resize in time to its initial size"
+        }
+    }
+}
+
+start_server {tags {"other external:skip"} overrides {cluster-compatibility-sample-ratio 100}} {
+    test {Cross DB command is incompatible with cluster mode} {
+        set incompatible_ops [s cluster_incompatible_ops]
+
+        # SELECT with 0 is compatible command in cluster mode
+        assert_equal {OK} [r select 0]
+        assert_equal $incompatible_ops [s cluster_incompatible_ops]
+
+        # SELECT with nonzero is incompatible command in cluster mode
+        assert_equal {OK} [r select 1]
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+
+        # SWAPDB is incompatible command in cluster mode
+        assert_equal {OK} [r swapdb 0 1]
+        assert_equal [expr $incompatible_ops + 2] [s cluster_incompatible_ops]
+
+
+        # If destination db in COPY command is equal to source db, it is compatible
+        # with cluster mode, otherwise it is incompatible.
+        r select 0
+        r set key1 value1
+        set incompatible_ops [s cluster_incompatible_ops]
+        assert_equal {1} [r copy key1 key2{key1}] ;# destination db is equal to source db
+        assert_equal $incompatible_ops [s cluster_incompatible_ops]
+        assert_equal {1} [r copy key2{key1} key1 db 1] ;# destination db is not equal to source db
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+
+        # If destination db in MOVE command is not equal to source db, it is incompatible
+        # with cluster mode.
+        r set key3 value3
+        assert_equal {1} [r move key3 1]
+        assert_equal [expr $incompatible_ops + 2] [s cluster_incompatible_ops]
+    } {} {cluster:skip}
+
+    test {Function no-cluster flag is incompatible with cluster mode} {
+        set incompatible_ops [s cluster_incompatible_ops]
+
+        # no-cluster flag is incompatible with cluster mode
+        r function load {#!lua name=test
+            redis.register_function{function_name='f1', callback=function() return 'hello' end, flags={'no-cluster'}}
+        }
+        r fcall f1 0
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+
+        # It is compatible without no-cluster flag, should not increase the cluster_incompatible_ops
+        r function load {#!lua name=test2
+            redis.register_function{function_name='f2', callback=function() return 'hello' end}
+        }
+        r fcall f2 0
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+    } {} {cluster:skip}
+
+    test {Script no-cluster flag is incompatible with cluster mode} {
+        set incompatible_ops [s cluster_incompatible_ops]
+
+        # no-cluster flag is incompatible with cluster mode
+        r eval {#!lua flags=no-cluster
+                return 1
+            } 0
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+
+        # It is compatible without no-cluster flag, should not increase the cluster_incompatible_ops
+        r eval {#!lua
+                return 1
+            } 0
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+    } {} {cluster:skip}
+
+    test {SORT command incompatible operations with cluster mode} {
+        set incompatible_ops [s cluster_incompatible_ops]
+
+        # If the BY pattern slot is not equal with the slot of keys, we consider
+        # an incompatible behavior, otherwise it is compatible, should not increase
+        # the cluster_incompatible_ops
+        r lpush mylist 1 2 3
+        for {set i 1} {$i < 4} {incr i} {
+            r set weight_$i [expr 4 - $i]
+        }
+        assert_equal {3 2 1} [r sort mylist BY weight_*]
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+        # weight{mylist}_* and mylist have the same slot
+        for {set i 1} {$i < 4} {incr i} {
+            r set weight{mylist}_$i [expr 4 - $i]
+        }
+        assert_equal {3 2 1} [r sort mylist BY weight{mylist}_*]
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+
+        # If the GET pattern slot is not equal with the slot of keys, we consider
+        # an incompatible behavior, otherwise it is compatible, should not increase
+        # the cluster_incompatible_ops
+        for {set i 1} {$i < 4} {incr i} {
+            r set object_$i o_$i
+        }
+        assert_equal {o_3 o_2 o_1} [r sort mylist BY weight{mylist}_* GET object_*]
+        assert_equal [expr $incompatible_ops + 2] [s cluster_incompatible_ops]
+        # object{mylist}_*, weight{mylist}_* and mylist have the same slot
+        for {set i 1} {$i < 4} {incr i} {
+            r set object{mylist}_$i o_$i
+        }
+        assert_equal {o_3 o_2 o_1} [r sort mylist BY weight{mylist}_* GET object{mylist}_*]
+        assert_equal [expr $incompatible_ops + 2] [s cluster_incompatible_ops]
+    } {} {cluster:skip}
+
+    test {Normal cross slot commands are incompatible with cluster mode} {
+        # Normal cross slot command
+        set incompatible_ops [s cluster_incompatible_ops]
+        r mset foo bar bar foo
+        r del foo bar
+        assert_equal [expr $incompatible_ops + 2] [s cluster_incompatible_ops]
+    } {} {cluster:skip}
+
+    test {Transaction is incompatible with cluster mode} {
+        set incompatible_ops [s cluster_incompatible_ops]
+
+        # Incomplete transaction
+        catch {r EXEC}
+        r multi
+        r exec
+        assert_equal $incompatible_ops [s cluster_incompatible_ops]
+
+        # Transaction, SET and DEL have keys with different slots
+        r multi
+        r set foo bar
+        r del bar
+        r exec
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+    } {} {cluster:skip}
+
+    test {Lua scripts are incompatible with cluster mode} {
+        # Lua script, declared keys have different slots, it is not a compatible operation
+        set incompatible_ops [s cluster_incompatible_ops]
+        r eval {#!lua
+            redis.call('mset', KEYS[1], 0, KEYS[2], 0)
+        } 2 foo bar
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+
+        # Lua script, no declared keys, but accessing keys have different slots,
+        # it is not a compatible operation
+        set incompatible_ops [s cluster_incompatible_ops]
+        r eval {#!lua
+            redis.call('mset', 'foo', 0, 'bar', 0)
+        } 0
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+
+        # Lua script, declared keys have the same slot, but accessing keys
+        # have different slots in one command, even with flag 'allow-cross-slot-keys',
+        # it still is not a compatible operation
+        set incompatible_ops [s cluster_incompatible_ops]
+        r eval {#!lua flags=allow-cross-slot-keys
+            redis.call('mset', 'foo', 0, 'bar', 0)
+            redis.call('mset', KEYS[1], 0, KEYS[2], 0)
+        } 2 foo bar{foo}
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+
+        # Lua script, declared keys have the same slot, but accessing keys have different slots
+        # in multiple commands, and with flag 'allow-cross-slot-keys', it is a compatible operation
+        set incompatible_ops [s cluster_incompatible_ops]
+        r eval {#!lua flags=allow-cross-slot-keys
+            redis.call('set', 'foo', 0)
+            redis.call('set', 'bar', 0)
+            redis.call('mset', KEYS[1], 0, KEYS[2], 0)
+        } 2 foo bar{foo}
+        assert_equal $incompatible_ops [s cluster_incompatible_ops]
+    } {} {cluster:skip}
+
+    test {Shard subscribe commands are incompatible with cluster mode} {
+        set rd1 [redis_deferring_client]
+        set incompatible_ops [s cluster_incompatible_ops]
+        assert_equal {1 2} [ssubscribe $rd1 {foo bar}]
+        assert_equal [expr $incompatible_ops + 1] [s cluster_incompatible_ops]
+    } {} {cluster:skip}
+
+    test {cluster-compatibility-sample-ratio configuration can work} {
+        # Disable cluster compatibility sampling, no increase in cluster_incompatible_ops
+        set incompatible_ops [s cluster_incompatible_ops]
+        r config set cluster-compatibility-sample-ratio 0
+        for {set i 0} {$i < 100} {incr i} {
+            r mset foo bar$i bar foo$i
+        }
+        # Enable cluster compatibility sampling again to show the metric
+        r config set cluster-compatibility-sample-ratio 1
+        assert_equal $incompatible_ops [s cluster_incompatible_ops]
+
+        # 100% sample ratio, all operations should increase cluster_incompatible_ops
+        set incompatible_ops [s cluster_incompatible_ops]
+        r config set cluster-compatibility-sample-ratio 100
+        for {set i 0} {$i < 100} {incr i} {
+            r mset foo bar$i bar foo$i
+        }
+        assert_equal [expr $incompatible_ops + 100] [s cluster_incompatible_ops]
+
+        # 30% sample ratio, cluster_incompatible_ops should increase between 20% and 40%
+        set incompatible_ops [s cluster_incompatible_ops]
+        r config set cluster-compatibility-sample-ratio 30
+        for {set i 0} {$i < 1000} {incr i} {
+            r mset foo bar$i bar foo$i
+        }
+        assert_range [s cluster_incompatible_ops] [expr $incompatible_ops + 200] [expr $incompatible_ops + 400]
+    } {} {cluster:skip}
+}

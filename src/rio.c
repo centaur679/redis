@@ -1,3 +1,17 @@
+/*
+ * Copyright (c) 2009-Present, Redis Ltd.
+ * All rights reserved.
+ *
+ * Copyright (c) 2024-present, Valkey contributors.
+ * All rights reserved.
+ *
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
+ *
+ * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+ */
+
 /* rio.c is a simple stream-oriented I/O abstraction that provides an interface
  * to write code that can consume/produce data using different concrete input
  * and output devices. For instance the same rdb.c code using the rio
@@ -14,34 +28,6 @@
  * for the current checksum.
  *
  * ----------------------------------------------------------------------------
- *
- * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
  */
 
 
@@ -151,6 +137,16 @@ static size_t rioFileWrite(rio *r, const void *buf, size_t len) {
 #else
             if (redis_fsync(fileno(r->io.file.fp)) == -1) return 0;
 #endif
+            if (r->io.file.reclaim_cache) {
+                /* In Linux sync_file_range just issue a writeback request to
+                 * OS, and when posix_fadvise is called, the dirty page may
+                 * still be in flushing, which means it would be ignored by
+                 * posix_fadvise.
+                 * 
+                 * So we posix_fadvise the whole file, and the writeback-ed 
+                 * pages will have other chances to be reclaimed. */
+                reclaimFilePageCache(fileno(r->io.file.fp), 0, 0);
+            }
             r->io.file.buffered = 0;
         }
     }
@@ -191,6 +187,95 @@ void rioInitWithFile(rio *r, FILE *fp) {
     r->io.file.fp = fp;
     r->io.file.buffered = 0;
     r->io.file.autosync = 0;
+    r->io.file.reclaim_cache = 0;
+}
+
+/* Buffered read used by rioInitWithFileLoad(): reads directly from the
+ * underlying fd in RIO_FILE_LOAD_BUFLEN-sized chunks (bypassing stdio) and
+ * checksums each freshly read chunk in one crc64() call, rather than once
+ * per (often just a few bytes) caller request. This lets small RDB fields
+ * still feed the checksum buffers large enough to engage SIMD-accelerated
+ * crc64 implementations.
+ *
+ * The trailing 8-byte RDB checksum footer must never itself be folded into
+ * the running checksum, but a single physical read routinely spans both the
+ * last content bytes and the footer. content_end (filesize - 8) is used to
+ * clip the checksum to the content portion of each chunk. */
+#define RIO_FILE_LOAD_BUFLEN (4*1024)
+
+/* Fold up to 'n' freshly read bytes at 'buf' into the running checksum,
+ * clipped to the content/footer boundary, and advance read_offset. Shared
+ * by both the buffered-refill and direct-to-destination read paths below,
+ * since the clip is based on absolute file offsets and doesn't care where
+ * in memory the bytes landed. */
+static void rioFileLoadChecksumChunk(rio *r, const void *buf, ssize_t n) {
+    if (r->flags & RIO_FLAG_CKSUM_AT_SOURCE) {
+        off_t cksum_len = r->io.file.content_end - r->io.file.read_offset;
+        if (cksum_len > n) cksum_len = n;
+        if (cksum_len > 0) r->cksum = crc64(r->cksum, buf, (size_t)cksum_len);
+    }
+    r->io.file.read_offset += n;
+}
+
+static size_t rioFileLoadRead(rio *r, void *dst, size_t len) {
+    unsigned char *out = dst;
+    while (len) {
+        size_t avail = r->io.file.read_buf_valid - r->io.file.read_buf_pos;
+        if (avail) {
+            size_t take = avail < len ? avail : len;
+            memcpy(out, r->io.file.read_buf + r->io.file.read_buf_pos, take);
+            r->io.file.read_buf_pos += take;
+            out += take;
+            len -= take;
+            continue;
+        }
+        /* read_buf is empty. A request at least as large as one buffer's
+         * worth can be read straight into the destination for its
+         * RIO_FILE_LOAD_BUFLEN-aligned bulk, skipping the extra copy
+         * through read_buf entirely - the same optimization glibc's
+         * fread() applies for large reads. Only the unaligned remainder
+         * (always < RIO_FILE_LOAD_BUFLEN) goes through the buffer. */
+        if (len >= RIO_FILE_LOAD_BUFLEN) {
+            size_t direct_len = len - (len % RIO_FILE_LOAD_BUFLEN);
+            ssize_t n = read(fileno(r->io.file.fp), out, direct_len);
+            if (n <= 0) return 0;
+            rioFileLoadChecksumChunk(r, out, n);
+            out += n;
+            len -= n;
+            continue;
+        }
+
+        /* read_buf is empty and the remaining request fits one buffer:
+         * refill read_buf, then serve len on the next iteration. */        
+        ssize_t n = read(fileno(r->io.file.fp), r->io.file.read_buf, RIO_FILE_LOAD_BUFLEN);
+        if (n <= 0) return 0;
+        rioFileLoadChecksumChunk(r, r->io.file.read_buf, n);
+        r->io.file.read_buf_pos = 0;
+        r->io.file.read_buf_valid = (size_t)n;
+    }
+    return 1;
+}
+
+/* Create an RIO for sequentially loading an existing file of known size
+ * (an RDB, possibly an AOF's RDB preamble). Checksum computation happens
+ * inside the read() method itself (see rioFileLoadRead), at the granularity
+ * of physical reads rather than the caller's request size; callers that
+ * otherwise checksum every rioRead() unconditionally must check the
+ * RIO_FLAG_CKSUM_AT_SOURCE flag and skip their own checksum step. */
+void rioInitWithFileLoad(rio *r, FILE *fp, off_t filesize, int compute_checksum) {
+    rioInitWithFile(r, fp);
+    r->read = rioFileLoadRead;
+    if (compute_checksum) r->flags |= RIO_FLAG_CKSUM_AT_SOURCE;
+    r->io.file.read_buf = zmalloc(RIO_FILE_LOAD_BUFLEN);
+    r->io.file.read_buf_pos = 0;
+    r->io.file.read_buf_valid = 0;
+    r->io.file.read_offset = 0;
+    r->io.file.content_end = filesize > 8 ? filesize - 8 : 0;
+}
+
+void rioFreeFileLoad(rio *r) {
+    zfree(r->io.file.read_buf);
+    r->io.file.read_buf = NULL;
 }
 
 /* ------------------- Connection implementation -------------------
@@ -418,6 +503,140 @@ void rioFreeFd(rio *r) {
     sdsfree(r->io.fd.buf);
 }
 
+/* ------------------- Connection set implementation ------------------
+ * This target is used to write the RDB file to a set of replica connections as
+ * part of rdb channel replication. */
+
+/* Returns 1 for success, 0 for failure.
+ * The function returns success as long as we are able to correctly write
+ * to at least one file descriptor.
+ *
+ * When buf is NULL or len is 0, the function performs a flush operation if
+ * there is some pending buffer, so this function is also used in order to
+ * implement rioConnsetFlush(). */
+static size_t rioConnsetWrite(rio *r, const void *buf, size_t len) {
+    const size_t pre_flush_size = 256 * 1024;
+    unsigned char *p = (unsigned char*) buf;
+    size_t buflen = len;
+    size_t failed = 0; /* number of connections that write() returned error. */
+
+    /* For small writes, we rather keep the data in user-space buffer, and flush
+     * it only when it grows. however for larger writes, we prefer to flush
+     * any pre-existing buffer, and write the new one directly without reallocs
+     * and memory copying. */
+    if (len > pre_flush_size) {
+        rioConnsetWrite(r, NULL, 0);
+    } else {
+        if (buf && len) {
+            r->io.connset.buf = sdscatlen(r->io.connset.buf, buf, len);
+            if (sdslen(r->io.connset.buf) <= PROTO_IOBUF_LEN)
+                return 1;
+        }
+
+        p = (unsigned char *)r->io.connset.buf;
+        buflen = sdslen(r->io.connset.buf);
+    }
+
+    while (buflen > 0) {
+        /* Write in little chunks so that when there are big writes we
+         * parallelize while the kernel is sending data in background to the
+         * TCP socket. */
+        size_t limit = PROTO_IOBUF_LEN * 2;
+        size_t count = buflen < limit ? buflen : limit;
+
+        for (size_t i = 0; i < r->io.connset.n_dst; i++) {
+            size_t n_written = 0;
+
+            if (r->io.connset.dst[i].failed != 0) {
+                failed++;
+                continue; /* Skip failed connections. */
+            }
+
+            do {
+                ssize_t ret;
+                connection *c = r->io.connset.dst[i].conn;
+
+                ret = connWrite(c, p + n_written, count - n_written);
+                if (ret <= 0) {
+                    if (errno == 0)
+                        errno = EIO;
+                    /* With blocking sockets, which is the sole user of this
+                     * rio target, EWOULDBLOCK is returned only because of
+                     * the SO_SNDTIMEO socket option, so we translate the error
+                     * into one more recognizable by the user. */
+                    if (ret == -1 && errno == EWOULDBLOCK)
+                        errno = ETIMEDOUT;
+
+                    r->io.connset.dst[i].failed = 1;
+                    failed++;
+                    break;
+                }
+                n_written += ret;
+            } while (n_written != count);
+        }
+        if (failed == r->io.connset.n_dst)
+            return 0; /* All the connections have failed. */
+
+        p += count;
+        buflen -= count;
+        r->io.connset.pos += count;
+    }
+
+    sdsclear(r->io.connset.buf);
+    return 1;
+}
+
+/* Returns 1 or 0 for success/failure. */
+static size_t rioConnsetRead(rio *r, void *buf, size_t len) {
+    UNUSED(r);
+    UNUSED(buf);
+    UNUSED(len);
+    return 0; /* Error, this target does not support reading. */
+}
+
+/* Returns the number of sent bytes. */
+static off_t rioConnsetTell(rio *r) {
+    return r->io.connset.pos;
+}
+
+/* Flushes any buffer to target device if applicable. Returns 1 on success
+ * and 0 on failures. */
+static int rioConnsetFlush(rio *r) {
+    /* Our flush is implemented by the write method, that recognizes a
+     * buffer set to NULL with a count of zero as a flush request. */
+    return rioConnsetWrite(r, NULL, 0);
+}
+
+static const rio rioConnsetIO = {
+        rioConnsetRead,
+        rioConnsetWrite,
+        rioConnsetTell,
+        rioConnsetFlush,
+        NULL,            /* update_checksum */
+        0,               /* current checksum */
+        0,               /* flags */
+        0,               /* bytes read or written */
+        0,               /* read/write chunk size */
+        { { NULL, 0 } }  /* union for io-specific vars */
+};
+
+void rioInitWithConnset(rio *r, connection **conns, size_t n_conns) {
+    *r = rioConnsetIO;
+    r->io.connset.dst = zcalloc(sizeof(*r->io.connset.dst) * n_conns);
+    r->io.connset.n_dst = n_conns;
+    r->io.connset.pos = 0;
+    r->io.connset.buf = sdsempty();
+
+    for (size_t i = 0; i < n_conns; i++)
+        r->io.connset.dst[i].conn = conns[i];
+}
+
+/* release the rio stream. */
+void rioFreeConnset(rio *r) {
+    zfree(r->io.connset.dst);
+    sdsfree(r->io.connset.buf);
+}
+
 /* ---------------------------- Generic functions ---------------------------- */
 
 /* This function can be installed both in memory and file streams when checksum
@@ -437,6 +656,15 @@ void rioGenericUpdateChecksum(rio *r, const void *buf, size_t len) {
 void rioSetAutoSync(rio *r, off_t bytes) {
     if(r->write != rioFileIO.write) return;
     r->io.file.autosync = bytes;
+}
+
+/* Set the file-based rio object to reclaim cache after every auto-sync.
+ * In the Linux implementation POSIX_FADV_DONTNEED skips the dirty
+ * pages, so if auto sync is unset this option will have no effect.
+ * 
+ * This feature can reduce the cache footprint backed by the file. */
+void rioSetReclaimCache(rio *r, int enabled) {
+    r->io.file.reclaim_cache = enabled;
 }
 
 /* Check the type of rio. */

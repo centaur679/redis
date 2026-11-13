@@ -10,6 +10,9 @@ TIMEOUT=2000
 NODES=6
 REPLICAS=1
 PROTECTED_MODE=yes
+# The nodes talk over an unauthenticated cluster bus on loopback, which a cluster
+# node refuses to do by default, so protection has to be waived explicitly.
+BUS_PROTECTED_MODE=no
 ADDITIONAL_OPTIONS=""
 
 # You may want to put the above config parameters into config.sh in order to
@@ -28,7 +31,7 @@ then
     while [ $((PORT < ENDPORT)) != "0" ]; do
         PORT=$((PORT+1))
         echo "Starting $PORT"
-        $BIN_PATH/redis-server --port $PORT --protected-mode $PROTECTED_MODE --cluster-enabled yes --cluster-config-file nodes-${PORT}.conf --cluster-node-timeout $TIMEOUT --appendonly yes --appendfilename appendonly-${PORT}.aof --appenddirname appendonlydir-${PORT} --dbfilename dump-${PORT}.rdb --logfile ${PORT}.log --daemonize yes ${ADDITIONAL_OPTIONS}
+        $BIN_PATH/redis-server --port $PORT --protected-mode $PROTECTED_MODE --cluster-enabled yes --cluster-bus-port-protected-mode $BUS_PROTECTED_MODE --cluster-config-file nodes-${PORT}.conf --cluster-node-timeout $TIMEOUT --appendonly yes --appendfilename appendonly-${PORT}.aof --appenddirname appendonlydir-${PORT} --dbfilename dump-${PORT}.rdb --logfile ${PORT}.log --daemonize yes ${ADDITIONAL_OPTIONS}
     done
     exit 0
 fi
@@ -54,6 +57,23 @@ then
         PORT=$((PORT+1))
         echo "Stopping $PORT"
         $BIN_PATH/redis-cli -p $PORT shutdown nosave
+    done
+    exit 0
+fi
+
+if [ "$1" == "restart" ]
+then
+    OLD_PORT=$PORT
+    while [ $((PORT < ENDPORT)) != "0" ]; do
+        PORT=$((PORT+1))
+        echo "Stopping $PORT"
+        $BIN_PATH/redis-cli -p $PORT shutdown nosave
+    done
+    PORT=$OLD_PORT
+    while [ $((PORT < ENDPORT)) != "0" ]; do
+        PORT=$((PORT+1))
+        echo "Starting $PORT"
+        $BIN_PATH/redis-server --port $PORT --protected-mode $PROTECTED_MODE --cluster-enabled yes --cluster-bus-port-protected-mode $BUS_PROTECTED_MODE --cluster-config-file nodes-${PORT}.conf --cluster-node-timeout $TIMEOUT --appendonly yes --appendfilename appendonly-${PORT}.aof --appenddirname appendonlydir-${PORT} --dbfilename dump-${PORT}.rdb --logfile ${PORT}.log --daemonize yes ${ADDITIONAL_OPTIONS}
     done
     exit 0
 fi
@@ -113,10 +133,11 @@ then
     exit 0
 fi
 
-echo "Usage: $0 [start|create|stop|watch|tail|tailall|clean|clean-logs|call]"
+echo "Usage: $0 [start|create|stop|restart|watch|tail|tailall|clean|clean-logs|call]"
 echo "start       -- Launch Redis Cluster instances."
 echo "create [-f] -- Create a cluster using redis-cli --cluster create."
 echo "stop        -- Stop Redis Cluster instances."
+echo "restart     -- Restart Redis Cluster instances."
 echo "watch       -- Show CLUSTER NODES output (first 30 lines) of first node."
 echo "tail <id>   -- Run tail -f of instance at base port + ID."
 echo "tailall     -- Run tail -f for all the log files at once."

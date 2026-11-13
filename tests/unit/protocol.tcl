@@ -55,6 +55,60 @@ start_server {tags {"protocol network"}} {
         assert_error "*expected '$', got 'f'*" {r read}
     }
 
+    # The parser keeps a partially parsed command around between reads. A
+    # protocol error detected on a later read used to be recorded on that
+    # carried over command but never reported, leaving the client hanging
+    # while its query buffer kept growing. Send the header and the offending
+    # part in two separate writes so they land in two different reads.
+    test "Protocol error is reported when the command is split across reads" {
+        reconnect
+        r write "*3\r\n\$3\r\nSET\r\n\$1\r\nx\r\n"
+        r flush
+        after 100
+        r write "fooz\r\n"
+        r flush
+        assert_error "*expected '$', got 'f'*" {r read}
+    }
+
+    test "Invalid bulk length is reported when the command is split across reads" {
+        reconnect
+        r write "*3\r\n\$3\r\nSET\r\n\$1\r\nx\r\n"
+        r flush
+        after 100
+        r write "\$blabla\r\n"
+        r flush
+        assert_error "*invalid bulk length*" {r read}
+    }
+
+    # PROTO_INLINE_MAX_SIZE is 64k. A bulk count string longer than that has to
+    # be rejected instead of being buffered up to the query buffer limit. The
+    # header necessarily spans several reads, so this only works once an error
+    # found on a later read is actually reported.
+    test "Too big bulk count string" {
+        reconnect
+        r write "*1\r\n\$"
+        r flush
+        r write [string repeat 1 [expr {64*1024+16}]]
+        r flush
+        assert_error "*too big bulk count string*" {r read}
+    }
+
+    test "Too big multibulk count string" {
+        reconnect
+        r write "*"
+        r flush
+        r write [string repeat 1 [expr {64*1024+16}]]
+        r flush
+        assert_error "*too big mbulk count string*" {r read}
+    }
+
+    test "Too big inline request" {
+        reconnect
+        r write [string repeat A [expr {64*1024+16}]]
+        r flush
+        assert_error "*too big inline request*" {r read}
+    }
+
     test "Generic wrong number of args" {
         reconnect
         assert_error "*wrong*arguments*ping*" {r ping x y z}
@@ -110,16 +164,21 @@ start_server {tags {"protocol network"}} {
     # raw RESP response tests
     r readraw 1
 
+    set nullres {*-1}
+    if {$::force_resp3} {
+        set nullres {_}
+    }
+
     test "raw protocol response" {
         r srandmember nonexisting_key
-    } {*-1}
+    } "$nullres"
 
     r deferred 1
 
     test "raw protocol response - deferred" {
         r srandmember nonexisting_key
         r read
-    } {*-1}
+    } "$nullres"
 
     test "raw protocol response - multiline" {
         r sadd ss a
@@ -128,6 +187,54 @@ start_server {tags {"protocol network"}} {
         assert_equal [r read] {*1}
         assert_equal [r read] {$1}
         assert_equal [r read] {a}
+    }
+
+    test "bulk reply protocol" {
+        # value=2 (int encoding)
+        r set crlf 2
+        assert_equal [r rawread 5] "+OK\r\n"
+        r get crlf
+        assert_equal [r rawread 7] "\$1\r\n2\r\n"
+
+        # value=2147483647 (int encoding)
+        r set crlf 2147483647
+        assert_equal [r rawread 5] "+OK\r\n"
+        r get crlf
+        assert_equal [r rawread 17] "\$10\r\n2147483647\r\n"
+
+        # value=-2147483648 (int encoding)
+        r set crlf -2147483648
+        assert_equal [r rawread 5] "+OK\r\n"
+        r get crlf
+        assert_equal [r rawread 18] "\$11\r\n-2147483648\r\n"
+
+        # value=-9223372036854775809 (embstr encoding)
+        r set crlf -9223372036854775809
+        assert_equal [r rawread 5] "+OK\r\n"
+        r get crlf
+        assert_equal [r rawread 27] "\$20\r\n-9223372036854775809\r\n"
+
+        # value=9223372036854775808 (embstr encoding)
+        r set crlf 9223372036854775808
+        assert_equal [r rawread 5] "+OK\r\n"
+        r get crlf
+        assert_equal [r rawread 26] "\$19\r\n9223372036854775808\r\n"
+
+        # normal sds (embstr encoding)
+        r set crlf aaaaaaaaaaaaaaaa
+        assert_equal [r rawread 5] "+OK\r\n"
+        r get crlf
+        assert_equal [r rawread 23] "\$16\r\naaaaaaaaaaaaaaaa\r\n"
+
+        # normal sds (raw string encoding) with 45 'a'
+        set rawstr [string repeat "a" 45]
+        r set crlf $rawstr
+        assert_equal [r rawread 5] "+OK\r\n"
+        r get crlf
+        assert_equal [r rawread 52] "\$45\r\n$rawstr\r\n"
+
+        r del crlf
+        assert_equal [r rawread 4] ":1\r\n"
     }
 
     # restore connection settings
@@ -242,4 +349,15 @@ start_server {tags {"regression"}} {
         $rd read
         $rd close
     }
+}
+
+start_server {tags {"regression"}} {
+    test "Regression for a crash with cron release of client arguments" {
+        r write "*3\r\n"
+        r flush
+        after 3000 ;# wait for c->argv to be released due to timeout
+        r write "\$3\r\nSET\r\n\$3\r\nkey\r\n\$1\r\n0\r\n"
+        r flush
+        r read
+    } {OK}
 }

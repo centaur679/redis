@@ -1,6 +1,8 @@
-# tests of corrupt ziplist payload with valid CRC
+# tests of corrupt listpack payload with valid CRC
 
-tags {"dump" "corruption" "external:skip"} {
+# The fuzzer can cause corrupt the state in many places, which could
+# mess up the reply, so we decided to skip logreqres.
+tags {"dump" "corruption" "external:skip" "logreqres:skip"} {
 
 # catch sigterm so that in case one of the random command hangs the test,
 # usually due to redis not putting a response in the output buffers,
@@ -13,16 +15,34 @@ if { ! [ catch {
 
 proc generate_collections {suffix elements} {
     set rd [redis_deferring_client]
+    set numcmd 8  ;# base commands including array
+    set has_vsets [server_has_command vadd]
+    if {$has_vsets} {incr numcmd}
+
     for {set j 0} {$j < $elements} {incr j} {
         # add both string values and integers
         if {$j % 2 == 0} {set val $j} else {set val "_$j"}
         $rd hset hash$suffix $j $val
+        $rd hset hashmd$suffix $j $val
+        $rd hexpire hashmd$suffix [expr {int(rand() * 10000)}] FIELDS 1 $j
         $rd lpush list$suffix $val
         $rd zadd zset$suffix $j $val
         $rd sadd set$suffix $val
         $rd xadd stream$suffix * item 1 value $val
+        # Array with sparse indices and mixed value types (int, float, string)
+        set idx [expr {$j * 100 + int(rand() * 50)}]  ;# sparse indices
+        if {$j % 3 == 0} {
+            $rd arset array$suffix $idx $j  ;# integer value
+        } elseif {$j % 3 == 1} {
+            $rd arset array$suffix $idx [format "%.5f" [expr {rand() * 1000}]]  ;# float value
+        } else {
+            $rd arset array$suffix $idx "str_$val"  ;# string value
+        }
+        if {$has_vsets} {
+            $rd vadd vset$suffix VALUES 3 1 1 1 $j
+        }
     }
-    for {set j 0} {$j < $elements * 5} {incr j} {
+    for {set j 0} {$j < $elements * $numcmd} {incr j} {
         $rd read ; # Discard replies
     }
     $rd close
@@ -32,6 +52,7 @@ proc generate_collections {suffix elements} {
 proc generate_types {} {
     r config set list-max-ziplist-size 5
     r config set hash-max-ziplist-entries 5
+    r config set set-max-listpack-entries 5
     r config set zset-max-ziplist-entries 5
     r config set stream-node-max-entries 5
 
@@ -47,9 +68,48 @@ proc generate_types {} {
     # create other non-collection types
     r incr int
     r set string str
+if 0 {
+    r gcra gcra 10 5 60000
+}
+
+    # Create Roaring bitmap keys spanning empty, array, bitset, run, and
+    # multiple high-32 buckets so corruption reaches each portable-format
+    # structural layer.
+    r restore bitmapempty 0 [empty_roaring_bitmap_dump_payload]
+    r config set bitmap-default-roaring yes
+    r setbit bitmap 7 1
+    r setbit bitmap 100 1
+    r setbit bitmap 4095 1
+    r set bitmapbitset [string repeat "\xaa" 8192]
+    r setbit bitmapbitset 0 1 ;# converts the dense string to roaring
+    r setrange bitmapbig 0 [string repeat "\xff" 1024]
+    r setbit bitmapbig 100000 1 ;# converts the dense string to roaring
+
+    set old_proto_max_bulk_len [config_get_set proto-max-bulk-len 536870913]
+    r setbit bitmap64 1 1
+    r setbit bitmap64 4294967296 1
+    r config set proto-max-bulk-len $old_proto_max_bulk_len
+    r config set bitmap-default-roaring no
 
     # create bigger objects with 10 items (more than a single ziplist / listpack)
     generate_collections big 10
+
+    # Hash templates: cover all four DUMP types. 
+    # Value encoding depends on whether the values fit a listpack;
+    # The field-name format depends on whether the fields fit in a listpack. 
+    # TMPL_LP: field count < hash-max-ziplist-entries (5)
+    r himport prepare fs_lp_lp f0 f1 f2                         
+    r himport set htmpl_lp_lp fs_lp_lp 0 1 2
+    # TMPL_ARRAY: field count > hash-max-ziplist-entries (5)
+    r himport prepare fs_arr_raw f0 f1 f2 f3 f4 f5 f6 f7 f8 f9  
+    r himport set htmpl_arr_raw fs_arr_raw 0 1 2 3 4 5 6 7 8 9
+    # TMPL_LP: field count > hash-max-ziplist-entries (5)
+    r himport prepare fs_lp_raw f0 f1 [string repeat x 70]     
+    r himport set htmpl_lp_raw fs_lp_raw 0 1 2
+    # TMPL_ARRAY: long value > hash-max-ziplist-entries (5)
+    r himport prepare fs_arr_lp f0 f1 f2                       
+    r himport set htmpl_arr_lp fs_arr_lp 0 1 [string repeat y 70]
+    r himport discardall
 
     # make sure our big stream also has a listpack record that has different
     # field names than the master recorded
@@ -64,6 +124,40 @@ proc corrupt_payload {payload} {
     while { $count > 0 } {
         set idx [expr {int(rand() * $len)}]
         set ch [binary format c [expr {int(rand()*255)}]]
+        set payload [string replace $payload $idx $idx $ch]
+        incr count -1
+    }
+    return $payload
+}
+
+# Corrupt bytes inside an uncompressed bitmap's portable Roaring blob rather
+# than spending the deterministic seed passes on its RDB wrapper or checksum.
+proc corrupt_roaring_payload {payload} {
+    set offset 1 ;# Skip RDB_TYPE_BITMAP.
+    foreach field {byte-length payload-length} {
+        binary scan [string index $payload $offset] cu first
+        set type [expr {$first >> 6}]
+        if {$type == 0} {
+            incr offset
+        } elseif {$type == 1} {
+            incr offset 2
+        } elseif {$first == 0x80} {
+            incr offset 5
+        } elseif {$first == 0x81} {
+            incr offset 9
+        } else {
+            error "unexpected encoded $field in bitmap DUMP"
+        }
+    }
+
+    set len [expr {[string length $payload] - $offset - 10}]
+    if {$len <= 0} { error "missing portable bitmap payload" }
+    set count 1
+    if {rand() > 0.9} { set count 2 }
+    while {$count > 0} {
+        set idx [expr {$offset + int(rand() * $len)}]
+        binary scan [string index $payload $idx] cu old
+        set ch [binary format c [expr {($old + 1 + int(rand() * 255)) & 0xff}]]
         set payload [string replace $payload $idx $idx $ch]
         incr count -1
     }
@@ -108,15 +202,27 @@ foreach sanitize_dump {no yes} {
             set stat_successful_restore 0
             set stat_rejected_restore 0
             set stat_traffic_commands_sent 0
-            # repeatedly DUMP a random key, corrupt it and try RESTORE into a new key
+            # Exercise every Roaring portable shape once before returning to
+            # random key selection, then repeatedly corrupt DUMP payloads and
+            # try RESTORE into a new key.
+            set roaring_keys {bitmapempty bitmap bitmapbitset bitmapbig bitmap64}
             while true {
-                set k [r randomkey]
-                set dump [r dump $k]
-                set dump [corrupt_payload $dump]
+                if {$cycle < [llength $roaring_keys]} {
+                    set k [lindex $roaring_keys $cycle]
+                    set old_compression [config_get_set rdbcompression no]
+                    set dump [r dump $k]
+                    r config set rdbcompression $old_compression
+                    set dump [corrupt_roaring_payload $dump]
+                } else {
+                    set k [r randomkey]
+                    set dump [r dump $k]
+                    set dump [corrupt_payload $dump]
+                }
                 set printable_dump [string2printable $dump]
                 set restore_failed false
                 set report_and_restart false
                 set sent {}
+                set expired_subkeys [s expired_subkeys]
                 # RESTORE can fail, but hopefully not terminate
                 if { [catch { r restore "_$k" 0 $dump REPLACE } err] } {
                     set restore_failed true
@@ -132,7 +238,13 @@ foreach sanitize_dump {no yes} {
                         }
                     }
                 } else {
-                    r ping ;# an attempt to check if the server didn't terminate (this will throw an error that will terminate the tests)
+                    # an attempt to check if the server didn't terminate (this will throw an error that will terminate the tests)
+                    if { [catch { r ping } err] } {
+                        set msg "Server crashed after RESTORE with payload: $printable_dump"
+                        write_log_line 0 $msg
+                        puts $msg
+                        error $err
+                    }
                 }
 
                 set print_commands false
@@ -140,16 +252,41 @@ foreach sanitize_dump {no yes} {
                     # if RESTORE didn't fail or terminate, run some random traffic on the new key
                     incr stat_successful_restore
                     if { [ catch {
-                        set sent [generate_fuzzy_traffic_on_key "_$k" 1] ;# traffic for 1 second
+                        set type [r type "_$k"]
+                        if {$type eq {none}} {
+                            # The key has been removed due to expiration.
+                            # Ensure the server didn't terminate during expiration and verify
+                            # expire stats to confirm the key was removed due to expiration.
+                            r ping
+                            assert_morethan [s expired_subkeys] $expired_subkeys
+                        } else {
+                            set sent [generate_fuzzy_traffic_on_key "_$k" $type 1] ;# traffic for 1 second
+                        }
+
                         incr stat_traffic_commands_sent [llength $sent]
                         r del "_$k" ;# in case the server terminated, here's where we'll detect it.
                         if {$dbsize != [r dbsize]} {
                             puts "unexpected keys"
                             puts "keys: [r keys *]"
-                            puts $sent
+                            puts "commands leading to it:"
+                            foreach cmd $sent {
+                                foreach arg $cmd {
+                                    puts -nonewline "[string2printable $arg] "
+                                }
+                                puts ""
+                            }
                             exit 1
                         }
                     } err ] } {
+                        set err [format "%s" $err] ;# convert to string for pattern matching
+                        if {[string match "*SIGTERM*" $err]} {
+                            puts "payload that caused test to hang: $printable_dump"
+                            if {$::dump_logs} {
+                                set srv [get_srv 0]
+                                dump_server_log $srv
+                            }
+                            exit 1
+                        }
                         # if the server terminated update stats and restart it
                         set report_and_restart true
                         incr stat_terminated_in_traffic
@@ -157,7 +294,12 @@ foreach sanitize_dump {no yes} {
                         incr stat_terminated_by_signal $by_signal
 
                         if {$by_signal != 0 || $sanitize_dump == yes} {
-                            puts "Server crashed (by signal: $by_signal), with payload: $printable_dump"
+                            if {$::dump_logs} {
+                                set srv [get_srv 0]
+                                dump_server_log $srv
+                            }
+
+                            puts "Server crashed (by signal: $by_signal, err: $err), with payload: $printable_dump"
                             set print_commands true
                         }
                     }
@@ -212,7 +354,4 @@ foreach sanitize_dump {no yes} {
     }
 }
 
-
-
 } ;# tags
-

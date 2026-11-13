@@ -1,45 +1,51 @@
-# Returns 1 if no node knows node_id, 0 if any node knows it.
-proc node_is_forgotten {node_id} {
-    for {set j 0} {$j < [llength $::servers]} {incr j} {
-        set cluster_nodes [R $j CLUSTER NODES]
-        if { [string match "*$node_id*" $cluster_nodes] } {
-            return 0
-        }
-    }
-    return 1
-}
-
-# Isolate a node from the cluster and give it a new nodeid
-proc isolate_node {id} {
-    set node_id [R $id CLUSTER MYID]
-    R $id CLUSTER RESET HARD
-    # Here we additionally test that CLUSTER FORGET propagates to all nodes.
-    set other_id [expr $id == 0 ? 1 : 0]
-    R $other_id CLUSTER FORGET $node_id
-    wait_for_condition 50 100 {
-        [node_is_forgotten $node_id]
-    } else {
-        fail "CLUSTER FORGET was not propagated to all nodes"
-    }
-}
-
-# Check if cluster's view of hostnames is consistent
-proc are_hostnames_propagated {match_string} {
-    for {set j 0} {$j < [llength $::servers]} {incr j} {
-        set cfg [R $j cluster slots]
-        foreach node $cfg {
-            for {set i 2} {$i < [llength $node]} {incr i} {
-                if {! [string match $match_string [lindex [lindex [lindex $node $i] 3] 1]] } {
-                    return 0
-                }
-            }
-        }
-    }
-    return 1
-}
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
 
 proc get_slot_field {slot_output shard_id node_id attrib_id} {
     return [lindex [lindex [lindex $slot_output $shard_id] $node_id] $attrib_id]
+}
+
+proc build_cluster_bus_ping {sender_name sender_port sender_cport extensions_data} {
+    set CLUSTERMSG_TYPE_PING 0
+    set CLUSTERMSG_FLAG0_EXT_DATA 0x04
+    set CLUSTER_NODE_MASTER 1
+
+    set num_extensions [expr {[string length $extensions_data] > 0 ? 1 : 0}]
+    set mflags0 [expr {$num_extensions > 0 ? $CLUSTERMSG_FLAG0_EXT_DATA : 0}]
+    set totlen [expr {2256 + [string length $extensions_data]}]
+
+    set hdr [build_cluster_bus_header $sender_name $sender_port $sender_cport \
+        $CLUSTERMSG_TYPE_PING $totlen $num_extensions $CLUSTER_NODE_MASTER $mflags0]
+    append hdr $extensions_data
+    return $hdr
+}
+
+# Build a string PING extension: type 0 is CLUSTERMSG_EXT_TYPE_HOSTNAME, type 1
+# is CLUSTERMSG_EXT_TYPE_HUMAN_NODENAME. The caller supplies the NUL terminator.
+proc build_hostname_extension {hostname_bytes {type 0}} {
+    set ext_header_size 8
+    set total_ext_len [expr {$ext_header_size + [string length $hostname_bytes]}]
+    set padded_len [expr {(($total_ext_len + 7) / 8) * 8}]
+    set padding_len [expr {$padded_len - $total_ext_len}]
+
+    set ext ""
+    append ext [binary format I $padded_len]
+    append ext [binary format S $type]
+    append ext [binary format S 0]
+    append ext $hostname_bytes
+    append ext [string repeat \x00 $padding_len]
+    return $ext
 }
 
 # Start a cluster with 3 masters and 4 replicas.
@@ -156,10 +162,11 @@ test "Verify the nodes configured with prefer hostname only show hostname for ne
     # Have everyone forget node 6 and isolate it from the cluster.
     isolate_node 6
 
-    # Set hostnames for the masters, now that the node is isolated
-    R 0 config set cluster-announce-hostname "shard-1.com"
-    R 1 config set cluster-announce-hostname "shard-2.com"
-    R 2 config set cluster-announce-hostname "shard-3.com"
+    set primaries 3
+    for {set j 0} {$j < $primaries} {incr j} {
+        # Set hostnames for the masters, now that the node is isolated
+        R $j config set cluster-announce-hostname "shard-$j.com"
+    }
 
     # Prevent Node 0 and Node 6 from properly meeting,
     # they'll hang in the handshake phase. This allows us to 
@@ -189,9 +196,17 @@ test "Verify the nodes configured with prefer hostname only show hostname for ne
     } else {
         fail "Node did not learn about the 2 shards it can talk to"
     }
-    set slot_result [R 6 CLUSTER SLOTS]
-    assert_equal [lindex [get_slot_field $slot_result 0 2 3] 1] "shard-2.com"
-    assert_equal [lindex [get_slot_field $slot_result 1 2 3] 1] "shard-3.com"
+    wait_for_condition 50 100 {
+        [lindex [get_slot_field [R 6 CLUSTER SLOTS] 0 2 3] 1] eq "shard-1.com"
+    } else {
+        fail "hostname for shard-1 didn't reach node 6"
+    }
+
+    wait_for_condition 50 100 {
+        [lindex [get_slot_field [R 6 CLUSTER SLOTS] 1 2 3] 1] eq "shard-2.com"
+    } else {
+        fail "hostname for shard-2 didn't reach node 6"
+    }
 
     # Also make sure we know about the isolated master, we 
     # just can't reach it.
@@ -210,10 +225,14 @@ test "Verify the nodes configured with prefer hostname only show hostname for ne
     } else {
         fail "Node did not learn about the 2 shards it can talk to"
     }
-    set slot_result [R 6 CLUSTER SLOTS]
-    assert_equal [lindex [get_slot_field $slot_result 0 2 3] 1] "shard-1.com"
-    assert_equal [lindex [get_slot_field $slot_result 1 2 3] 1] "shard-2.com"
-    assert_equal [lindex [get_slot_field $slot_result 2 2 3] 1] "shard-3.com"
+
+    for {set j 0} {$j < $primaries} {incr j} {
+        wait_for_condition 50 100 {
+            [lindex [get_slot_field [R 6 CLUSTER SLOTS] $j 2 3] 1] eq "shard-$j.com"
+        } else {
+            fail "hostname information for shard-$j didn't reach node 6"
+        }
+    }
 }
 
 test "Test restart will keep hostname information" {
@@ -239,5 +258,88 @@ test "Test hostname validation" {
 
     # Note this isn't a valid hostname, but it passes our internal validation
     R 0 config set cluster-announce-hostname "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-."
+}
+
+test "PING with hostname extension missing null terminator is rejected" {
+    for {set j 0} {$j < [llength $::servers]} {incr j} {
+        R $j config set cluster-announce-hostname ""
+    }
+    wait_for_condition 50 100 {
+        [are_hostnames_propagated ""] eq 1
+    } else {
+        fail "hostnames were not cleared"
+    }
+
+    set node1_id [R 1 CLUSTER MYID]
+    set target_host [srv 0 host]
+    set target_bus_port [expr {[srv 0 port] + 10000}]
+    set sender_port [srv -1 port]
+    set sender_cport [expr {$sender_port + 10000}]
+
+    # Freeze node 1 so its real PINGs cannot overwrite the injected hostname.
+    set node1_pid [srv -1 pid]
+    pause_process $node1_pid
+
+    set payload_len 32
+    set bad_hostname [string repeat A $payload_len]
+    set bad_ext [build_hostname_extension $bad_hostname]
+    set bad_packet [build_cluster_bus_ping $node1_id $sender_port $sender_cport $bad_ext]
+
+    # Record the log position before injecting the bad packet.
+    set loglines [count_log_lines 0]
+
+    if {$::tls} {
+        set fd [::tls::socket \
+            -cafile "$::tlsdir/ca.crt" \
+            -certfile "$::tlsdir/client.crt" \
+            -keyfile "$::tlsdir/client.key" \
+            $target_host $target_bus_port]
+    } else {
+        set fd [socket $target_host $target_bus_port]
+    }
+    fconfigure $fd -translation binary -buffering full
+    puts -nonewline $fd $bad_packet
+    flush $fd
+
+    # Verify the server logged the proper rejection message.
+    wait_for_log_messages 0 {"*missing null terminator*"} $loglines 50 100
+
+    close $fd
+    resume_process $node1_pid
+}
+
+test "PING with invalid characters in hostname or nodename extension is rejected" {
+    set CLUSTERMSG_EXT_TYPE_HOSTNAME 0
+    set CLUSTERMSG_EXT_TYPE_HUMAN_NODENAME 1
+
+    set node1_id [R 1 CLUSTER MYID]
+    set sender_port [srv -1 port]
+    set sender_cport [expr {$sender_port + 10000}]
+
+    # Freeze node 1 so its real PINGs cannot overwrite an injected value.
+    set node1_pid [srv -1 pid]
+    pause_process $node1_pid
+
+    # Each value would be shown to clients and written to nodes.conf, where
+    # CR/LF ends the line, and space and comma are field delimiters.
+    set cases [list \
+        $CLUSTERMSG_EXT_TYPE_HOSTNAME "evil\r\n+PWN" \
+        $CLUSTERMSG_EXT_TYPE_HOSTNAME "evil host" \
+        $CLUSTERMSG_EXT_TYPE_HOSTNAME [string repeat a 256] \
+        $CLUSTERMSG_EXT_TYPE_HUMAN_NODENAME "evil\r\n+PWN" \
+        $CLUSTERMSG_EXT_TYPE_HUMAN_NODENAME "evil,name" \
+    ]
+    foreach {exttype value} $cases {
+        set ext [build_hostname_extension "$value\x00" $exttype]
+        set packet [build_cluster_bus_ping $node1_id $sender_port $sender_cport $ext]
+        set loglines [count_log_lines 0]
+        set fd [send_cluster_bus_packet 0 $packet]
+        wait_for_log_messages 0 [list "*invalid characters in extension type $exttype*"] $loglines 50 100
+        close $fd
+    }
+    assert_no_match "*evil*" [R 0 CLUSTER NODES]
+
+    resume_process $node1_pid
+    wait_for_cluster_state ok
 }
 }

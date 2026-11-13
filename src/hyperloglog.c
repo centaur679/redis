@@ -1,38 +1,38 @@
 /* hyperloglog.c - Redis HyperLogLog probabilistic cardinality approximation.
  * This file implements the algorithm and the exported Redis commands.
  *
- * Copyright (c) 2014, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2014-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * Copyright (c) 2024-present, Valkey contributors.
+ * All rights reserved.
  *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
 #include "server.h"
+#include "hyperloglog.h"
 
 #include <stdint.h>
 #include <math.h>
+
+#ifdef HAVE_AVX2
+/* Define __MM_MALLOC_H to prevent importing the memory aligned
+ * allocation functions, which we don't use. */
+#define __MM_MALLOC_H
+#include <immintrin.h>
+#endif
+
+#ifdef HAVE_AARCH64_NEON
+#include <arm_neon.h>
+#endif
+
+#undef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 /* The Redis HyperLogLog implementation is based on the following ideas:
  *
@@ -144,7 +144,7 @@
  * In the example the sparse representation used just 7 bytes instead
  * of 12k in order to represent the HLL registers. In general for low
  * cardinality there is a big win in terms of space efficiency, traded
- * with CPU time since the sparse representation is slower to access:
+ * with CPU time since the sparse representation is slower to access.
  *
  * The following table shows average cardinality vs bytes used, 100
  * samples per cardinality (when the set was not representable because
@@ -206,6 +206,22 @@ struct hllhdr {
 #define HLL_MAX_ENCODING 1
 
 static char *invalid_hll_err = "-INVALIDOBJ Corrupted HLL object detected";
+
+#if defined(HAVE_AVX2) || defined(HAVE_AARCH64_NEON)
+static int simd_enabled = 1;
+#endif
+
+#ifdef HAVE_AVX2
+#define HLL_USE_AVX2 (simd_enabled && __builtin_cpu_supports("avx2"))
+#else
+#define HLL_USE_AVX2 0
+#endif
+
+#ifdef HAVE_AARCH64_NEON
+#define HLL_USE_NEON (simd_enabled)
+#else
+#define HLL_USE_NEON 0
+#endif
 
 /* =========================== Low level bit macros ========================= */
 
@@ -394,7 +410,7 @@ static char *invalid_hll_err = "-INVALIDOBJ Corrupted HLL object detected";
  * It was modified for Redis in order to provide the same result in
  * big and little endian archs (endian neutral). */
 REDIS_NO_SANITIZE("alignment")
-uint64_t MurmurHash64A (const void * key, int len, unsigned int seed) {
+uint64_t MurmurHash64A (const void * key, size_t len, unsigned int seed) {
     const uint64_t m = 0xc6a4a7935bd1e995;
     const int r = 47;
     uint64_t h = seed ^ (len * m);
@@ -450,7 +466,7 @@ uint64_t MurmurHash64A (const void * key, int len, unsigned int seed) {
  * of the pattern 000..1 of the element hash. As a side effect 'regp' is
  * set to the register index this element hashes to. */
 int hllPatLen(unsigned char *ele, size_t elesize, long *regp) {
-    uint64_t hash, bit, index;
+    uint64_t hash, index;
     int count;
 
     /* Count the number of zeroes starting from bit HLL_REGISTERS
@@ -460,21 +476,14 @@ int hllPatLen(unsigned char *ele, size_t elesize, long *regp) {
      * Note that the final "1" ending the sequence of zeroes must be
      * included in the count, so if we find "001" the count is 3, and
      * the smallest count possible is no zeroes at all, just a 1 bit
-     * at the first position, that is a count of 1.
-     *
-     * This may sound like inefficient, but actually in the average case
-     * there are high probabilities to find a 1 after a few iterations. */
+     * at the first position, that is a count of 1. */
     hash = MurmurHash64A(ele,elesize,0xadc83b19ULL);
     index = hash & HLL_P_MASK; /* Register index. */
     hash >>= HLL_P; /* Remove bits used to address the register. */
     hash |= ((uint64_t)1<<HLL_Q); /* Make sure the loop terminates
                                      and count will be <= Q+1. */
-    bit = 1;
-    count = 1; /* Initialized to 1 since we count the "00000...1" pattern. */
-    while((hash & bit) == 0) {
-        count++;
-        bit <<= 1;
-    }
+
+    count = __builtin_ctzll(hash) + 1;
     *regp = (int) index;
     return count;
 }
@@ -522,11 +531,17 @@ void hllDenseRegHisto(uint8_t *registers, int* reghisto) {
 
     /* Redis default is to use 16384 registers 6 bits each. The code works
      * with other values by modifying the defines, but for our target value
-     * we take a faster path with unrolled loops. */
+     * we take a faster path with unrolled loops.
+     *
+     * Uses 4 independent histogram accumulators to break store→load
+     * dependency chains when multiple registers map to the same bin.
+     * Each group of 4 registers goes to a different accumulator. */
     if (HLL_REGISTERS == 16384 && HLL_BITS == 6) {
         uint8_t *r = registers;
         unsigned long r0, r1, r2, r3, r4, r5, r6, r7, r8, r9,
                       r10, r11, r12, r13, r14, r15;
+        int h0[64] = {0}, h1[64] = {0}, h2[64] = {0}, h3[64] = {0};
+
         for (j = 0; j < 1024; j++) {
             /* Handle 16 registers per iteration. */
             r0 = r[0] & 63;
@@ -546,24 +561,35 @@ void hllDenseRegHisto(uint8_t *registers, int* reghisto) {
             r14 = (r[10] >> 4 | r[11] << 4) & 63;
             r15 = (r[11] >> 2) & 63;
 
-            reghisto[r0]++;
-            reghisto[r1]++;
-            reghisto[r2]++;
-            reghisto[r3]++;
-            reghisto[r4]++;
-            reghisto[r5]++;
-            reghisto[r6]++;
-            reghisto[r7]++;
-            reghisto[r8]++;
-            reghisto[r9]++;
-            reghisto[r10]++;
-            reghisto[r11]++;
-            reghisto[r12]++;
-            reghisto[r13]++;
-            reghisto[r14]++;
-            reghisto[r15]++;
+            /* Interleave across 4 accumulators by index mod 4:
+             * r0,r4,r8,r12 → h0;  r1,r5,r9,r13 → h1;
+             * r2,r6,r10,r14 → h2; r3,r7,r11,r15 → h3.
+             * HLL register values cluster in a few consecutive bins, so adjacent
+             * registers frequently hit the same histogram bin. 4 accumulators
+             * break the resulting store→load dependency chain. */
+            h0[r0]++;
+            h1[r1]++;
+            h2[r2]++;
+            h3[r3]++;
+            h0[r4]++;
+            h1[r5]++;
+            h2[r6]++;
+            h3[r7]++;
+            h0[r8]++;
+            h1[r9]++;
+            h2[r10]++;
+            h3[r11]++;
+            h0[r12]++;
+            h1[r13]++;
+            h2[r14]++;
+            h3[r15]++;
 
             r += 12;
+        }
+
+        /* Merge accumulators — 64 entries (6-bit register values), negligible cost. */
+        for (j = 0; j < 64; j++) {
+            reghisto[j] = h0[j] + h1[j] + h2[j] + h3[j];
         }
     } else {
         for(j = 0; j < HLL_REGISTERS; j++) {
@@ -587,6 +613,7 @@ int hllSparseToDense(robj *o) {
     struct hllhdr *hdr, *oldhdr = (struct hllhdr*)sparse;
     int idx = 0, runlen, regval;
     uint8_t *p = (uint8_t*)sparse, *end = p+sdslen(sparse);
+    int valid = 1;
 
     /* If the representation is already the right one return ASAP. */
     hdr = (struct hllhdr*) sparse;
@@ -606,16 +633,27 @@ int hllSparseToDense(robj *o) {
     while(p < end) {
         if (HLL_SPARSE_IS_ZERO(p)) {
             runlen = HLL_SPARSE_ZERO_LEN(p);
+            if ((runlen + idx) > HLL_REGISTERS) { /* Overflow. */
+                valid = 0;
+                break;
+            }
             idx += runlen;
             p++;
         } else if (HLL_SPARSE_IS_XZERO(p)) {
             runlen = HLL_SPARSE_XZERO_LEN(p);
+            if ((runlen + idx) > HLL_REGISTERS) { /* Overflow. */
+                valid = 0;
+                break;
+            }
             idx += runlen;
             p += 2;
         } else {
             runlen = HLL_SPARSE_VAL_LEN(p);
             regval = HLL_SPARSE_VAL_VALUE(p);
-            if ((runlen + idx) > HLL_REGISTERS) break; /* Overflow. */
+            if ((runlen + idx) > HLL_REGISTERS) { /* Overflow. */
+                valid = 0;
+                break;
+            }
             while(runlen--) {
                 HLL_DENSE_SET_REGISTER(hdr->registers,idx,regval);
                 idx++;
@@ -626,7 +664,7 @@ int hllSparseToDense(robj *o) {
 
     /* If the sparse representation was valid, we expect to find idx
      * set to HLL_REGISTERS. */
-    if (idx != HLL_REGISTERS) {
+    if (!valid || idx != HLL_REGISTERS) {
         sdsfree(dense);
         return C_ERR;
     }
@@ -662,12 +700,22 @@ int hllSparseSet(robj *o, long index, uint8_t count) {
      * switch to dense representation. */
     if (count > HLL_SPARSE_VAL_MAX_VALUE) goto promote;
 
-    /* When updating a sparse representation, sometimes we may need to
-     * enlarge the buffer for up to 3 bytes in the worst case (XZERO split
-     * into XZERO-VAL-XZERO). Make sure there is enough space right now
-     * so that the pointers we take during the execution of the function
-     * will be valid all the time. */
-    o->ptr = sdsMakeRoomFor(o->ptr,3);
+    /* When updating a sparse representation, sometimes we may need to enlarge the
+     * buffer for up to 3 bytes in the worst case (XZERO split into XZERO-VAL-XZERO),
+     * and the following code does the enlarge job.
+     * Actually, we use a greedy strategy, enlarge more than 3 bytes to avoid the need
+     * for future reallocates on incremental growth. But we do not allocate more than
+     * 'server.hll_sparse_max_bytes' bytes for the sparse representation.
+     * If the available size of hyperloglog sds string is not enough for the increment
+     * we need, we promote the hyperloglog to dense representation in 'step 3'.
+     */
+    if (sdsalloc(o->ptr) < server.hll_sparse_max_bytes && sdsavail(o->ptr) < 3) {
+        size_t newlen = sdslen(o->ptr) + 3;
+        newlen += min(newlen, 300); /* Greediness: double 'newlen' if it is smaller than 300, or add 300 to it when it exceeds 300 */
+        if (newlen > server.hll_sparse_max_bytes)
+            newlen = server.hll_sparse_max_bytes;
+        o->ptr = sdsResize(o->ptr, newlen, 1);
+    }
 
     /* Step 1: we need to locate the opcode we need to modify to check
      * if a value update is actually needed. */
@@ -824,17 +872,18 @@ int hllSparseSet(robj *o, long index, uint8_t count) {
     /* Step 3: substitute the new sequence with the old one.
      *
      * Note that we already allocated space on the sds string
-     * calling sdsMakeRoomFor(). */
-     int seqlen = n-seq;
-     int oldlen = is_xzero ? 2 : 1;
-     int deltalen = seqlen-oldlen;
+     * calling sdsResize(). */
+    int seqlen = n-seq;
+    int oldlen = is_xzero ? 2 : 1;
+    int deltalen = seqlen-oldlen;
 
-     if (deltalen > 0 &&
-         sdslen(o->ptr)+deltalen > server.hll_sparse_max_bytes) goto promote;
-     if (deltalen && next) memmove(next+deltalen,next,end-next);
-     sdsIncrLen(o->ptr,deltalen);
-     memcpy(p,seq,seqlen);
-     end += deltalen;
+    if (deltalen > 0 &&
+        sdslen(o->ptr) + deltalen > server.hll_sparse_max_bytes) goto promote;
+    serverAssert(sdslen(o->ptr) + deltalen <= sdsalloc(o->ptr));
+    if (deltalen && next) memmove(next+deltalen,next,end-next);
+    sdsIncrLen(o->ptr,deltalen);
+    memcpy(p,seq,seqlen);
+    end += deltalen;
 
 updated:
     /* Step 4: Merge adjacent values if possible.
@@ -912,27 +961,40 @@ int hllSparseAdd(robj *o, unsigned char *ele, size_t elesize) {
 void hllSparseRegHisto(uint8_t *sparse, int sparselen, int *invalid, int* reghisto) {
     int idx = 0, runlen, regval;
     uint8_t *end = sparse+sparselen, *p = sparse;
+    int valid = 1;
 
     while(p < end) {
         if (HLL_SPARSE_IS_ZERO(p)) {
             runlen = HLL_SPARSE_ZERO_LEN(p);
+            if ((runlen + idx) > HLL_REGISTERS) { /* Overflow. */
+                valid = 0;
+                break;
+            }
             idx += runlen;
             reghisto[0] += runlen;
             p++;
         } else if (HLL_SPARSE_IS_XZERO(p)) {
             runlen = HLL_SPARSE_XZERO_LEN(p);
+            if ((runlen + idx) > HLL_REGISTERS) { /* Overflow. */
+                valid = 0;
+                break;
+            }
             idx += runlen;
             reghisto[0] += runlen;
             p += 2;
         } else {
             runlen = HLL_SPARSE_VAL_LEN(p);
             regval = HLL_SPARSE_VAL_VALUE(p);
+            if ((runlen + idx) > HLL_REGISTERS) { /* Overflow. */
+                valid = 0;
+                break;
+            }
             idx += runlen;
             reghisto[regval] += runlen;
             p++;
         }
     }
-    if (idx != HLL_REGISTERS && invalid) *invalid = 1;
+    if ((!valid || idx != HLL_REGISTERS) && invalid) *invalid = 1;
 }
 
 /* ========================= HyperLogLog Count ==============================
@@ -942,27 +1004,39 @@ void hllSparseRegHisto(uint8_t *sparse, int sparselen, int *invalid, int* reghis
  * computation, which is representation-specific, while all the rest is common. */
 
 /* Implements the register histogram calculation for uint8_t data type
- * which is only used internally as speedup for PFCOUNT with multiple keys. */
+ * which is only used internally as speedup for PFCOUNT with multiple keys.
+ *
+ * Uses 4 independent histogram accumulators to break store→load dependency
+ * chains: when two bytes in the same word map to the same histogram bin,
+ * a single accumulator serializes on the load-modify-store cycle. With 4
+ * accumulators, each byte goes to a different copy, allowing the CPU's
+ * out-of-order engine to overlap the increments. */
 void hllRawRegHisto(uint8_t *registers, int* reghisto) {
-    uint64_t *word = (uint64_t*) registers;
-    uint8_t *bytes;
+    /* 4 independent accumulators — each byte position in the 8-byte word
+     * maps to a different accumulator to maximize ILP. Accumulator
+     * assignment is by byte index mod 4: bytes 0,4 → h0, 1,5 → h1,
+     * 2,6 → h2, 3,7 → h3. */
+    int h0[64] = {0}, h1[64] = {0}, h2[64] = {0}, h3[64] = {0};
+    uint8_t *r = registers;
     int j;
 
-    for (j = 0; j < HLL_REGISTERS/8; j++) {
-        if (*word == 0) {
-            reghisto[0] += 8;
-        } else {
-            bytes = (uint8_t*) word;
-            reghisto[bytes[0]]++;
-            reghisto[bytes[1]]++;
-            reghisto[bytes[2]]++;
-            reghisto[bytes[3]]++;
-            reghisto[bytes[4]]++;
-            reghisto[bytes[5]]++;
-            reghisto[bytes[6]]++;
-            reghisto[bytes[7]]++;
-        }
-        word++;
+    for (j = 0; j < HLL_REGISTERS; j += 8) {
+        h0[r[0]]++;
+        h1[r[1]]++;
+        h2[r[2]]++;
+        h3[r[3]]++;
+        h0[r[4]]++;
+        h1[r[5]]++;
+        h2[r[6]]++;
+        h3[r[7]]++;
+        r += 8;
+    }
+
+    /* Merge accumulators. The histogram has 64 entries (register values
+     * are 6-bit, range 0-63), so this loop is negligible compared to
+     * the 16384-register main loop. */
+    for (j = 0; j < 64; j++) {
+        reghisto[j] = h0[j] + h1[j] + h2[j] + h3[j];
     }
 }
 
@@ -1058,6 +1132,203 @@ int hllAdd(robj *o, unsigned char *ele, size_t elesize) {
     }
 }
 
+#ifdef HAVE_AVX2
+/* A specialized version of hllMergeDense, optimized for default configurations.
+ * 
+ * Requirements:
+ * 1) HLL_REGISTERS == 16384 && HLL_BITS == 6
+ * 2) The CPU supports AVX2 (checked at runtime in hllMergeDense)
+ *
+ * reg_raw: pointer to the raw representation array (16384 bytes, one byte per register)
+ * reg_dense: pointer to the dense representation array (12288 bytes, 6 bits per register)
+ */
+ATTRIBUTE_TARGET_AVX2
+void hllMergeDenseAVX2(uint8_t *reg_raw, const uint8_t *reg_dense) {
+    const __m256i shuffle = _mm256_setr_epi8( //
+        4, 5, 6, -1,                          //
+        7, 8, 9, -1,                          //
+        10, 11, 12, -1,                       //
+        13, 14, 15, -1,                       //
+        0, 1, 2, -1,                          //
+        3, 4, 5, -1,                          //
+        6, 7, 8, -1,                          //
+        9, 10, 11, -1                         //
+    );
+
+    /* Merge the first 8 registers (6 bytes) normally 
+     * as the AVX2 algorithm needs 4 padding bytes at the start */
+    uint8_t val;
+    for (int i = 0; i < 8; i++) {
+        HLL_DENSE_GET_REGISTER(val, reg_dense, i);
+        reg_raw[i] = MAX(reg_raw[i], val);
+    }
+
+    /* Dense to Raw:
+     *
+     * 4 registers in 3 bytes:
+     * {bbaaaaaa|ccccbbbb|ddddddcc}
+     * 
+     * LOAD 32 bytes (32 registers) per iteration:
+     * 4(padding) + 12(16 registers) + 12(16 registers) + 4(padding)
+     * {XXXX|AAAB|BBCC|CDDD|EEEF|FFGG|GHHH|XXXX}
+     * 
+     * SHUFFLE to:
+     * {AAA0|BBB0|CCC0|DDD0|EEE0|FFF0|GGG0|HHH0}
+     * {bbaaaaaa|ccccbbbb|ddddddcc|00000000} x8
+     *
+     * AVX2 is little endian, each of the 8 groups is a little-endian int32.
+     * A group (int32) contains 3 valid bytes (4 registers) and a zero byte.
+     * 
+     * extract registers in each group with AND and SHIFT:
+     * {00aaaaaa|00000000|00000000|00000000} x8 (<<0)
+     * {00000000|00bbbbbb|00000000|00000000} x8 (<<2)
+     * {00000000|00000000|00cccccc|00000000} x8 (<<4)
+     * {00000000|00000000|00000000|00dddddd} x8 (<<6)
+     *
+     * merge the extracted registers with OR:
+     * {00aaaaaa|00bbbbbb|00cccccc|00dddddd} x8
+     *
+     * Finally, compute MAX(reg_raw, merged) and STORE it back to reg_raw
+     */
+
+    /* Skip 8 registers (6 bytes) */ 
+    const uint8_t *r = reg_dense + 6 - 4;
+    uint8_t *t = reg_raw + 8;
+
+    for (int i = 0; i < HLL_REGISTERS / 32 - 1; ++i) {
+        __m256i x0, x;
+        x0 = _mm256_loadu_si256((__m256i *)r);
+        x = _mm256_shuffle_epi8(x0, shuffle);
+
+        __m256i a1, a2, a3, a4;
+        a1 = _mm256_and_si256(x, _mm256_set1_epi32(0x0000003f));
+        a2 = _mm256_and_si256(x, _mm256_set1_epi32(0x00000fc0));
+        a3 = _mm256_and_si256(x, _mm256_set1_epi32(0x0003f000));
+        a4 = _mm256_and_si256(x, _mm256_set1_epi32(0x00fc0000));
+
+        a2 = _mm256_slli_epi32(a2, 2);
+        a3 = _mm256_slli_epi32(a3, 4);
+        a4 = _mm256_slli_epi32(a4, 6);
+
+        __m256i y1, y2, y;
+        y1 = _mm256_or_si256(a1, a2);
+        y2 = _mm256_or_si256(a3, a4);
+        y = _mm256_or_si256(y1, y2);
+
+        __m256i z = _mm256_loadu_si256((__m256i *)t);
+
+        z = _mm256_max_epu8(z, y);
+
+        _mm256_storeu_si256((__m256i *)t, z);
+
+        r += 24;
+        t += 32;
+    }
+
+    /* Merge the last 24 registers normally 
+     * as the AVX2 algorithm needs 4 padding bytes at the end */
+    for (int i = HLL_REGISTERS - 24; i < HLL_REGISTERS; i++) {
+        HLL_DENSE_GET_REGISTER(val, reg_dense, i);
+        reg_raw[i] = MAX(reg_raw[i], val);
+    }
+}
+#endif
+
+#ifdef HAVE_AARCH64_NEON
+/* A specialized version of hllMergeDense, optimized for default configurations.
+ * Based on the AVX2 version.
+ * 
+ * Requirements:
+ * 1) HLL_REGISTERS == 16384 && HLL_BITS == 6
+ * 2) Aarch64 CPU supports NEON (checked at runtime in hllMergeDense)
+ *
+ * reg_raw: pointer to the raw representation array (16384 bytes, one byte per register)
+ * reg_dense: pointer to the dense representation array (12288 bytes, 6 bits per register)
+ */
+void hllMergeDenseAarch64(uint8_t *reg_raw, const uint8_t *reg_dense) {
+    const uint8_t *r = reg_dense;
+    uint8_t *t = reg_raw;
+
+    /* Shuffle pattern to expand each 12-byte packed group (16 regs x 6 bits)
+     * to 16 bytes by inserting zeroes at bytes 3, 7, 11 and 15. */
+    const uint8x16_t shuffle = {
+        0, 1, 2, -1,
+        3, 4, 5, -1,
+        6, 7, 8, -1,
+        9, 10, 11, -1
+    };
+
+    for (int i = 0; i < HLL_REGISTERS / 16 - 1; ++i) {
+        /* Load 16 bytes (12 meaningful) and apply table; zeros fill pad positions. */
+        uint8x16_t x, x0;
+        x0 = vld1q_u8(r);
+        x = vqtbl1q_u8(x0, shuffle);
+
+        /* Treat as 4x32-bit lanes (LE); each lane now holds 3 packed bytes + one zero. */
+        uint32x4_t x32 = vreinterpretq_u32_u8(x);
+
+        /* Extract the four 6-bit fields per 32-bit lane. */
+        uint32x4_t a1, a2, a3, a4;
+        a1 = vandq_u32(x32, vdupq_n_u32(0x0000003f));
+        a2 = vandq_u32(x32, vdupq_n_u32(0x00000fc0));
+        a3 = vandq_u32(x32, vdupq_n_u32(0x0003f000));
+        a4 = vandq_u32(x32, vdupq_n_u32(0x00fc0000));
+
+        /* Align fields to byte boundaries within each lane. */
+        a2 = vshlq_n_u32(a2, 2);
+        a3 = vshlq_n_u32(a3, 4);
+        a4 = vshlq_n_u32(a4, 6);
+
+        /* Combine fields per lane (32-bit). */
+        uint32x4_t y32 = vorrq_u32(vorrq_u32(a1, a2), vorrq_u32(a3, a4));
+
+        /* Reinterpret to actual 8-bit uints for comparison. */
+        uint8x16_t y = vreinterpretq_u8_u32(y32);
+
+        /* Max-merge with existing raw registers. */
+        uint8x16_t z = vld1q_u8(t);
+        z = vmaxq_u8(z, y);
+
+        /* Store the results. */
+        vst1q_u8(t, z);
+
+        r += 12;
+        t += 16;
+    }
+
+    /* Process remaining registers, we do this manually because we don't want to over-read 4 bytes */
+    uint8_t val;
+    for (int i = HLL_REGISTERS - 16; i < HLL_REGISTERS; i++) {
+        HLL_DENSE_GET_REGISTER(val, reg_dense, i);
+        reg_raw[i] = MAX(reg_raw[i], val);
+    }
+}
+#endif /* HAVE_AARCH64_NEON */
+
+/* Merge dense-encoded registers to raw registers array. */
+void hllMergeDense(uint8_t* reg_raw, const uint8_t* reg_dense) {
+#if HLL_REGISTERS == 16384 && HLL_BITS == 6
+#ifdef HAVE_AVX2
+    if (HLL_USE_AVX2) {
+        hllMergeDenseAVX2(reg_raw, reg_dense);
+        return;
+    }
+#endif
+#ifdef HAVE_AARCH64_NEON
+    if (HLL_USE_NEON) {
+        hllMergeDenseAarch64(reg_raw, reg_dense);
+        return;
+    }
+#endif
+#endif
+
+    uint8_t val;
+    for (int i = 0; i < HLL_REGISTERS; i++) {
+        HLL_DENSE_GET_REGISTER(val, reg_dense, i);
+        reg_raw[i] = MAX(reg_raw[i], val);
+    }
+}
+
 /* Merge by computing MAX(registers[i],hll[i]) the HyperLogLog 'hll'
  * with an array of uint8_t HLL_REGISTERS registers pointed by 'max'.
  *
@@ -1071,31 +1342,38 @@ int hllMerge(uint8_t *max, robj *hll) {
     int i;
 
     if (hdr->encoding == HLL_DENSE) {
-        uint8_t val;
-
-        for (i = 0; i < HLL_REGISTERS; i++) {
-            HLL_DENSE_GET_REGISTER(val,hdr->registers,i);
-            if (val > max[i]) max[i] = val;
-        }
+        hllMergeDense(max, hdr->registers);
     } else {
         uint8_t *p = hll->ptr, *end = p + sdslen(hll->ptr);
         long runlen, regval;
+        int valid = 1;
 
         p += HLL_HDR_SIZE;
         i = 0;
         while(p < end) {
             if (HLL_SPARSE_IS_ZERO(p)) {
                 runlen = HLL_SPARSE_ZERO_LEN(p);
+                if ((runlen + i) > HLL_REGISTERS) { /* Overflow. */
+                    valid = 0;
+                    break;
+                }
                 i += runlen;
                 p++;
             } else if (HLL_SPARSE_IS_XZERO(p)) {
                 runlen = HLL_SPARSE_XZERO_LEN(p);
+                if ((runlen + i) > HLL_REGISTERS) { /* Overflow. */
+                    valid = 0;
+                    break;
+                }
                 i += runlen;
                 p += 2;
             } else {
                 runlen = HLL_SPARSE_VAL_LEN(p);
                 regval = HLL_SPARSE_VAL_VALUE(p);
-                if ((runlen + i) > HLL_REGISTERS) break; /* Overflow. */
+                if ((runlen + i) > HLL_REGISTERS) { /* Overflow. */
+                    valid = 0;
+                    break;
+                }
                 while(runlen--) {
                     if (regval > max[i]) max[i] = regval;
                     i++;
@@ -1103,9 +1381,192 @@ int hllMerge(uint8_t *max, robj *hll) {
                 p++;
             }
         }
-        if (i != HLL_REGISTERS) return C_ERR;
+        if (!valid || i != HLL_REGISTERS) return C_ERR;
     }
     return C_OK;
+}
+
+#ifdef HAVE_AVX2
+/* A specialized version of hllDenseCompress, optimized for default configurations.
+ * 
+ * Requirements:
+ * 1) HLL_REGISTERS == 16384 && HLL_BITS == 6
+ * 2) The CPU supports AVX2 (checked at runtime in hllDenseCompress)
+ *
+ * reg_dense: pointer to the dense representation array (12288 bytes, 6 bits per register)
+ * reg_raw: pointer to the raw representation array (16384 bytes, one byte per register)
+ */
+ATTRIBUTE_TARGET_AVX2
+void hllDenseCompressAVX2(uint8_t *reg_dense, const uint8_t *reg_raw) {
+    const __m256i shuffle = _mm256_setr_epi8( //
+        0, 1, 2,                              //
+        4, 5, 6,                              //
+        8, 9, 10,                             //
+        12, 13, 14,                           //
+        -1, -1, -1, -1,                       //
+        0, 1, 2,                              //
+        4, 5, 6,                              //
+        8, 9, 10,                             //
+        12, 13, 14,                           //
+        -1, -1, -1, -1                        //
+    );
+
+    /* Raw to Dense:
+     * 
+     * LOAD 32 bytes (32 registers) per iteration:
+     * {00aaaaaa|00bbbbbb|00cccccc|00dddddd} x8
+     *
+     * AVX2 is little endian, each of the 8 groups is a little-endian int32.
+     * A group (int32) contains 4 registers.
+     * 
+     * move the registers to correct positions with AND and SHIFT:
+     * {00aaaaaa|00000000|00000000|00000000} x8 (>>0)
+     * {bb000000|0000bbbb|00000000|00000000} x8 (>>2)
+     * {00000000|cccc0000|000000cc|00000000} x8 (>>4)
+     * {00000000|00000000|dddddd00|00000000} x8 (>>6)
+     *
+     * merge the registers with OR:
+     * {bbaaaaaa|ccccbbbb|ddddddcc|00000000} x8
+     * {AAA0|BBB0|CCC0|DDD0|EEE0|FFF0|GGG0|HHH0}
+     *
+     * SHUFFLE to:
+     * {AAAB|BBCC|CDDD|0000|EEEF|FFGG|GHHH|0000}
+     *
+     * STORE the lower half and higher half respectively:
+     * AAABBBCCCDDD0000 
+     *             EEEFFFGGGHHH0000
+     * AAABBBCCCDDDEEEFFFGGGHHH0000
+     *
+     * Note that the last 4 bytes are padding bytes.
+     */
+
+    const uint8_t *r = reg_raw;
+    uint8_t *t = reg_dense;
+
+    for (int i = 0; i < HLL_REGISTERS / 32 - 1; ++i) {
+        __m256i x = _mm256_loadu_si256((__m256i *)r);
+
+        __m256i a1, a2, a3, a4;
+        a1 = _mm256_and_si256(x, _mm256_set1_epi32(0x0000003f));
+        a2 = _mm256_and_si256(x, _mm256_set1_epi32(0x00003f00));
+        a3 = _mm256_and_si256(x, _mm256_set1_epi32(0x003f0000));
+        a4 = _mm256_and_si256(x, _mm256_set1_epi32(0x3f000000));
+
+        a2 = _mm256_srli_epi32(a2, 2);
+        a3 = _mm256_srli_epi32(a3, 4);
+        a4 = _mm256_srli_epi32(a4, 6);
+
+        __m256i y1, y2, y;
+        y1 = _mm256_or_si256(a1, a2);
+        y2 = _mm256_or_si256(a3, a4);
+        y = _mm256_or_si256(y1, y2);
+        y = _mm256_shuffle_epi8(y, shuffle);
+
+        __m128i lower, higher;
+        lower = _mm256_castsi256_si128(y);
+        higher = _mm256_extracti128_si256(y, 1);
+
+        _mm_storeu_si128((__m128i *)t, lower);
+        _mm_storeu_si128((__m128i *)(t + 12), higher);
+
+        r += 32;
+        t += 24;
+    }
+
+    /* Merge the last 32 registers normally 
+     * as the AVX2 algorithm needs 4 padding bytes at the end */
+    for (int i = HLL_REGISTERS - 32; i < HLL_REGISTERS; i++) {
+        HLL_DENSE_SET_REGISTER(reg_dense, i, reg_raw[i]);
+    }
+}
+#endif
+
+#ifdef HAVE_AARCH64_NEON
+/* A specialized version of hllDenseCompress, optimized for default configurations.
+ * Based on the AVX2 version.
+ * 
+ * Requirements:
+ * 1) HLL_REGISTERS == 16384 && HLL_BITS == 6
+ * 2) Aarch64 CPU supports NEON (checked at runtime in hllDenseCompress)
+ *
+ * reg_dense: pointer to the dense representation array (12288 bytes, 6 bits per register)
+ * reg_raw: pointer to the raw representation array (16384 bytes, one byte per register)
+ */
+void hllDenseCompressAarch64(uint8_t *reg_dense, const uint8_t *reg_raw) {
+    const uint8_t *r = reg_raw;
+    uint8_t *t = reg_dense;
+
+    /* Shuffle pattern to collapse 16 raw bytes (16 regs x 8 bits)
+     * into 12 bytes (16 regs x 6 bits) by dropping padding bytes 3, 7, 11, 15. */
+    const uint8x16_t shuffle = {
+        0, 1, 2,
+        4, 5, 6,
+        8, 9, 10,
+        12, 13, 14,
+        -1, -1, -1
+    };
+
+    for (int i = 0; i < HLL_REGISTERS / 16 - 1; ++i) {
+        /* Load 16 raw registers as four 32-bit lanes (LE). */
+        const uint32x4_t x = vld1q_u32((const uint32_t *)r);
+
+        /* Extract the four 6-bit fields per 32-bit lane. */
+        uint32x4_t a1, a2, a3, a4;
+        a1 = vandq_u32(x, vdupq_n_u32(0x0000003f));
+        a2 = vandq_u32(x, vdupq_n_u32(0x00003f00));
+        a3 = vandq_u32(x, vdupq_n_u32(0x003f0000));
+        a4 = vandq_u32(x, vdupq_n_u32(0x3f000000));
+
+        /* Align fields to packed positions within each lane. */
+        a2 = vshrq_n_u32(a2, 2);
+        a3 = vshrq_n_u32(a3, 4);
+        a4 = vshrq_n_u32(a4, 6);
+
+        /* Combine fields per lane (32-bit). */
+        uint32x4_t y32 = vorrq_u32(vorrq_u32(a1, a2), vorrq_u32(a3, a4));
+
+        /* Reinterpret to 8-bit uints; each lane now holds 3 packed bytes + one pad. */
+        uint8x16_t y = vreinterpretq_u8_u32(y32);
+
+        /* Compact to 12 bytes by removing each lane's pad byte. */
+        y = vqtbl1q_u8(y, shuffle);
+
+        /* Store the results. */
+        vst1q_u8(t, y);
+
+        r += 16;
+        t += 12;
+    }
+
+    /* Merge the last 16 registers normally 
+     * as the NEON algorithm needs 4 padding bytes at the end */
+    for (int i = HLL_REGISTERS - 16; i < HLL_REGISTERS; i++) {
+        HLL_DENSE_SET_REGISTER(reg_dense, i, reg_raw[i]);
+    }
+}
+#endif
+
+/* Compress raw registers to dense representation. */
+void hllDenseCompress(uint8_t *reg_dense, const uint8_t *reg_raw) {
+#if HLL_REGISTERS == 16384 && HLL_BITS == 6
+#ifdef HAVE_AVX2
+    if (HLL_USE_AVX2) {
+        hllDenseCompressAVX2(reg_dense, reg_raw);
+        return;
+    }
+#endif
+
+#ifdef HAVE_AARCH64_NEON
+    if (HLL_USE_NEON) {
+        hllDenseCompressAarch64(reg_dense, reg_raw);
+        return;
+    }
+#endif
+#endif
+
+    for (int i = 0; i < HLL_REGISTERS; i++) {
+        HLL_DENSE_SET_REGISTER(reg_dense, i, reg_raw[i]);
+    }
 }
 
 /* ========================== HyperLogLog commands ========================== */
@@ -1179,24 +1640,32 @@ invalid:
 
 /* PFADD var ele ele ele ... ele => :0 or :1 */
 void pfaddCommand(client *c) {
-    robj *o = lookupKeyWrite(c->db,c->argv[1]);
+    uint64_t oldlen;
+    dictEntryLink link;
+    size_t oldsize = 0;
+    kvobj *kv = lookupKeyWriteWithLink(c->db,c->argv[1], &link);
+
     struct hllhdr *hdr;
     int updated = 0, j;
 
-    if (o == NULL) {
+    if (kv == NULL) {
         /* Create the key with a string value of the exact length to
          * hold our HLL data structure. sdsnewlen() when NULL is passed
          * is guaranteed to return bytes initialized to zero. */
-        o = createHLLObject();
-        dbAdd(c->db,c->argv[1],o);
+        robj *o = createHLLObject();
+        kv = dbAddByLink(c->db, c->argv[1], &o, &link);
         updated++;
     } else {
-        if (isHLLObjectOrReply(c,o) != C_OK) return;
-        o = dbUnshareStringValue(c->db,c->argv[1],o);
+        if (isHLLObjectOrReply(c,kv) != C_OK) return;
+        kv = dbUnshareStringValue(c->db,c->argv[1],kv);
     }
+    oldlen = stringObjectLen(kv);
+    if (server.memory_tracking_enabled)
+        oldsize = kvobjAllocSize(kv);
+
     /* Perform the low level ADD operation for every element. */
     for (j = 2; j < c->argc; j++) {
-        int retval = hllAdd(o, (unsigned char*)c->argv[j]->ptr,
+        int retval = hllAdd(kv, (unsigned char*)c->argv[j]->ptr,
                                sdslen(c->argv[j]->ptr));
         switch(retval) {
         case 1:
@@ -1204,22 +1673,27 @@ void pfaddCommand(client *c) {
             break;
         case -1:
             addReplyError(c,invalid_hll_err);
+            if (server.memory_tracking_enabled)
+                updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), kv, oldsize, kvobjAllocSize(kv));
             return;
         }
     }
-    hdr = o->ptr;
+
+    hdr = kv->ptr;
+    updateKeysizesHist(c->db, OBJ_STRING, oldlen, stringObjectLen(kv));
+    if (server.memory_tracking_enabled)
+        updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), kv, oldsize, kvobjAllocSize(kv));
     if (updated) {
-        signalModifiedKey(c,c->db,c->argv[1]);
+        HLL_INVALIDATE_CACHE(hdr);
+        keyModified(c,c->db,c->argv[1],kv,1);
         notifyKeyspaceEvent(NOTIFY_STRING,"pfadd",c->argv[1],c->db->id);
         server.dirty += updated;
-        HLL_INVALIDATE_CACHE(hdr);
     }
     addReply(c, updated ? shared.cone : shared.czero);
 }
 
 /* PFCOUNT var -> approximated cardinality of set. */
 void pfcountCommand(client *c) {
-    robj *o;
     struct hllhdr *hdr;
     uint64_t card;
 
@@ -1238,7 +1712,7 @@ void pfcountCommand(client *c) {
         registers = max + HLL_HDR_SIZE;
         for (j = 1; j < c->argc; j++) {
             /* Check type and size. */
-            robj *o = lookupKeyRead(c->db,c->argv[j]);
+            kvobj *o = lookupKeyRead(c->db,c->argv[j]);
             if (o == NULL) continue; /* Assume empty HLL for non existing var.*/
             if (isHLLObjectOrReply(c,o) != C_OK) return;
 
@@ -1266,7 +1740,7 @@ void pfcountCommand(client *c) {
      * logically expired key on a replica is deleted, while with lookupKeyRead
      * it isn't, but the lookup returns NULL either way if the key is logically
      * expired, which is what matters here. */
-    o = lookupKeyRead(c->db,c->argv[1]);
+    kvobj *o = lookupKeyRead(c->db, c->argv[1]);
     if (o == NULL) {
         /* No key? Cardinality is zero since no element was added, otherwise
          * we would have a key as HLLADD creates it as a side effect. */
@@ -1306,7 +1780,7 @@ void pfcountCommand(client *c) {
             /* This is considered a read-only command even if the cached value
              * may be modified and given that the HLL is a Redis string
              * we need to propagate the change. */
-            signalModifiedKey(c,c->db,c->argv[1]);
+            keyModified(c,c->db,c->argv[1],o,1);
             server.dirty++;
         }
         addReplyLongLong(c,card);
@@ -1319,6 +1793,7 @@ void pfmergeCommand(client *c) {
     struct hllhdr *hdr;
     int j;
     int use_dense = 0; /* Use dense representation as target? */
+    size_t oldsize = 0;
 
     /* Compute an HLL with M[i] = MAX(M[i]_j).
      * We store the maximum into the max array of registers. We'll write
@@ -1326,9 +1801,9 @@ void pfmergeCommand(client *c) {
     memset(max,0,sizeof(max));
     for (j = 1; j < c->argc; j++) {
         /* Check type and size. */
-        robj *o = lookupKeyRead(c->db,c->argv[j]);
+        kvobj *o = lookupKeyRead(c->db, c->argv[j]);
         if (o == NULL) continue; /* Assume empty HLL for non existing var. */
-        if (isHLLObjectOrReply(c,o) != C_OK) return;
+        if (isHLLObjectOrReply(c, o) != C_OK) return;
 
         /* If at least one involved HLL is dense, use the dense representation
          * as target ASAP to save time and avoid the conversion step. */
@@ -1344,45 +1819,59 @@ void pfmergeCommand(client *c) {
     }
 
     /* Create / unshare the destination key's value if needed. */
-    robj *o = lookupKeyWrite(c->db,c->argv[1]);
-    if (o == NULL) {
+    dictEntryLink link;
+    kvobj *kv = lookupKeyWriteWithLink(c->db,c->argv[1],&link);
+    if (kv == NULL) {
         /* Create the key with a string value of the exact length to
          * hold our HLL data structure. sdsnewlen() when NULL is passed
          * is guaranteed to return bytes initialized to zero. */
-        o = createHLLObject();
-        dbAdd(c->db,c->argv[1],o);
+        robj *o = createHLLObject();
+        kv = dbAddByLink(c->db, c->argv[1], &o, &link);
     } else {
         /* If key exists we are sure it's of the right type/size
          * since we checked when merging the different HLLs, so we
          * don't check again. */
-        o = dbUnshareStringValue(c->db,c->argv[1],o);
+        kv = dbUnshareStringValue(c->db,c->argv[1],kv);
     }
+
+    uint64_t oldLen = stringObjectLen(kv);
+    if (server.memory_tracking_enabled)
+        oldsize = kvobjAllocSize(kv);
 
     /* Convert the destination object to dense representation if at least
      * one of the inputs was dense. */
-    if (use_dense && hllSparseToDense(o) == C_ERR) {
+    if (use_dense && hllSparseToDense(kv) == C_ERR) {
         addReplyError(c,invalid_hll_err);
         return;
     }
 
     /* Write the resulting HLL to the destination HLL registers and
      * invalidate the cached value. */
-    for (j = 0; j < HLL_REGISTERS; j++) {
-        if (max[j] == 0) continue;
-        hdr = o->ptr;
-        switch(hdr->encoding) {
-        case HLL_DENSE: hllDenseSet(hdr->registers,j,max[j]); break;
-        case HLL_SPARSE: hllSparseSet(o,j,max[j]); break;
+    if (use_dense) {
+        hdr = kv->ptr;
+        hllDenseCompress(hdr->registers, max);
+    } else {
+        for (j = 0; j < HLL_REGISTERS; j++) {
+            if (max[j] == 0) continue;
+            hdr = kv->ptr;
+            switch (hdr->encoding) {
+                case HLL_DENSE: hllDenseSet(hdr->registers,j,max[j]); break;
+                case HLL_SPARSE: hllSparseSet(kv,j,max[j]); break;
+            }
         }
     }
-    hdr = o->ptr; /* o->ptr may be different now, as a side effect of
+    hdr = kv->ptr; /* o->ptr may be different now, as a side effect of
                      last hllSparseSet() call. */
     HLL_INVALIDATE_CACHE(hdr);
 
-    signalModifiedKey(c,c->db,c->argv[1]);
+    if (server.memory_tracking_enabled)
+        updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), kv, oldsize, kvobjAllocSize(kv));
+    keyModified(c,c->db,c->argv[1],kv,1);
     /* We generate a PFADD event for PFMERGE for semantical simplicity
      * since in theory this is a mass-add of elements. */
     notifyKeyspaceEvent(NOTIFY_STRING,"pfadd",c->argv[1],c->db->id);
+
+    updateKeysizesHist(c->db, OBJ_STRING, oldLen, stringObjectLen(kv));
     server.dirty++;
     addReply(c,shared.ok);
 }
@@ -1501,12 +1990,34 @@ cleanup:
  * PFDEBUG DECODE <key>
  * PFDEBUG ENCODING <key>
  * PFDEBUG TODENSE <key>
+ * PFDEBUG SIMD (ON|OFF)
  */
 void pfdebugCommand(client *c) {
     char *cmd = c->argv[1]->ptr;
     struct hllhdr *hdr;
-    robj *o;
+    kvobj *o;
     int j;
+    size_t oldsize = 0;
+
+    if (!strcasecmp(cmd, "simd")) {
+        if (c->argc != 3) goto arityerr;
+
+        if (!strcasecmp(c->argv[2]->ptr, "on")) {
+#if defined(HAVE_AVX2) || defined(HAVE_AARCH64_NEON)
+            simd_enabled = 1;
+#endif
+        } else if (!strcasecmp(c->argv[2]->ptr, "off")) {
+#if defined(HAVE_AVX2) || defined(HAVE_AARCH64_NEON)
+            simd_enabled = 0;
+#endif
+        } else {
+            addReplyError(c, "Argument must be ON or OFF");
+        }
+
+        addReplyStatus(c, HLL_USE_AVX2 || HLL_USE_NEON ? "enabled" : "disabled");
+
+        return;
+    }
 
     o = lookupKeyWrite(c->db,c->argv[2]);
     if (o == NULL) {
@@ -1516,16 +2027,22 @@ void pfdebugCommand(client *c) {
     if (isHLLObjectOrReply(c,o) != C_OK) return;
     o = dbUnshareStringValue(c->db,c->argv[2],o);
     hdr = o->ptr;
+    if (server.memory_tracking_enabled)
+        oldsize = kvobjAllocSize(o);
 
     /* PFDEBUG GETREG <key> */
     if (!strcasecmp(cmd,"getreg")) {
         if (c->argc != 3) goto arityerr;
 
         if (hdr->encoding == HLL_SPARSE) {
+            uint64_t oldlen = (uint64_t) stringObjectLen(o);
             if (hllSparseToDense(o) == C_ERR) {
                 addReplyError(c,invalid_hll_err);
                 return;
             }
+            updateKeysizesHist(c->db, OBJ_STRING, oldlen, stringObjectLen(o));
+            if (server.memory_tracking_enabled)
+                updateSlotAllocSize(c->db, getKeySlot(c->argv[2]->ptr), o, oldsize, kvobjAllocSize(o));
             server.dirty++; /* Force propagation on encoding change. */
         }
 
@@ -1587,10 +2104,14 @@ void pfdebugCommand(client *c) {
         if (c->argc != 3) goto arityerr;
 
         if (hdr->encoding == HLL_SPARSE) {
+            int64_t oldlen = (int64_t) stringObjectLen(o);
             if (hllSparseToDense(o) == C_ERR) {
                 addReplyError(c,invalid_hll_err);
                 return;
             }
+            updateKeysizesHist(c->db, OBJ_STRING, oldlen, stringObjectLen(o));
+            if (server.memory_tracking_enabled)
+                updateSlotAllocSize(c->db, getKeySlot(c->argv[2]->ptr), o, oldsize, kvobjAllocSize(o));
             conv = 1;
             server.dirty++; /* Force propagation on encoding change. */
         }

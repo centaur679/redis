@@ -553,7 +553,7 @@ start_server {tags {"multi"}} {
         catch { $r2 exec; } e
         assert_match {EXECABORT*previous errors*} $e
         set xx [r get xx]
-        # make sure that either the whole transcation passed or none of it (we actually expect none)
+        # make sure that either the whole transaction passed or none of it (we actually expect none)
         assert { $xx == 1 || $xx == 3}
         # check that the connection is no longer in multi state
         set pong [$r2 ping asdf]
@@ -578,7 +578,7 @@ start_server {tags {"multi"}} {
         r script kill
         after 200 ; # Give some time to Lua to call the hook again...
         set xx [r get xx]
-        # make sure that either the whole transcation passed or none of it (we actually expect none)
+        # make sure that either the whole transaction passed or none of it (we actually expect none)
         assert { $xx == 1 || $xx == 3}
         # check that the connection is no longer in multi state
         set pong [$r2 ping asdf]
@@ -603,7 +603,7 @@ start_server {tags {"multi"}} {
         catch { $r2 exec; } e
         assert_match {EXECABORT*previous errors*} $e
         set xx [r get xx]
-        # make sure that either the whole transcation passed or none of it (we actually expect none)
+        # make sure that either the whole transaction passed or none of it (we actually expect none)
         assert { $xx == 1 || $xx == 3}
         # check that the connection is no longer in multi state
         set pong [$r2 ping asdf]
@@ -825,7 +825,9 @@ start_server {tags {"multi"}} {
                 {multi}
                 {xclaim *}
                 {xclaim *}
+                {xgroup SETID * ENTRIESREAD *}
                 {xclaim *}
+                {xgroup SETID * ENTRIESREAD *}
                 {exec}
             }
             close_replication_stream $repl
@@ -891,9 +893,17 @@ start_server {tags {"multi"}} {
         set res [r read]
         assert_equal $res "+OK"
         set res [r read]
-        r readraw 1
+        r readraw 0
         set _ $res
     } {*CONFIG SET failed*}
+    
+    test "Flushall while watching several keys by one client" {
+        r flushall
+        r mset a{t} a b{t} b
+        r watch b{t} a{t}
+        r flushall
+        r ping
+     }
 }
 
 start_server {overrides {appendonly {yes} appendfilename {appendonly.aof} appendfsync always} tags {external:skip}} {

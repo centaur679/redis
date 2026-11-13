@@ -1,105 +1,53 @@
-# Redis test suite. Copyright (C) 2009 Salvatore Sanfilippo antirez@gmail.com
-# This software is released under the BSD License. See the COPYING file for
-# more information.
+# Redis test suite.
+#
+# Copyright (C) 2014-Present, Redis Ltd.
+# All Rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
 
-package require Tcl 8.5
+package require Tcl 8.5-10
 
-set tcl_precision 17
+if {$tcl_version < 9.0} { set tcl_precision 17 }
 source tests/support/redis.tcl
 source tests/support/aofmanifest.tcl
 source tests/support/server.tcl
-source tests/support/cluster_helper.tcl
+source tests/support/cluster_util.tcl
 source tests/support/tmpfile.tcl
 source tests/support/test.tcl
 source tests/support/util.tcl
 
-set ::all_tests {
-    unit/printver
-    unit/dump
-    unit/auth
-    unit/protocol
-    unit/keyspace
-    unit/scan
-    unit/info
-    unit/info-command
-    unit/type/string
-    unit/type/incr
-    unit/type/list
-    unit/type/list-2
-    unit/type/list-3
-    unit/type/set
-    unit/type/zset
-    unit/type/hash
-    unit/type/stream
-    unit/type/stream-cgroups
-    unit/sort
-    unit/expire
-    unit/other
-    unit/multi
-    unit/quit
-    unit/aofrw
-    unit/acl
-    unit/acl-v2
-    unit/latency-monitor
-    integration/block-repl
-    integration/replication
-    integration/replication-2
-    integration/replication-3
-    integration/replication-4
-    integration/replication-psync
-    integration/replication-buffer
-    integration/shutdown
-    integration/aof
-    integration/aof-race
-    integration/aof-multi-part
-    integration/rdb
-    integration/corrupt-dump
-    integration/corrupt-dump-fuzzer
-    integration/convert-zipmap-hash-on-load
-    integration/convert-ziplist-hash-on-load
-    integration/convert-ziplist-zset-on-load
-    integration/logging
-    integration/psync2
-    integration/psync2-reg
-    integration/psync2-pingoff
-    integration/psync2-master-restart
-    integration/failover
-    integration/redis-cli
-    integration/redis-benchmark
-    integration/dismiss-mem
-    unit/pubsub
-    unit/pubsubshard
-    unit/slowlog
-    unit/scripting
-    unit/functions
-    unit/maxmemory
-    unit/introspection
-    unit/introspection-2
-    unit/limits
-    unit/obuf-limits
-    unit/bitops
-    unit/bitfield
-    unit/geo
-    unit/memefficiency
-    unit/hyperloglog
-    unit/lazyfree
-    unit/wait
-    unit/pause
-    unit/querybuf
-    unit/tls
-    unit/tracking
-    unit/oom-score-adj
-    unit/shutdown
-    unit/networking
-    unit/client-eviction
-    unit/violations
-    unit/replybufsize
-    unit/cluster/misc
-    unit/cluster/cli
-    unit/cluster/scripting
-    unit/cluster/hostnames
-    unit/cluster/multi-slot-operations
-    unit/cluster/slot-ownership
+set dir [pwd]
+set ::all_tests []
+
+set test_dirs {
+    unit
+    unit/type
+    unit/moduleapi
+    unit/cluster
+    integration
+}
+
+foreach test_dir $test_dirs {
+    set files [glob -nocomplain $dir/tests/$test_dir/*.tcl]
+
+    foreach file [lsort $files] {
+        lappend ::all_tests $test_dir/[file root [file tail $file]]
+    }
+}
+
+# The cluster tests, for --cluster. They are part of ::all_tests above and run
+# with everything else by default; this list just lets a run be limited to them.
+set ::cluster_all_tests {}
+foreach file [lsort [glob -nocomplain $dir/tests/unit/cluster/*.tcl]] {
+    lappend ::cluster_all_tests unit/cluster/[file root [file tail $file]]
 }
 # Index to the next test to run in the ::all_tests list.
 set ::next_test 0
@@ -110,6 +58,7 @@ set ::baseport 21111; # initial port for spawned redis servers
 set ::portcount 8000; # we don't wanna use more than 10000 to avoid collision with cluster bus ports
 set ::traceleaks 0
 set ::valgrind 0
+set ::tsan 0
 set ::durable 0
 set ::tls 0
 set ::tls_module 0
@@ -132,8 +81,13 @@ set ::accurate 0; # If true runs fuzz tests with more iterations
 set ::force_failure 0
 set ::timeout 1200; # 20 minutes without progresses will quit the test.
 set ::last_progress [clock seconds]
+array set ::client_pid {};         # os pid of each test client, from its ready packet
+array set ::client_sigusr1_trace {}; # clients that answer SIGUSR1 with a Tcl stack trace (need Tclx)
+set ::in_timeout_report 0;         # true while reporting a timeout (we re-enter the event loop)
+array set ::client_trace_received {}; # clients that answered a timeout report with a Tcl stack trace
 set ::active_servers {} ; # Pids of active Redis instances.
 set ::dont_clean 0
+set ::dont_pre_clean 0
 set ::wait_server 0
 set ::stop_on_failure 0
 set ::dump_logs 0
@@ -144,6 +98,10 @@ set ::cluster_mode 0
 set ::ignoreencoding 0
 set ::ignoredigest 0
 set ::large_memory 0
+set ::log_req_res 0
+set ::force_resp3 0
+set ::debug_defrag 0
+set ::compression 0
 
 # Set to 1 when we are running in client mode. The Redis test uses a
 # server-client model to run tests simultaneously. The server instance
@@ -191,6 +149,12 @@ proc srv {args} {
     dict get $srv $property
 }
 
+# Take an index to get a srv.
+proc get_srv {level} {
+    set srv [lindex $::servers end+$level]
+    return $srv
+}
+
 # Provide easy access to the client for the inner server. It's possible to
 # prepend the argument list with a negative level to access clients for
 # servers running in outer blocks.
@@ -203,11 +167,16 @@ proc r {args} {
     [srv $level "client"] {*}$args
 }
 
+# Returns a Redis instance by index.
+proc Rn {n} {
+    set level [expr -1*$n]
+    return [srv $level "client"]
+}
+
 # Provide easy access to a client for an inner server. Requires a positive
 # index, unlike r which uses an optional negative index.
 proc R {n args} {
-    set level [expr -1*$n]
-    [srv $level "client"] {*}$args
+    [Rn $n] {*}$args
 }
 
 proc reconnect {args} {
@@ -265,7 +234,7 @@ proc redis_client {args} {
         set args [lrange $args 1 end]
     }
 
-    # create client that defers reading reply
+    # create client that won't defers reading reply
     set client [redis [srv $level "host"] [srv $level "port"] 0 $::tls]
 
     # select the right db and read the response (OK), or at least ping
@@ -278,6 +247,16 @@ proc redis_client {args} {
     return $client
 }
 
+proc redis_deferring_client_by_addr {host port} {
+    set client [redis $host $port 1 $::tls]
+    return $client
+}
+
+proc redis_client_by_addr {host port} {
+    set client [redis $host $port 0 $::tls]
+    return $client
+}
+
 # Provide easy access to INFO properties. Same semantic as "proc r".
 proc s {args} {
     set level 0
@@ -286,6 +265,10 @@ proc s {args} {
         set args [lrange $args 1 end]
     }
     status [srv $level "client"] [lindex $args 0]
+}
+
+proc S {index field} {
+    getInfoProperty [R $index info] $field
 }
 
 # Get the specified field from the givens instances cluster info output.
@@ -314,7 +297,7 @@ proc cleanup {} {
 }
 
 proc test_server_main {} {
-    cleanup
+    if {!$::dont_pre_clean} cleanup
     set tclsh [info nameofexecutable]
     # Open a listening socket, trying different ports in order to find a
     # non busy one.
@@ -356,13 +339,33 @@ proc test_server_main {} {
 
 # This function gets called 10 times per second.
 proc test_server_cron {} {
+    # request_client_stack_traces pumps the event loop, which would otherwise
+    # let this fire again in the middle of a report.
+    if {$::in_timeout_report} return
+
     set elapsed [expr {[clock seconds]-$::last_progress}]
 
     if {$elapsed > $::timeout} {
+        set ::in_timeout_report 1
         set err "\[[colorstr red TIMEOUT]\]: clients state report follows."
         puts $err
         lappend ::failed_tests $err
         show_clients_state
+
+        # Order matters: collect the servers first. Poking a client makes it
+        # unwind, and on the way out start_server kills the very servers we
+        # want a crash report from (and tells us they are gone, emptying
+        # ::active_servers).
+        # Nothing here may throw: this runs from an "after" handler, so an
+        # error would be swallowed as a background error and, with the cron no
+        # longer rescheduled, leave the run hanging instead of tearing it down.
+        if {[catch dump_stuck_servers e]} {
+            puts "(collecting server crash reports failed: $e)"
+        }
+        if {[catch request_client_stack_traces e]} {
+            puts "(collecting the clients' Tcl stack traces failed: $e)"
+        }
+
         kill_clients
         force_kill_all_servers
         the_end
@@ -371,8 +374,70 @@ proc test_server_cron {} {
     after 100 test_server_cron
 }
 
+# Let the event loop run until every client in $fds has reported a Tcl stack
+# trace, or we give up. A report arrives as an ordinary exception/err packet,
+# which read_from_test_client prints and records.
+proc pump_for_client_traces {fds ticks} {
+    for {set i 0} {$i < $ticks} {incr i} {
+        set pending 0
+        foreach fd $fds {
+            if {![info exists ::client_trace_received($fd)]} {incr pending}
+        }
+        if {!$pending} return
+        after 100
+        update
+    }
+}
+
+# Get a Tcl stack trace out of every active test client, so we learn where in
+# the test each one hung and not just which test it was running. No client has
+# reported progress for --timeout seconds, so all of them are stuck.
+#
+# There are two ways one reaches us. Crash-reporting the servers above usually
+# unblocks a client by itself: its connection dies, the error unwinds, and the
+# client's existing top-level handler reports $::errorInfo. So collect that
+# first. Only a client stuck on something else -- a still-live server, an exec,
+# a sleep -- has to be poked, and for that we use SIGUSR1, which the client turns
+# into a Tcl error (see test_client_main): the same unwind, on demand.
+proc request_client_stack_traces {} {
+    set fds $::active_clients
+    pump_for_client_traces $fds 30
+
+    set poked {}
+    foreach fd $fds {
+        if {[info exists ::client_trace_received($fd)]} continue
+        if {![info exists ::client_pid($fd)]} {
+            puts "(no pid known for test client $fd, skipping its Tcl stack trace)"
+            continue
+        }
+        set pid $::client_pid($fd)
+        if {![info exists ::client_sigusr1_trace($fd)]} {
+            puts "(test client $fd (pid $pid) has no Tclx, so it can't be asked for a Tcl stack trace)"
+            continue
+        }
+        if {![is_running $pid]} {
+            puts "(test client $fd (pid $pid) already exited without reporting a Tcl stack trace)"
+            continue
+        }
+        puts "Requesting a Tcl stack trace from test client $fd (pid $pid)..."
+        if {[catch {exec kill -USR1 $pid} e]} {
+            puts "(couldn't signal the test client: $e)"
+            continue
+        }
+        lappend poked $fd
+    }
+    if {![llength $poked]} return
+
+    pump_for_client_traces $poked 100
+    foreach fd $poked {
+        if {![info exists ::client_trace_received($fd)]} {
+            puts "(no Tcl stack trace came back from test client $fd; it may be running without Tclx)"
+        }
+    }
+}
+
 proc accept_test_clients {fd addr port} {
-    fconfigure $fd -encoding binary
+    fconfigure $fd -translation binary
     fileevent $fd readable [list read_from_test_client $fd]
 }
 
@@ -391,9 +456,26 @@ proc accept_test_clients {fd addr port} {
 # exception: there was a runtime exception while executing the test.
 # done: all the specified test file was processed, this test client is
 #       ready to accept a new task.
+# sigusr1-trace: the client answers SIGUSR1 with a Tcl stack trace (see
+#       test_client_main), so a timeout report may ask it for one.
 proc read_from_test_client fd {
-    set bytes [gets $fd]
-    set payload [read $fd $bytes]
+    if {[catch {set bytes [gets $fd]}] || ![string is integer -strict $bytes] ||
+        [catch {set payload [encoding convertfrom utf-8 [read $fd $bytes]]}]} {
+        # The client is gone. Stop listening, otherwise the dead socket stays
+        # readable and spins this handler.
+        fileevent $fd readable {}
+        # During a timeout report that is expected: a client exits right after
+        # reporting the stack trace we asked for.
+        if {$::in_timeout_report} return
+        # Otherwise it died without reporting an exception (crashed, OOM,
+        # killed), which is just as fatal -- don't wait for --timeout.
+        set task "no state reported"
+        if {[info exists ::active_clients_task($fd)]} {set task $::active_clients_task($fd)}
+        puts "\[[colorstr red exception]\]: Test client $fd exited unexpectedly -- last client state: $task"
+        kill_clients
+        force_kill_all_servers
+        exit 1
+    }
     foreach {status data elapsed} $payload break
     set ::last_progress [clock seconds]
 
@@ -401,6 +483,9 @@ proc read_from_test_client fd {
         if {!$::quiet} {
             puts "\[$status\]: $data"
         }
+        # The payload is the client's os pid; remember it so a timeout can ask
+        # this client for a Tcl stack trace.
+        set ::client_pid($fd) $data
         signal_idle_client $fd
     } elseif {$status eq {done}} {
         set elapsed [expr {[clock seconds]-$::clients_start_time($fd)}]
@@ -409,6 +494,14 @@ proc read_from_test_client fd {
         set completed_tests_count [expr {$::next_test-$running_tests_count}]
         puts "\[$completed_tests_count/$all_tests_count [colorstr yellow $status]\]: $data ($elapsed seconds)"
         lappend ::clients_time_history $elapsed $data
+        if {$::in_timeout_report} {
+            # A client can finish its unit once its servers are crash-reported
+            # (e.g. under --durable). It has nothing left to report, and
+            # signal_idle_client would hand it a new unit or call the_end, which
+            # exits before the timeout report is done.
+            set ::client_trace_received($fd) 1
+            return
+        }
         signal_idle_client $fd
         set ::active_clients_task($fd) "(DONE) $data"
     } elseif {$status eq {ok}} {
@@ -427,6 +520,12 @@ proc read_from_test_client fd {
     } elseif {$status eq {err}} {
         set err "\[[colorstr red $status]\]: $data"
         puts $err
+        if {$::in_timeout_report} {
+            # Same as below, for a --durable run where the client reports the
+            # interrupted test as a failure rather than re-raising.
+            set ::client_trace_received($fd) 1
+            return
+        }
         lappend ::failed_tests $err
         set ::active_clients_task($fd) "(ERR) $data"
         if {$::stop_on_failure} {
@@ -436,6 +535,12 @@ proc read_from_test_client fd {
         }
     } elseif {$status eq {exception}} {
         puts "\[[colorstr red $status]\]: $data"
+        if {$::in_timeout_report} {
+            # This is the Tcl stack trace a timeout report is waiting for;
+            # carry on with the report instead of tearing down here.
+            set ::client_trace_received($fd) 1
+            return
+        }
         kill_clients
         force_kill_all_servers
         exit 1
@@ -451,12 +556,119 @@ proc read_from_test_client fd {
     } elseif {$status eq {server-killed}} {
         set ::active_servers [lsearch -all -inline -not -exact $::active_servers $data]
         set ::active_clients_task($fd) "(KILLED SERVER) pid:$data"
+    } elseif {$status eq {sigusr1-trace}} {
+        set ::client_sigusr1_trace($fd) 1
     } elseif {$status eq {run_solo}} {
         lappend ::run_solo_tests $data
     } else {
         if {!$::quiet} {
             puts "\[$status\]: $data"
         }
+    }
+}
+
+# Like is_alive, but a zombie counts as gone. We are not the parent of the
+# servers (the stuck test client is, and it is not reaping them) nor do we reap
+# the test clients until our next exec, so after dying they linger as zombies,
+# which kill -0 still reports as alive.
+proc is_running pid {
+    if {[catch {get_proc_state $pid} st]} {return 0}
+    expr {![string match Z* [string trim $st]]}
+}
+
+# Map a server pid to its log files. The test server only ever learns pids (from
+# the server-spawned packet), not paths, so find the tests/tmp directory whose
+# log carries that pid as a line prefix ("<pid>:M ...").
+proc server_log_files_of_pid {pid} {
+    set res {}
+    foreach f [glob -nocomplain "tests/tmp/*/stdout"] {
+        if {[catch {set fh [open $f r]}]} continue
+        fconfigure $fh -translation binary; # see dump_crash_report
+        # The whole file: a server restarted without rotating its log appends
+        # to the same one, so its pid may first appear anywhere.
+        set data [read $fh]
+        close $fh
+        if {![regexp -line "^$pid:" $data]} continue
+        lappend res $f
+        set errfile [file join [file dirname $f] stderr]
+        if {[file exists $errfile]} {lappend res $errfile}
+    }
+    return $res
+}
+
+# Print the end of a server log: the crash report we just asked for, plus a few
+# lines of context above it for what the server was doing. A timeout can leave
+# many servers alive across all clients, so we don't want whole logs. A log with
+# no crash report (the server died before writing one, or this is its stderr)
+# gets its tail instead, which is then the only evidence there is.
+proc dump_crash_report {f pid {context_lines 10} {tail_bytes 262144}} {
+    if {[catch {set fh [open $f r]} e]} {
+        puts "(can't open $f: $e)"
+        return
+    }
+    # Read raw bytes: a log can hold anything (binary keys in the client list),
+    # and a strict decode (Tcl 9's default) would throw mid-report.
+    fconfigure $fh -translation binary
+    set data [read $fh]
+    close $fh
+    set size [string length $data]
+
+    set pos [string last "REDIS BUG REPORT START" $data]
+    if {$pos >= 0} {
+        # Back up to the start of the marker line, then context_lines more.
+        for {set i 0} {$i <= $context_lines && $pos >= 0} {incr i} {
+            set pos [string last "\n" $data [expr {$pos-1}]]
+        }
+        set start [expr {$pos+1}]
+    } else {
+        set start [expr {max(0, $size-$tail_bytes)}]
+    }
+
+    puts "\n===== Start of $f (pid $pid, last [expr {$size-$start}] of $size bytes) =====\n"
+    if {$start} {puts "\[...$start earlier bytes skipped...\]"}
+    set out [string range $data $start end]
+    catch {set out [encoding convertfrom utf-8 $out]}; # else print it raw
+    puts $out
+    puts "===== End of $f (pid $pid) =====\n"
+}
+
+# A timeout SIGKILLs every server, throwing away the only evidence we could
+# have had -- and --dump-logs only fires for a failed or excepted test, never
+# for a timeout. So ask the servers to talk first.
+#
+# SIGSEGV makes redis log a stack trace of every one of its threads plus INFO,
+# the client list and the config (printCrashReport) and then die. The handler
+# runs on whichever thread takes the signal, so it works on a server whose
+# event loop is wedged -- exactly the case we cannot diagnose from outside.
+# kill_server already resorts to SIGSEGV for the same reason when a server
+# won't exit, but the timeout path never reaches it.
+proc dump_stuck_servers {} {
+    set pids $::active_servers
+    if {[llength $pids] == 0} return
+
+    # Signal every server, even one whose log we can't find: the crash report
+    # also unblocks a client waiting on it.
+    puts "Requesting crash reports (SIGSEGV) from [llength $pids] still running server(s)..."
+    foreach p $pids {
+        # A stopped server (pause_process, SIGSTOP) only runs the handler once
+        # continued -- kill_server does the same for the same reason.
+        catch {exec kill -SIGCONT $p}
+        catch {exec kill -SEGV $p}
+    }
+
+    # The handler writes the whole report before letting the process die, so the
+    # log is complete once the process is gone.
+    foreach p $pids {
+        for {set i 0} {$i < 300 && [is_running $p]} {incr i} {after 100}
+    }
+
+    foreach p $pids {
+        set files [server_log_files_of_pid $p]
+        if {[llength $files] == 0} {
+            puts "(no log file found for server pid $p)"
+            continue
+        }
+        foreach f $files {dump_crash_report $f $p}
     }
 }
 
@@ -517,6 +729,7 @@ proc signal_idle_client fd {
         incr ::next_test
         if {$::loop && $::next_test == [llength $::all_tests]} {
             set ::next_test 0
+            incr ::loop -1
         }
     } elseif {[llength $::run_solo_tests] != 0 && [llength $::active_clients] == 0} {
         if {!$::quiet} {
@@ -558,15 +771,30 @@ proc the_end {} {
     }
 }
 
-# The client is not even driven (the test server is instead) as we just need
+# The client is not event driven (the test server is instead) as we just need
 # to read the command, execute, reply... all this in a loop.
 proc test_client_main server_port {
     set ::test_server_fd [socket localhost $server_port]
-    fconfigure $::test_server_fd -encoding binary
+    fconfigure $::test_server_fd -translation binary
+
+    # A SIGUSR1 from the test server means "you look stuck -- say where".
+    # "signal error" raises a Tcl error at the next point Tcl checks for
+    # signals, which unwinds through the handler at the bottom of this file and
+    # reports $::errorInfo, a Tcl stack trace of wherever we hung. That covers a
+    # blocking read (the syscall is interrupted rather than retried), a long
+    # "after" and a polling loop alike; a plain "signal trap" only covers the
+    # first. It also keeps the signal from simply killing us. Tclx is optional:
+    # without it a timeout just reports no client stack trace.
+    if {![catch {package require Tclx; signal error SIGUSR1}]} {
+        # Only now may the test server signal us: without the handler,
+        # SIGUSR1 just kills a client that could still be about to report.
+        send_data_packet $::test_server_fd sigusr1-trace 1
+    }
+
     send_data_packet $::test_server_fd ready [pid]
     while 1 {
         set bytes [gets $::test_server_fd]
-        set payload [read $::test_server_fd $bytes]
+        set payload [encoding convertfrom utf-8 [read $::test_server_fd $bytes]]
         foreach {cmd data} $payload break
         if {$cmd eq {run}} {
             execute_test_file $data
@@ -581,14 +809,21 @@ proc test_client_main server_port {
 
 proc send_data_packet {fd status data {elapsed 0}} {
     set payload [list $status $data $elapsed]
-    puts $fd [string length $payload]
-    puts -nonewline $fd $payload
+    # Convert to UTF-8 bytes before sending so that:
+    # 1. The byte count is accurate (Tcl 9.0 string length returns character
+    #    count, which differs from byte count for non-ASCII Unicode chars).
+    # 2. Characters above U+00FF (not representable in the channel's iso8859-1
+    #    encoding) are safely transmitted as multi-byte UTF-8 sequences.
+    set payload_bytes [encoding convertto utf-8 $payload]
+    puts $fd [string length $payload_bytes]
+    puts -nonewline $fd $payload_bytes
     flush $fd
 }
 
 proc print_help_screen {} {
     puts [join {
         "--valgrind         Run the test over valgrind."
+        "--tsan             Run the test with thread sanitizer."
         "--durable          suppress test crashes and keep running"
         "--stack-logging    Enable OSX leaks/malloc stack logging."
         "--accurate         Run slow randomized tests for more iterations."
@@ -605,11 +840,14 @@ proc print_help_screen {} {
         "--config <k> <v>   Extra config file argument."
         "--skipfile <file>  Name of a file containing test names or regexp patterns (if <test> starts with '/') that should be skipped (one per line). This option can be repeated."
         "--skiptest <test>  Test name or regexp pattern (if <test> starts with '/') to skip. This option can be repeated."
+        "--cluster          Run only the cluster tests (tests/unit/cluster)."
         "--tags <tags>      Run only tests having specified tags or not having '-' prefixed tags."
         "--dont-clean       Don't delete redis log files after the run."
+        "--dont-pre-clean   Don't delete existing redis log files before the run."
         "--no-latency       Skip latency measurements and validation by some tests."
         "--stop             Blocks once the first test fails."
         "--loop             Execute the specified set of tests forever."
+        "--loops <count>    Execute the specified set of tests several times."
         "--wait-server      Wait after server is started (so that you can attach a debugger)."
         "--dump-logs        Dump server log on test failure."
         "--tls              Run tests in TLS mode."
@@ -623,6 +861,7 @@ proc print_help_screen {} {
         "--ignore-encoding  Don't validate object encoding."
         "--ignore-digest    Don't use debug digest validations."
         "--large-memory     Run tests using over 100mb."
+        "--debug-defrag     Indicate the test is running against server compiled with DEBUG_DEFRAG option"
         "--help             Print this help screen."
     } "\n"]
 }
@@ -631,7 +870,9 @@ proc print_help_screen {} {
 for {set j 0} {$j < [llength $argv]} {incr j} {
     set opt [lindex $argv $j]
     set arg [lindex $argv [expr $j+1]]
-    if {$opt eq {--tags}} {
+    if {$opt eq {--cluster}} {
+        set ::all_tests $::cluster_all_tests
+    } elseif {$opt eq {--tags}} {
         foreach tag $arg {
             if {[string index $tag 0] eq "-"} {
                 lappend ::denytags [string range $tag 1 end]
@@ -645,6 +886,10 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         lappend ::global_overrides $arg
         lappend ::global_overrides $arg2
         incr j 2
+    } elseif {$opt eq {--log-req-res}} {
+        set ::log_req_res 1
+    } elseif {$opt eq {--force-resp3}} {
+        set ::force_resp3 1
     } elseif {$opt eq {--skipfile}} {
         incr j
         set fp [open $arg r]
@@ -656,6 +901,8 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         incr j
     } elseif {$opt eq {--valgrind}} {
         set ::valgrind 1
+    } elseif {$opt eq {--tsan}} {
+        set ::tsan 1
     } elseif {$opt eq {--stack-logging}} {
         if {[string match {*Darwin*} [exec uname -a]]} {
             set ::stack_logging 1
@@ -707,7 +954,7 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         }
         exit 0
     } elseif {$opt eq {--verbose}} {
-        set ::verbose 1
+        incr ::verbose
     } elseif {$opt eq {--client}} {
         set ::client 1
         set ::test_server_port $arg
@@ -719,6 +966,8 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         set ::durable 1
     } elseif {$opt eq {--dont-clean}} {
         set ::dont_clean 1
+    } elseif {$opt eq {--dont-pre-clean}} {
+        set ::dont_pre_clean 1
     } elseif {$opt eq {--no-latency}} {
         set ::no_latency 1
     } elseif {$opt eq {--wait-server}} {
@@ -728,7 +977,10 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
     } elseif {$opt eq {--stop}} {
         set ::stop_on_failure 1
     } elseif {$opt eq {--loop}} {
-        set ::loop 1
+        set ::loop 2147483647
+    } elseif {$opt eq {--loops}} {
+        set ::loop $arg
+        incr j
     } elseif {$opt eq {--timeout}} {
         set ::timeout $arg
         incr j
@@ -743,6 +995,10 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         set ::ignoreencoding 1
     } elseif {$opt eq {--ignore-digest}} {
         set ::ignoredigest 1
+    } elseif {$opt eq {--debug-defrag}} {
+        set ::debug_defrag 1
+    } elseif {$opt eq {--compression}} {
+        set ::compression 1
     } elseif {$opt eq {--help}} {
         print_help_screen
         exit 0
@@ -852,9 +1108,22 @@ proc read_from_replication_stream {s} {
 }
 
 proc assert_replication_stream {s patterns} {
+    set errors 0
+    set values_list {}
+    set patterns_list {}
     for {set j 0} {$j < [llength $patterns]} {incr j} {
-        assert_match [lindex $patterns $j] [read_from_replication_stream $s]
+        set pattern [lindex $patterns $j]
+        lappend patterns_list $pattern
+        set value [read_from_replication_stream $s]
+        lappend values_list $value
+        if {![string match $pattern $value]} { incr errors }
     }
+
+    if {$errors == 0} { return }
+
+    set context [info frame -1]
+    close_replication_stream $s ;# for fast exit
+    assert_match $patterns_list $values_list "" $context
 }
 
 proc close_replication_stream {s} {

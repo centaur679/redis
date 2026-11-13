@@ -1,31 +1,11 @@
 /* Rax -- A radix tree implementation.
  *
- * Copyright (c) 2017-2018, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2017-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #ifndef RAX_H
@@ -92,6 +72,16 @@
  * is created (the chain must also not include nodes that represent keys),
  * it must be compressed back into a single node.
  *
+ * FIXED LENGTH KEY OPT
+ * --------------------
+ * Another optimization applies when all keys share a known fixed length, set at 
+ * construction via raxNewEx()'s keyFixedLen. In that mode the leaf raxNode is 
+ * skipped: the value pointer is stored directly in the parent's child-pointer 
+ * slot. The node at depth keyFixedLen-1 becomes a "leaf parent" whose slots hold 
+ * inlined values instead of raxNode pointers, saving one raxNode allocation per 
+ * key. In fact, fixed length keys are a common case in Redis so this 
+ * implementation is very useful.
+ *
  */
 
 #define RAX_NODE_MAX_SIZE ((1<<29)-1)
@@ -109,7 +99,7 @@ typedef struct raxNode {
      *
      * [header iscompr=0][abc][a-ptr][b-ptr][c-ptr](value-ptr?)
      *
-     * if node is compressed (iscompr bit is 1) the node has 1 children.
+     * if node is compressed (iscompr bit is 1) the node has 1 child.
      * In that case the 'size' bytes of the string stored immediately at
      * the start of the data section, represent a sequence of successive
      * nodes linked one after the other, for which only the last one in
@@ -134,6 +124,15 @@ typedef struct rax {
     raxNode *head;
     uint64_t numele;
     uint64_t numnodes;
+    size_t *alloc_size;
+    uint32_t keyFixedLen;   /* 0 = variable-length keys (today's behavior).
+                             * >0 = all keys exactly this many bytes; set at
+                             * creation via raxNewEx() and immutable
+                             * thereafter. Enables the leaf-inlining path
+                             * (no leaf raxNode allocation). Wrong-length
+                             * inserts/removes are a programmer error
+                             * (asserted in debug). */
+    void *metadata[];
 } rax;
 
 /* Stack data structure used by raxLowWalk() in order to, optionally, return
@@ -162,7 +161,7 @@ typedef struct raxStack {
  * Redis application for this callback).
  *
  * This is currently only supported in forward iterations (raxNext) */
-typedef int (*raxNodeCallback)(raxNode **noderef);
+typedef int (*raxNodeCallback)(raxNode **noderef, void *privdata);
 
 /* Radix tree iterator state is encapsulated into this data structure. */
 #define RAX_ITER_STATIC_LEN 128
@@ -180,22 +179,74 @@ typedef struct raxIterator {
     size_t key_len;         /* Current key length. */
     size_t key_max;         /* Max key len the current key buffer can hold. */
     unsigned char key_static_string[RAX_ITER_STATIC_LEN];
-    raxNode *node;          /* Current node. Only for unsafe iteration. */
+    raxNode *node;          /* Current node. Only for unsafe iteration.
+                             * When leaf_slot_idx >= 0 this is the leaf
+                             * parent of the inlined value at slot
+                             * leaf_slot_idx (no real raxNode below it). */
     raxStack stack;         /* Stack used for unsafe iteration. */
     raxNodeCallback node_cb; /* Optional node callback. Normally set to NULL. */
+    void *privdata;         /* Optional private data for node callback. */
+    int leaf_slot_idx;      /* Fixed-length leaf inlining: -1 in normal
+                             * traversal. >= 0 means we are positioned on
+                             * a virtual leaf (the value at slot
+                             * leaf_slot_idx of `node`, which is the leaf
+                             * parent). Variable-length trees keep this
+                             * at -1 throughout. */
 } raxIterator;
 
-/* A special pointer returned for not found items. */
-extern void *raxNotFound;
+/* Result of a rax walk, used to commit a find-then-insert pair without
+ * re-walking the tree.
+ *
+ *   raxFindLink()  produces a link.
+ *   raxInsertAt()  consumes it.
+ *
+ * Invalidation contract: `stopnode` and `parentlink` are interior pointers into
+ * the tree. They become stale on ANY intervening rax mutation. Callers
+ * MUST commit (or discard) immediately after the find; do not interleave
+ * other rax calls on the same tree, do not retain across yield points.
+ * The commit itself is allowed to realloc `stopnode` (raxReallocForData,
+ * raxAddChild) and update *parentlink in-place -- the link's own fields
+ * survive the commit, but a second commit on the same link is undefined. */
+#define RAX_LEAF_PARENT_STOP (-1)  /* on fixed-len, when walk stop at a leaf parent */
+typedef struct raxNodeLink {
+    raxNode  *stopnode;     /* Stop node. */
+    raxNode **parentlink;   /* Slot in stopnode's parent that holds h. */
+    size_t    consumed;     /* Bytes of key consumed at stop. */
+    int       splitpos;     /* Split position inside stopnode's compressed
+                             * prefix. Same semantic as raxLowWalk():
+                             * only meaningful when stopnode->iscompr; 0 with
+                             * i == len means clean arrival at stopnode, 0 with
+                             * i < len means the first prefix byte
+                             * mismatched the next key byte, > 0 means
+                             * the walk stopped mid-prefix.
+                             * RAX_LEAF_PARENT_STOP is the fixed-length
+                             * leaf-parent stop sentinel (see leafSlot). */
+    int       leafSlot;     /* Fixed-length leaf-parent stop only
+                             * (splitpos == RAX_LEAF_PARENT_STOP). Index
+                             * of the inlined value slot inside h: 0 for
+                             * iscompr=1 leaf parents (single slot), the
+                             * matched edge index for iscompr=0.
+                             * RAX_LEAF_PARENT_STOP otherwise. */
+} raxNodeLink;
 
 /* Exported API. */
 rax *raxNew(void);
+rax *raxNewEx(int metaSize, size_t *alloc_size, uint32_t keyFixedLen);
 int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old);
 int raxTryInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old);
 int raxRemove(rax *rax, unsigned char *s, size_t len, void **old);
-void *raxFind(rax *rax, unsigned char *s, size_t len);
+int raxFind(rax *rax, unsigned char *s, size_t len, void **value);
+
+int raxFindLink(rax *rax, unsigned char *s, size_t len,
+                void **value, raxNodeLink *link);
+int raxInsertAt(rax *rax, unsigned char *s, size_t len,
+                void *data, void **old, raxNodeLink *link);
+
 void raxFree(rax *rax);
 void raxFreeWithCallback(rax *rax, void (*free_callback)(void*));
+void raxFreeWithCbAndContext(rax *rax,
+                             void (*free_callback)(void *item, void *ctx),
+                             void *ctx);
 void raxStart(raxIterator *it, rax *rt);
 int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len);
 int raxNext(raxIterator *it);
@@ -204,13 +255,14 @@ int raxRandomWalk(raxIterator *it, size_t steps);
 int raxCompare(raxIterator *iter, const char *op, unsigned char *key, size_t key_len);
 void raxStop(raxIterator *it);
 int raxEOF(raxIterator *it);
+void raxIteratorSetData(raxIterator *it, void *data);
 void raxShow(rax *rax);
 uint64_t raxSize(rax *rax);
 unsigned long raxTouch(raxNode *n);
 void raxSetDebugMsg(int onoff);
 
-/* Internal API. May be used by the node callback in order to access rax nodes
- * in a low level way, so this function is exported as well. */
-void raxSetData(raxNode *n, void *data);
+#ifdef REDIS_TEST
+int raxTest(int argc, char *argv[], int flags);
+#endif
 
 #endif

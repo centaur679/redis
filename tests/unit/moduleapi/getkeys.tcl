@@ -1,6 +1,6 @@
 set testmodule [file normalize tests/modules/getkeys.so]
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
 
     test {COMMAND INFO correctly reports a movable keys module command} {
@@ -58,6 +58,15 @@ start_server {tags {"modules"}} {
         set _ $e
     } {*EINVAL*}
 
+    test "introspect with > MAX_KEYS_BUFFER keys triggers RM_GetCommandKeysWithFlags heap alloc" {
+        set args {}
+        for {set i 0} {$i < 7} {incr i} {
+            lappend args key k$i
+        }
+        set reply [r getkeys.introspect 1 getkeys.command_with_flags {*}$args]
+        assert_equal {{k0 RO} {k1 RO} {k2 RO} {k3 RO} {k4 RO} {k5 RO} {k6 RO}} $reply
+    }
+
     # user that can only read from "read" keys, write to "write" keys, and read+write to "RW" keys
     r ACL setuser testuser +@all %R~read* %W~write* %RW~rw*
 
@@ -77,4 +86,57 @@ start_server {tags {"modules"}} {
     test "Unload the module - getkeys" {
         assert_equal {OK} [r module unload getkeys]
     }
+}
+
+# Position callbacks must not change execution_nesting from IO threads while
+# the main thread executes writes. Otherwise pending propagation can be skipped
+# or flushed by an IO thread, causing assertions or replication crashes (#16042).
+start_server {overrides {save ""} tags {iothreads repl network modules external:skip}} {
+start_server {overrides {io-threads 4 save ""}} {
+    set master [srv 0 client]
+    set slave [srv -1 client]
+    $master module load $testmodule
+    $master module load [file normalize tests/modules/getchannels.so]
+
+    test {Module key and channel position callbacks from IO threads do not corrupt execution nesting} {
+        $slave replicaof [srv 0 host] [srv 0 port]
+        wait_for_sync $slave
+
+        set clients {}
+        for {set i 0} {$i < 4} {incr i} {
+            set rd [redis_deferring_client]
+            $rd client info
+            assert {[regexp {io-thread=(\d+)} [$rd read] - tid]}
+            assert_morethan $tid 0
+            lappend clients $rd
+        }
+
+        # IO threads resolving key/channel positions can race with the main thread
+        # executing SET commands from other clients.
+        # This stress test depends on timing and may miss the old race.
+        set seconds 5 ;# run 5s stress test
+        set batch 200
+        set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+        while {[clock milliseconds] < $deadline} {
+            foreach rd $clients {
+                for {set j 0} {$j < $batch} {incr j} {
+                    $rd set race:$j v
+                    $rd getkeys.command key race:$j
+                    $rd getchannels.command_with_keyspec publish literal race:$j
+                }
+            }
+            foreach rd $clients {
+                for {set j 0} {$j < $batch} {incr j} {
+                    assert_equal OK [$rd read]
+                    assert_equal [list race:$j] [$rd read]
+                    assert_equal OK [$rd read]
+                }
+            }
+        }
+
+        foreach rd $clients { $rd close }
+        wait_for_ofs_sync $master $slave
+        assert_equal [$master debug digest] [$slave debug digest]
+    }
+}
 }

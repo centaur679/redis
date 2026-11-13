@@ -1,6 +1,6 @@
 {
     "SET": {
-        "summary": "Set the string value of a key",
+        "summary": "Sets the string value of a key, ignoring its type. The key is created if it doesn't exist.",
         "complexity": "O(1)",
         "group": "string",
         "since": "1.0.0",
@@ -23,6 +23,10 @@
             [
                 "7.0.0",
                 "Allowed the `NX` and `GET` options to be used together."
+            ],
+            [
+                "8.4.0",
+                "Added 'IFEQ', 'IFNE', 'IFDEQ', 'IFDNE' options."
             ]
         ],
         "command_flags": [
@@ -55,6 +59,26 @@
                 }
             }
         ],
+        "reply_schema": {
+            "anyOf":[
+                {
+                    "description": "`GET` not given: Operation was aborted (conflict with one of the `XX`/`NX`/`IFEQ`/`IFDEQ` options or condition not met).",
+                    "type": "null"
+                },
+                {
+                    "description": "`GET` not given: The key was set.",
+                    "const": "OK"
+                },
+                {
+                    "description": "`GET` given: The key didn't exist before the `SET`",
+                    "type": "null"
+                },
+                {
+                    "description": "`GET` given: The previous value of the key",
+                    "type": "string"
+                }
+            ]
+        },
         "arguments": [
             {
                 "name": "key",
@@ -80,6 +104,30 @@
                         "name": "xx",
                         "type": "pure-token",
                         "token": "XX"
+                    },
+                    {
+                        "name": "ifeq-value",
+                        "type": "string",
+                        "token": "IFEQ",
+                        "since": "8.4.0"
+                    },
+                    {
+                        "name": "ifne-value",
+                        "type": "string",
+                        "token": "IFNE",
+                        "since": "8.4.0"
+                    },
+                    {
+                        "name": "ifdeq-digest",
+                        "type": "string",
+                        "token": "IFDEQ",
+                        "since": "8.4.0"
+                    },
+                    {
+                        "name": "ifdne-digest",
+                        "type": "string",
+                        "token": "IFDNE",
+                        "since": "8.4.0"
                     }
                 ]
             },

@@ -1,5 +1,5 @@
-set ::base_aof_sufix ".base"
-set ::incr_aof_sufix ".incr"
+set ::base_aof_suffix ".base"
+set ::incr_aof_suffix ".incr"
 set ::manifest_suffix ".manifest"
 set ::aof_format_suffix ".aof"
 set ::rdb_format_suffix ".rdb"
@@ -122,7 +122,7 @@ proc assert_aof_manifest_content {manifest_path content} {
     assert_equal [llength $lines] [llength $content]
 
     for { set i 0 } { $i < [llength $lines] } {incr i} {
-        assert_equal [lindex $lines $i] [lindex $content $i]
+        assert {[string first [lindex $content $i] [lindex $lines $i]] != -1}
     }
 }
 
@@ -161,9 +161,13 @@ proc create_aof_dir {dir_path} {
 }
 
 proc start_server_aof {overrides code} {
+    upvar defaults defaults srv srv server_path server_path aof_basename aof_basename aof_dirpath aof_dirpath aof_manifest_file aof_manifest_file aof_manifest_file2 aof_manifest_file2
+    set config [concat $defaults $overrides]
+    start_server [list overrides $config keep_persistence true] $code
+}
+
+proc start_server_aof_ex {overrides options code} {
     upvar defaults defaults srv srv server_path server_path
     set config [concat $defaults $overrides]
-    set srv [start_server [list overrides $config]]
-    uplevel 1 $code
-    kill_server $srv
+    start_server [concat [list overrides $config keep_persistence true] $options] $code
 }

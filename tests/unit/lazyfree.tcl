@@ -50,11 +50,20 @@ start_server {tags {"lazyfree"}} {
 
         r config resetstat
         r config set stream-node-max-entries 5
+        # Use explicit IDs one millisecond apart. What decides whether UNLINK
+        # frees the stream lazily is lazyfreeGetFreeEffort(), which for a stream
+        # is dominated by the number of nodes in its radix tree, and with
+        # server-generated IDs that is the number of distinct milliseconds these
+        # 1000 XADDs happen to span -- keys sharing a millisecond share a prefix
+        # and collapse into one compressed node. On a machine fast enough to run
+        # the loop in well under 64ms the whole stream fits in a handful of
+        # nodes, the effort falls below LAZYFREE_THRESHOLD, the stream is freed
+        # synchronously and lazyfreed_objects stays 0.
         for {set j 0} {$j < 1000} {incr j} {
             if {rand() < 0.9} {
-                r xadd stream * foo $j
+                r xadd stream $j-1 foo $j
             } else {
-                r xadd stream * bar $j
+                r xadd stream $j-1 bar $j
             }
         }
         r xgroup create stream mygroup 0
@@ -87,4 +96,114 @@ start_server {tags {"lazyfree"}} {
         }
         assert_equal [s lazyfreed_objects] 0
     } {} {needs:config-resetstat}
+
+    test "FLUSHALL SYNC optimized to run in bg as blocking FLUSHALL ASYNC" {
+        set num_keys 1000
+        r config resetstat
+
+        # Verify at start there are no lazyfree pending objects
+        assert_equal [s lazyfree_pending_objects] 0
+
+        # Fillup DB with items
+        populate $num_keys
+
+        # Run FLUSHALL SYNC command, optimized as blocking ASYNC
+        r flushall
+
+        # Verify all keys counted as lazyfreed
+        assert_equal [s lazyfreed_objects] $num_keys
+    }
+
+    test "Run consecutive blocking FLUSHALL ASYNC successfully" {
+        r config resetstat
+        set rd [redis_deferring_client]
+
+        # Fillup DB with items
+        r set x 1
+        r set y 2
+
+        $rd write "FLUSHALL\r\nFLUSHALL\r\nFLUSHDB\r\n"
+        $rd flush
+        assert_equal [$rd read] {OK}
+        assert_equal [$rd read] {OK}
+        assert_equal [$rd read] {OK}
+        assert_equal [s lazyfreed_objects] 2
+        $rd close
+    }
+
+    test "FLUSHALL SYNC in MULTI not optimized to run as blocking FLUSHALL ASYNC" {
+        r config resetstat
+
+        # Fillup DB with items
+        r set x 11
+        r set y 22
+
+        # FLUSHALL SYNC in multi
+        r multi
+        r flushall
+        r exec
+
+        # Verify flushall not run as lazyfree
+        assert_equal [s lazyfree_pending_objects] 0
+        assert_equal [s lazyfreed_objects] 0
+    }
+
+    test "Client closed in the middle of blocking FLUSHALL ASYNC" {
+        set num_keys 100000
+        r config resetstat
+
+        # Fillup DB with items
+        populate $num_keys
+
+        # close client in the middle of ongoing Blocking FLUSHALL ASYNC
+        set rd [redis_deferring_client]
+        $rd flushall
+        $rd close
+
+        # Wait to verify all keys counted as lazyfreed
+        wait_for_condition 50 100 {
+            [s lazyfreed_objects] == $num_keys
+        } else {
+            fail "Unexpected number of lazyfreed_objects: [s lazyfreed_objects]"
+        }
+    }
+
+    test "Pending commands in querybuf processed once unblocking FLUSHALL ASYNC" {
+        r config resetstat
+        set rd [redis_deferring_client]
+
+        # Fillup DB with items
+        r set x 1
+        r set y 2
+
+        $rd write "FLUSHALL\r\nPING\r\n"
+        $rd flush
+        assert_equal [$rd read] {OK}
+        assert_equal [$rd read] {PONG}
+        assert_equal [s lazyfreed_objects] 2
+        $rd close
+    }
+
+    test "Unblocks client blocked on lazyfree via REPLICAOF command" {
+        r config resetstat
+        set rd [redis_deferring_client]
+
+        populate 50000 ;# Just to make flushdb async slower
+        $rd flushdb
+
+        # Verify flushdb run as lazyfree
+        wait_for_condition 50 100 {
+            [s lazyfree_pending_objects] > 0 ||
+            [s lazyfreed_objects] > 0
+        } else {
+            fail "FLUSHDB didn't run as lazyfree"
+        }
+
+        # Test that slaveof command unblocks clients without assertion failure
+        r slaveof 127.0.0.1 0
+        assert_equal [$rd read] {OK}
+        $rd close
+        r ping
+        r slaveof no one
+    } {OK} {external:skip}
 }

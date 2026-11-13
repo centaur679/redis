@@ -1,3 +1,25 @@
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
+
+# Read and return the full contents of a file.
+proc read_file {path} {
+    set fd [open $path r]
+    set contents [read $fd]
+    close $fd
+    return $contents
+}
+
 proc randstring {min max {type binary}} {
     set len [expr {$min+int(rand()*($max-$min+1))}]
     set output {}
@@ -56,14 +78,19 @@ proc sanitizer_errors_from_file {filename} {
     set lines [split [exec cat $filename] "\n"]
 
     foreach line $lines {
-        # Ignore huge allocation warnings
+        # Ignore huge allocation warnings for both ASan and MSan
         if ([string match {*WARNING: AddressSanitizer failed to allocate*} $line]) {
             continue
         }
 
+        if ([string match {*WARNING: MemorySanitizer failed to allocate*} $line]) {
+            continue
+        }
+
         # GCC UBSAN output does not contain 'Sanitizer' but 'runtime error'.
-        if {[string match {*runtime error*} $log] ||
-            [string match {*Sanitizer*} $log]} {
+        if {[string match {*runtime error*} $line] ||
+            [string match {*Sanitizer*} $line] ||
+            [string match {*<jemalloc>:*size mismatch*} $line]} {
             return $log
         }
     }
@@ -98,7 +125,12 @@ proc waitForBgsave r {
 
 proc waitForBgrewriteaof r {
     while 1 {
-        if {[status $r aof_rewrite_in_progress] eq 1} {
+        set rewrite_in_progress [status $r aof_rewrite_in_progress]
+        set rewrite_scheduled [status $r aof_rewrite_scheduled]
+
+        # A rewrite can be scheduled but paused while another background task is running,
+        # so we need to check two conditions
+        if {$rewrite_in_progress eq 1 || $rewrite_scheduled eq 1} {
             if {$::verbose} {
                 puts -nonewline "\nWaiting for background AOF rewrite to finish... "
                 flush stdout
@@ -111,23 +143,52 @@ proc waitForBgrewriteaof r {
 }
 
 proc wait_for_sync r {
-    wait_for_condition 50 100 {
+    set maxtries 50
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {$::tsan} {
+        set maxtries 100
+    }
+    # same for compression
+    if {$::compression} {
+        set maxtries 200
+    }
+
+    wait_for_condition $maxtries 100 {
         [status $r master_link_status] eq "up"
     } else {
         fail "replica didn't sync in time"
     }
 }
 
-proc wait_replica_online r {
-    wait_for_condition 50 100 {
-        [string match "*slave0:*,state=online*" [$r info replication]]
+proc wait_replica_online {r {replica_id 0} {maxtries 50} {delay 100}} {
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {$::tsan} {
+        set maxtries [expr {$maxtries * 2}]
+    }
+    if {$::compression} {
+        set maxtries [expr {$maxtries * 3}]
+    }
+
+    wait_for_condition $maxtries $delay {
+        [string match "*slave$replica_id:*,state=online*" [$r info replication]]
     } else {
-        fail "replica didn't online in time"
+        fail "replica $replica_id did not become online in time"
     }
 }
 
 proc wait_for_ofs_sync {r1 r2} {
-    wait_for_condition 50 100 {
+    set maxtries 50
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {$::tsan} {
+        set maxtries 100
+    }
+    if {$::compression} {
+        set maxtries 150
+    }
+    wait_for_condition $maxtries 100 {
         [status $r1 master_repl_offset] eq [status $r2 master_repl_offset]
     } else {
         fail "replica offset didn't match in time"
@@ -150,9 +211,17 @@ proc wait_lazyfree_done r {
     }
 }
 
+# count lines in a log file, by path. Unlike count_log_lines this doesn't need
+# a running server, so it can also be used to snapshot a log file before
+# starting the server that will write to it.
+proc count_file_lines {file} {
+    if {![file exists $file]} { return 0 }
+    return [string trim [exec wc -l < $file]]
+}
+
 # count current log lines in server's stdout
 proc count_log_lines {srv_idx} {
-    set _ [string trim [exec wc -l < [srv $srv_idx stdout]]]
+    count_file_lines [srv $srv_idx stdout]
 }
 
 # returns the number of times a line with that pattern appears in a file
@@ -171,6 +240,133 @@ proc count_log_message {srv_idx pattern} {
     return [count_message_lines $stdout $pattern]
 }
 
+# Run the openssl command line client against $host:$port with the given extra
+# arguments and return its whole output (stdout and stderr), whatever its exit
+# status. The connection is held open for a second: in TLS 1.3 the server sends
+# session tickets only after the handshake has completed, and a client that
+# disconnects at once would leave without a token to resume from. The report
+# says "New, TLSv1.x" after a full handshake and "Reused, TLSv1.x" after a
+# resumed session; -sess_out FILE saves the session, -sess_in FILE resumes it.
+# The connection is closed before the command returns; openssl_s_client_open
+# keeps one open.
+proc openssl_s_client {host port args} {
+    set cmd "sleep 1 | openssl s_client -connect $host:$port -CAfile $::tlsdir/ca.crt $args 2>&1"
+    catch {exec sh -c $cmd} out
+    return $out
+}
+
+# Like openssl_s_client, but keeps the connection open: s_client's standard
+# input is held, so it neither exits nor shuts the connection down until
+# openssl_s_client_close is called on the returned handle, which then returns
+# the whole output. A session established on the connection stays in the
+# server's cache only while the connection lasts: OpenSSL drops a cached session
+# when its connection is freed without a close_notify having been sent, and the
+# server sends none for a connection its peer closed first. Tickets are
+# unaffected, as the client holds them.
+proc openssl_s_client_open {host port args} {
+    set out [file join [pwd] tests/tmp s_client.[pid].[incr ::openssl_s_client_seq].out]
+    set fd [open "|[list openssl s_client -connect $host:$port -CAfile $::tlsdir/ca.crt {*}$args >& $out]" w]
+    return [list $fd $out]
+}
+
+proc openssl_s_client_close {handle} {
+    lassign $handle fd out
+    # End of input: s_client shuts the connection down and exits.
+    catch {close $fd}
+    set f [open $out]
+    set result [read $f]
+    close $f
+    file delete $out
+    return $result
+}
+
+# Classify the output of openssl s_client asked for one protocol version:
+# "ok" when that version was negotiated, "unsupported" when the version is not
+# available on the client or on the server, "failed" for anything else.
+proc openssl_s_client_result {out version} {
+    # A completed handshake prints a session block. Its protocol line is the
+    # negotiated version; the version printed beside "New" is not, older
+    # clients print the cipher's own there ("TLSv1/SSLv3" for a TLS 1.2
+    # handshake). A failed handshake prints the block too, with the cipher
+    # shown as "(NONE)" by current clients and "0000" by old ones, so the
+    # cipher line tells a real negotiation from an aborted one. An alert
+    # anywhere in the output means the handshake did not complete cleanly,
+    # whatever else was printed.
+    if {[regexp -line {^\s*Protocol\s*:\s*(\S+)} $out -> proto] && $proto eq $version &&
+        [regexp -line {^\s*Cipher\s*:\s*(\S+)} $out -> cipher] &&
+        $cipher ne "(NONE)" && $cipher ne "0000" &&
+        ![string match {*alert*} $out]} {
+        return ok
+    }
+    # Three failures mean the version itself is unavailable. A client older
+    # than the version rejects the flag ("unknown option" or "Unrecognized
+    # flag", depending on its age). A client built without the version has
+    # "no protocols available" to offer. A server without the version, or
+    # restricted by tls-protocols, answers the ClientHello with a protocol
+    # version alert, alert number 70. Anything else is a real failure.
+    if {[regexp -nocase {unknown option|unrecognized flag|no protocols available|alert protocol version|alert number 70|unsupported protocol} $out]} {
+        return unsupported
+    }
+    return failed
+}
+
+# Whether a TLS 1.3 handshake with the server at host:port works. Tests that
+# try every way a session can be resumed need TLS 1.3 for the pre-shared-key
+# path, which OpenSSL before 1.1.1 does not have, on the server or in the
+# openssl client; those variants are skipped there while the TLS 1.2 ones
+# still run. Only a failure that means TLS 1.3 is unavailable leads to a skip,
+# and only once a TLS 1.2 handshake has shown the server to be reachable; any
+# other failure fails the test with the output of the attempt.
+proc tls13_supported {host port} {
+    # One probe per server. The tests ask several times, once per block or
+    # per variant table, and the answer cannot change for a running server.
+    if {[info exists ::tls13_supported($host:$port)]} {
+        return $::tls13_supported($host:$port)
+    }
+    # The suite's client certificate is presented, so the probe also works
+    # against a server that requires one; a server that does not ignores it.
+    set client [list -cert $::tlsdir/client.crt -key $::tlsdir/client.key]
+    # Ask for TLS 1.3 and nothing else, so that the server cannot fall back
+    # to TLS 1.2 and hide the answer.
+    set out13 [openssl_s_client $host $port -tls1_3 {*}$client]
+    switch [openssl_s_client_result $out13 TLSv1.3] {
+        ok {
+            set supported 1
+        }
+        unsupported {
+            # TLS 1.3 is absent for a known reason. Before skipping on that,
+            # make sure a handshake with this server works at all: a server
+            # that is down or misconfigured must fail the test, not look like
+            # an old library. Both outputs go into the failure, as the first
+            # one is what the diagnosis needs.
+            set out12 [openssl_s_client $host $port -tls1_2 {*}$client]
+            if {[openssl_s_client_result $out12 TLSv1.2] ne "ok"} {
+                fail "no TLS handshake with $host:$port.\nTLS 1.3 attempt:\n$out13\nTLS 1.2 attempt:\n$out12"
+            }
+            if {$::verbose} {
+                puts "Skipping the TLS 1.3 variants, TLS 1.3 is not supported."
+            }
+            set supported 0
+        }
+        default {
+            # Any other failure, an internal error alert or a refused
+            # connection for instance, is not a reason to skip: a TLS 1.3
+            # regression must surface here, with the output that shows it.
+            fail "unexpected TLS 1.3 handshake failure with $host:$port:\n$out13"
+        }
+    }
+    return [set ::tls13_supported($host:$port) $supported]
+}
+
+# The protocol version flags for openssl s_client that the server at
+# host:port supports, TLS 1.3 first when it has it.
+proc tls_client_versions {host port} {
+    if {[tls13_supported $host $port]} {
+        return {-tls1_3 -tls1_2}
+    }
+    return {-tls1_2}
+}
+
 # verify pattern exists in server's sdtout after a certain line number
 proc verify_log_message {srv_idx pattern from_line} {
     incr from_line
@@ -183,6 +379,9 @@ proc verify_log_message {srv_idx pattern from_line} {
 # wait for pattern to be found in server's stdout after certain line number
 # return value is a list containing the line that matched the pattern and the line number
 proc wait_for_log_messages {srv_idx patterns from_line maxtries delay} {
+    if {$::compression} {
+        set maxtries [expr {$maxtries * 3}]
+    }
     set retry $maxtries
     set next_line [expr $from_line + 1] ;# searching form the line after
     set stdout [srv $srv_idx stdout]
@@ -278,6 +477,36 @@ proc randomKey {} {
     }
 }
 
+# Creates an empty Roaring bitmap for a missing key, or re-encodes an existing
+# string bitmap without changing its logical value or TTL. BITCONVERT is an
+# internal replay primitive, so temporarily mark the test connection internal
+# and always restore its ordinary-client state. Callers must pass a connection
+# that is not already marked internal.
+proc convert_string_bitmap_to_roaring {client key} {
+    set code [catch {
+        {*}$client debug mark-internal-client
+        {*}$client bitconvert $key
+    } result opts]
+    set cleanup_code [catch {
+        {*}$client debug mark-internal-client unmark
+    } cleanup_result cleanup_opts]
+    if {$code != 0} {
+        return -options $opts $result
+    }
+    if {$cleanup_code != 0} {
+        return -options $cleanup_opts $cleanup_result
+    }
+    return $result
+}
+
+proc empty_roaring_bitmap_dump_payload {} {
+    # RDB_TYPE_BITMAP, zero logical byte length, an eight-byte portable
+    # Roaring payload with zero high-32 buckets, RDB_VERSION 16, followed by
+    # an all-zero checksum. RESTORE accepts the zero checksum in test-built
+    # payloads.
+    return [binary format H* 210008000000000000000010000000000000000000]
+}
+
 proc findKeyWithType {r type} {
     for {set j 0} {$j < 20} {incr j} {
         set k [{*}$r randomkey]
@@ -293,11 +522,18 @@ proc findKeyWithType {r type} {
 
 proc createComplexDataset {r ops {opt {}}} {
     set useexpire [expr {[lsearch -exact $opt useexpire] != -1}]
+    set usehexpire [expr {[lsearch -exact $opt usehexpire] != -1}]
+    set usesexpire [expr {[lsearch -exact $opt usesexpire] != -1}]
+
     if {[lsearch -exact $opt usetag] != -1} {
         set tag "{t}"
     } else {
         set tag ""
     }
+
+    # Prepare a fieldset so we can mix in template-encoded hash keys via HIMPORT SET.
+    {*}$r himport prepare fs f0 f1 f2
+
     for {set j 0} {$j < $ops} {incr j} {
         set k [randomKey]$tag
         set k2 [randomKey]$tag
@@ -307,6 +543,35 @@ proc createComplexDataset {r ops {opt {}}} {
         if {$useexpire} {
             if {rand() < 0.1} {
                 {*}$r expire [randomKey] [randomInt 2]
+            }
+        }
+
+        # Do one random operation on one of 20 dedicated stream keys. Streams get
+        # their own keys because Redis deletes a list/set/zset/hash once its last
+        # element is gone, which frees the name to be reused as another type, while
+        # an empty stream stays. The test code never deletes such a stream, on purpose:
+        # together with strings and bitmaps, streams can exist with zero elements,
+        # and they give the dataset its zero-length coverage, like the
+        # size-0 bucket of the INFO keysizes histograms. The 20 keys for streams also
+        # mean each stream gets many operations, with "*" keeping its IDs increasing.
+        if {rand() < 0.2} {
+            set sk "strm:[randomInt 20]$tag"
+            randpath {
+                {*}$r xadd $sk * $f $v
+            } {
+                {*}$r xadd $sk MAXLEN [randomInt 30] * $f $v
+            } {
+                catch {{*}$r xtrim $sk MAXLEN [randomInt 10]}
+            } {
+                catch {{*}$r xgroup create $sk g 0 MKSTREAM}
+                catch {{*}$r xreadgroup group g c count 5 streams $sk >}
+            } {
+                # Ack-and-delete the oldest entry, if any, to drive XACKDEL/PEL.
+                set first [lindex [{*}$r xrange $sk - + COUNT 1] 0 0]
+                if {$first ne {}} {
+                    catch {{*}$r xackdel $sk g IDS 1 $first}
+                    catch {{*}$r xdel $sk $first}
+                }
             }
         }
 
@@ -336,6 +601,14 @@ proc createComplexDataset {r ops {opt {}}} {
                 {*}$r zadd $k $d $v
             } {
                 {*}$r hset $k $f $v
+            } {
+                # template-encoded hash. Short/long values naturally produce 
+                # both TMPL_LP and TMPL_ARRAY encodings.
+                {*}$r himport set $k fs $v [randomValue] [randomValue]
+            } {
+                # Start with a native zero-length bitmap. Its later writes stay
+                # within 1 KiB so complex-data stress tests remain bounded.
+                {*}$r restore $k 0 [empty_roaring_bitmap_dump_payload]
             } {
                 {*}$r del $k
             }
@@ -368,6 +641,16 @@ proc createComplexDataset {r ops {opt {}}} {
                                 }
                             }
                         }
+
+                if {$usesexpire && rand() < 0.5} {
+                    randpath {
+                        catch {{*}$r sexpire $k 1000 MEMBERS 1 $v}
+                    } {
+                        catch {{*}$r saddex $k EX 1000 MEMBERS 1 $v}
+                    } {
+                        catch {{*}$r spersist $k MEMBERS 1 $v}
+                    }
+                }
             }
             {zset} {
                 randpath {{*}$r zadd $k $d $v} \
@@ -386,6 +669,20 @@ proc createComplexDataset {r ops {opt {}}} {
             {hash} {
                 randpath {{*}$r hset $k $f $v} \
                         {{*}$r hdel $k $f}
+
+                if { [{*}$r hexists $k $f] && $usehexpire && rand() < 0.5} {
+                    {*}$r hexpire $k 1000 FIELDS 1 $f
+                }
+            }
+            {bitmap} {
+                randpath {
+                    {*}$r setbit $k [randomInt 8192] [randomInt 2]
+                } {
+                    {*}$r bitfield $k SET u8 [randomInt 8185] [randomInt 256]
+                } {
+                    # Preserve some empty bitmaps for zero-length coverage.
+                    {*}$r bitcount $k
+                }
             }
         }
     }
@@ -438,8 +735,14 @@ proc csvdump r {
                 hash {
                     set fields [{*}$r hgetall $k]
                     set newfields {}
-                    foreach {k v} $fields {
-                        lappend newfields [list $k $v]
+                    foreach {f v} $fields {
+                        set expirylist [{*}$r hexpiretime $k FIELDS 1 $f]
+                        if {$expirylist eq (-1)} {
+                            lappend newfields [list $f $v]
+                        } else {
+                            set e [lindex $expirylist 0]
+                            lappend newfields [list $f $e $v] # TODO: extract the actual ttl value from the list in $e
+                        }
                     }
                     set fields [lsort -index 0 $newfields]
                     foreach kv $fields {
@@ -447,6 +750,20 @@ proc csvdump r {
                         append o [csvstring [lindex $kv 1]] ,
                     }
                     append o "\n"
+                }
+                stream {
+                    # Must cover the same state as the stream
+                    # digest in xorObjectDigest() (debug.c)
+                    foreach entry [{*}$r xrange $k - +] {
+                        append o [csvstring [lindex $entry 0]] ,
+                        foreach fv [lindex $entry 1] {
+                            append o [csvstring $fv] ,
+                        }
+                    }
+                    append o "\n"
+                }
+                bitmap {
+                    append o [csvstring [{*}$r debug bitmap-raw $k]] "\n"
                 }
             }
         }
@@ -473,8 +790,9 @@ proc find_available_port {start count} {
             set port $start
         }
         set fd1 -1
-        if {[catch {set fd1 [socket -server 127.0.0.1 $port]}] ||
-            [catch {set fd2 [socket -server 127.0.0.1 [expr $port+10000]]}]} {
+        proc dummy_accept {chan addr port} {}
+        if {[catch {set fd1 [socket -server dummy_accept -myaddr 127.0.0.1 $port]}] ||
+            [catch {set fd2 [socket -server dummy_accept -myaddr 127.0.0.1 [expr $port+10000]]}]} {
             if {$fd1 != -1} {
                 close $fd1
             }
@@ -552,10 +870,13 @@ proc find_valgrind_errors {stderr on_termination} {
 }
 
 # Execute a background process writing random data for the specified number
-# of seconds to the specified Redis instance.
-proc start_write_load {host port seconds} {
+# of seconds to the specified Redis instance. If key is omitted, a random key
+# is used for every SET command.
+# ignore_error_reply (default 0): set non-zero in cluster slot-migration tests to tolerate
+# MOVED/ASK replies while draining pipelined writes in the load helper.
+proc start_write_load {host port seconds {key ""} {size 0} {sleep 0} {ignore_error_reply 0}} {
     set tclsh [info nameofexecutable]
-    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds $::tls &
+    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds $::tls $key $size $sleep $ignore_error_reply &
 }
 
 # Stop a process generating write load executed with start_write_load.
@@ -572,6 +893,26 @@ proc wait_load_handlers_disconnected {{level 0}} {
 }
 
 proc K { x y } { set x } 
+
+# Send count commands on a deferring client, draining replies in batches to
+# avoid TCP deadlock when deferred replies accumulate.
+proc deferred_batch {rd count cmd_script {batch_size 1000}} {
+    set pending 0
+    for {set idx 0} {$idx < $count} {incr idx} {
+        uplevel 1 [list set i $idx]
+        uplevel 1 $cmd_script
+        incr pending
+        if {$pending == $batch_size} {
+            for {set reply_idx 0} {$reply_idx < $pending} {incr reply_idx} {
+                $rd read
+            }
+            set pending 0
+        }
+    }
+    for {set reply_idx 0} {$reply_idx < $pending} {incr reply_idx} {
+        $rd read
+    }
+}
 
 # Shuffle a list with Fisher-Yates algorithm.
 proc lshuffle {list} {
@@ -602,15 +943,44 @@ proc stop_bg_complex_data {handle} {
 # Write num keys with the given key prefix and value size (in bytes). If idx is
 # given, it's the index (AKA level) used with the srv procedure and it specifies
 # to which Redis instance to write the keys.
-proc populate {num {prefix key:} {size 3} {idx 0}} {
-    set rd [redis_deferring_client $idx]
-    for {set j 0} {$j < $num} {incr j} {
-        $rd set $prefix$j [string repeat A $size]
+proc populate {num {prefix key:} {size 3} {idx 0} {prints false} {expires 0} {random false}} {
+    r $idx deferred 1
+    if {$num > 16} {set pipeline 16} else {set pipeline $num}
+    if {$random} {
+        set baseval [randstring $size $size]
+    } else {
+        set val [string repeat A $size]
     }
-    for {set j 0} {$j < $num} {incr j} {
-        $rd read
+    for {set j 0} {$j < $pipeline} {incr j} {
+        if {$random} {
+            set jstr [format "%08d" $j]
+            set val [string replace $baseval 0 7 $jstr]
+        }
+        if {$expires > 0} {
+            r $idx set $prefix$j $val ex $expires
+        } else {
+            r $idx set $prefix$j $val
+        }
+        if {$prints} {puts $j}
     }
-    $rd close
+    for {} {$j < $num} {incr j} {
+        if {$random} {
+            set jstr [format "%08d" $j]
+            set val [string replace $baseval 0 7 $jstr]
+        }
+        if {$expires > 0} {
+            r $idx set $prefix$j $val ex $expires
+        } else {
+            r $idx set $prefix$j $val
+        }
+        r $idx read
+        if {$prints} {puts $j}
+    }
+    for {set j 0} {$j < $pipeline} {incr j} {
+        r $idx read
+        if {$prints} {puts $j}
+    }
+    r $idx deferred 0
 }
 
 proc get_child_pid {idx} {
@@ -625,6 +995,75 @@ proc get_child_pid {idx} {
     close $fd
 
     return $child_pid
+}
+
+proc process_is_alive pid {
+    if {[catch {exec ps -p $pid -f} err]} {
+        return 0
+    } else {
+        if {[string match "*<defunct>*" $err]} { return 0 }
+        return 1
+    }
+}
+
+proc get_system_name {} {
+    return [string tolower [exec uname -s]]
+}
+
+proc get_proc_state {pid} {
+    if {[get_system_name] eq {sunos}} {
+        return [exec ps -o s= -p $pid]
+    } else {
+        return [exec ps -o state= -p $pid]
+    }
+}
+
+proc get_proc_job {pid} {
+    if {[get_system_name] eq {sunos}} {
+        return [exec ps -l -p $pid]
+    } else {
+        return [exec ps j $pid]
+    }
+}
+
+proc pause_process {pid} {
+    exec kill -SIGSTOP $pid
+    wait_for_condition 50 100 {
+        [string match "T*" [get_proc_state $pid]]
+    } else {
+        puts [get_proc_job $pid]
+        fail "process didn't stop"
+    }
+}
+
+proc resume_process {pid} {
+    wait_for_condition 50 1000 {
+        [string match "T*" [get_proc_state $pid]]
+    } else {
+        puts [get_proc_job $pid]
+        fail "process was not stopped"
+    }
+
+    set max_attempts 10
+    set attempt 0
+    while {($attempt < $max_attempts) && [string match "T*" [exec ps -o state= -p $pid]]} {
+        exec kill -SIGCONT $pid
+
+        incr attempt
+        after 100
+    }
+
+    set max_attempts 50
+    if {$::compression} {
+        set max_attempts 150
+    }
+    wait_for_condition $max_attempts 1000 {
+        [string match "R*" [exec ps -o state= -p $pid]] ||
+        [string match "S*" [exec ps -o state= -p $pid]]
+    } else {
+        puts [exec ps j $pid]
+        fail "process was not resumed"
+    }
 }
 
 proc cmdrstat {cmd r} {
@@ -645,7 +1084,17 @@ proc latencyrstat_percentiles {cmd r} {
     }
 }
 
-proc generate_fuzzy_traffic_on_key {key duration} {
+proc get_io_thread_clients {id {client r}} {
+    set pattern "io_thread_$id:clients=(\[0-9\]+)"
+    set info [$client info threads]
+    if {[regexp $pattern $info _ value]} {
+        return $value
+    } else {
+        return -1
+    }
+}
+
+proc generate_fuzzy_traffic_on_key {key type duration} {
     # Commands per type, blocking commands removed
     # TODO: extract these from COMMAND DOCS, and improve to include other types
     set string_commands {APPEND BITCOUNT BITFIELD BITOP BITPOS DECR DECRBY GET GETBIT GETRANGE GETSET INCR INCRBY INCRBYFLOAT MGET MSET MSETNX PSETEX SET SETBIT SETEX SETNX SETRANGE LCS STRLEN}
@@ -653,10 +1102,16 @@ proc generate_fuzzy_traffic_on_key {key duration} {
     set zset_commands {ZADD ZCARD ZCOUNT ZINCRBY ZINTERSTORE ZLEXCOUNT ZPOPMAX ZPOPMIN ZRANGE ZRANGEBYLEX ZRANGEBYSCORE ZRANK ZREM ZREMRANGEBYLEX ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREVRANGE ZREVRANGEBYLEX ZREVRANGEBYSCORE ZREVRANK ZSCAN ZSCORE ZUNIONSTORE ZRANDMEMBER}
     set list_commands {LINDEX LINSERT LLEN LPOP LPOS LPUSH LPUSHX LRANGE LREM LSET LTRIM RPOP RPOPLPUSH RPUSH RPUSHX}
     set set_commands {SADD SCARD SDIFF SDIFFSTORE SINTER SINTERSTORE SISMEMBER SMEMBERS SMOVE SPOP SRANDMEMBER SREM SSCAN SUNION SUNIONSTORE}
-    set stream_commands {XACK XADD XCLAIM XDEL XGROUP XINFO XLEN XPENDING XRANGE XREAD XREADGROUP XREVRANGE XTRIM}
-    set commands [dict create string $string_commands hash $hash_commands zset $zset_commands list $list_commands set $set_commands stream $stream_commands]
+    set stream_commands {XACK XADD XCLAIM XDEL XGROUP XINFO XLEN XPENDING XRANGE XREAD XREADGROUP XREVRANGE XTRIM XDELEX XACKDEL XNACK}
+    set vset_commands {VADD VREM}
+    set array_commands {ARSET ARGET ARDEL ARCOUNT ARMSET ARMGET ARGETRANGE ARDELRANGE ARINFO}
+    set bitmap_commands {SETBIT GETBIT BITCOUNT BITPOS BITOP BITFIELD BITFIELD_RO}
+    set commands [dict create string $string_commands hash $hash_commands zset $zset_commands list $list_commands set $set_commands stream $stream_commands vectorset $vset_commands array $array_commands bitmap $bitmap_commands]
+if 0 {
+    set gcra_commands {GCRA}
+    dict set commands gcra $gcra_commands
+}
 
-    set type [r type $key]
     set cmds [dict get $commands $type]
     set start_time [clock seconds]
     set sent {}
@@ -705,6 +1160,61 @@ proc generate_fuzzy_traffic_on_key {key duration} {
             lappend cmd [randomValue]
             incr i 4
         }
+        if {$cmd == "VADD"} {
+            lappend cmd $key
+            lappend cmd VALUES 3 1 1 1
+            lappend cmd [randomValue]
+            incr i 7
+        }
+        if {$cmd == "VREM"} {
+            lappend cmd $key
+            lappend cmd [randomValue]
+            incr i 2
+        }
+        # Array commands need integer indices
+        if {$cmd == "ARSET"} {
+            lappend cmd $key
+            lappend cmd [randomInt 100000]  ;# index
+            lappend cmd [randomValue]       ;# value
+            incr i 3
+        }
+        if {$cmd == "ARGET" || $cmd == "ARDEL"} {
+            lappend cmd $key
+            lappend cmd [randomInt 100000]  ;# index
+            incr i 2
+        }
+        if {$cmd == "ARCOUNT" || $cmd == "ARINFO"} {
+            lappend cmd $key
+            incr i 1
+        }
+        if {$cmd == "ARMSET"} {
+            lappend cmd $key
+            # Add 2-4 index/value pairs
+            set npairs [expr {int(rand() * 3) + 2}]
+            for {set p 0} {$p < $npairs} {incr p} {
+                lappend cmd [randomInt 100000]
+                lappend cmd [randomValue]
+            }
+            incr i [expr {1 + $npairs * 2}]
+        }
+        if {$cmd == "ARMGET"} {
+            lappend cmd $key
+            # Add 2-4 indices
+            set nidx [expr {int(rand() * 3) + 2}]
+            for {set p 0} {$p < $nidx} {incr p} {
+                lappend cmd [randomInt 100000]
+            }
+            incr i [expr {1 + $nidx}]
+        }
+        if {$cmd == "ARGETRANGE" || $cmd == "ARDELRANGE"} {
+            lappend cmd $key
+            set idx1 [randomInt 100000]
+            set idx2 [expr {$idx1 + [randomInt 1000]}]
+            lappend cmd $idx1
+            lappend cmd $idx2
+            incr i 3
+        }
+
         for {} {$i < $arity} {incr i} {
             if {$i == $firstkey || $i == $lastkey} {
                 lappend cmd $key
@@ -721,13 +1231,20 @@ proc generate_fuzzy_traffic_on_key {key duration} {
         } else {
             set err [format "%s" $err] ;# convert to string for pattern matching
             if {[string match "*SIGTERM*" $err]} {
-                puts "command caused test to hang? $cmd"
-                exit 1
+                puts "commands caused test to hang:"
+                foreach cmd $sent {
+                    foreach arg $cmd {
+                        puts -nonewline "[string2printable $arg] "
+                    }
+                    puts ""
+                }
+                # Re-raise, let handler up the stack take care of this.
+                error $err $::errorInfo
             }
         }
     }
 
-    # print stats so that we know if we managed to generate commands that actually made senes
+    # print stats so that we know if we managed to generate commands that actually made sense
     #if {$::verbose} {
     #    set count [llength $sent]
     #    puts "Fuzzy traffic sent: $count, succeeded: $succeeded"
@@ -855,6 +1372,18 @@ proc debug_digest_value {key} {
     r debug digest-value $key
 }
 
+# Arm the per-command INFO Streams assertion: the server rebuilds the stream
+# histograms from the keyspace after every command and panics on a mismatch,
+# so the calling suite also covers the stream-stats bookkeeping. Not a tag on
+# the suite, which would skip every test where DEBUG is unavailable (external
+# servers, and the CI job that runs with --tags -needs:debug): only the
+# arming is skipped there.
+proc arm_stream_stats_assert {} {
+    if {$::external || [lsearch $::denytags "needs:debug"] >= 0} return
+    r config set stream-stats yes
+    r debug stream-stats-assert 1
+}
+
 proc debug_digest {{level 0}} {
     if {[lsearch $::denytags "needs:debug"] >= 0 || $::ignoredigest} {
         return "dummy-digest"
@@ -862,19 +1391,27 @@ proc debug_digest {{level 0}} {
     r $level debug digest
 }
 
-proc wait_for_blocked_client {} {
+proc wait_for_blocked_client {{idx 0}} {
     wait_for_condition 50 100 {
-        [s blocked_clients] ne 0
+        [s $idx blocked_clients] ne 0
     } else {
         fail "no blocked clients"
     }
 }
 
-proc wait_for_blocked_clients_count {count {maxtries 100} {delay 10}} {
+proc wait_for_blocked_clients_count {count {maxtries 100} {delay 10} {idx 0}} {
     wait_for_condition $maxtries $delay  {
-        [s blocked_clients] == $count
+        [s $idx blocked_clients] == $count
     } else {
-        fail "Timeout waiting for blocked clients"
+        fail "Timeout waiting for blocked clients (expected $count, actual [s $idx blocked_clients])"
+    }
+}
+
+proc wait_for_watched_clients_count {count {maxtries 100} {delay 10} {idx 0}} {
+    wait_for_condition $maxtries $delay  {
+        [s $idx watching_clients] == $count
+    } else {
+        fail "Timeout waiting for watched clients"
     }
 }
 
@@ -934,6 +1471,38 @@ proc config_get_set {param value {options {}}} {
     return $config
 }
 
+# Enable active defrag until it has walked some keys, then raise
+# active-defrag-threshold-lower above any fragmentation so the running cycle
+# is the last one. Returns how many cycles ran, counted from the verbose
+# "Active defrag done" line each cycle ends with, or 0 if this build cannot
+# enable active defrag. Every counted cycle ran to completion, so per-cycle
+# defrag stats are exact multiples of the returned count.
+proc run_complete_defrag_cycles {} {
+    set old_loglevel [config_get_set loglevel verbose]
+    set old_threshold [lindex [r config get active-defrag-threshold-lower] 1]
+    set done_lines [count_log_message 0 "Active defrag done"]
+    set cycles 0
+    catch {r config set activedefrag yes}
+    if {[r config get activedefrag] eq "activedefrag yes"} {
+        wait_for_condition 500 100 {
+            [s active_defrag_key_hits] + [s active_defrag_key_misses] > 0
+        } else {
+            fail "defrag did not start"
+        }
+        r config set active-defrag-threshold-lower 1000
+        wait_for_condition 500 100 {
+            [s active_defrag_running] eq 0
+        } else {
+            fail "defrag did not finish its last cycle"
+        }
+        set cycles [expr {[count_log_message 0 "Active defrag done"] - $done_lines}]
+        r config set activedefrag no
+    }
+    r config set active-defrag-threshold-lower $old_threshold
+    r config set loglevel $old_loglevel
+    return $cycles
+}
+
 proc delete_lines_with_pattern {filename tmpfilename pattern} {
     set fh_in [open $filename r]
     set fh_out [open $tmpfilename w]
@@ -958,7 +1527,7 @@ proc get_nonloopback_client {} {
 }
 
 # The following functions and variables are used only when running large-memory
-# tests. We avoid defining them when not running large-memory tests because the 
+# tests. We avoid defining them when not running large-memory tests because the
 # global variables takes up lots of memory.
 proc init_large_mem_vars {} {
     if {![info exists ::str500]} {
@@ -1046,6 +1615,15 @@ proc memory_usage {key} {
     return $usage
 }
 
+# Test if the server supports the specified command.
+proc server_has_command {cmd_wanted} {
+    set lowercase_commands {}
+    foreach cmd [r command list] {
+        lappend lowercase_commands [string tolower $cmd]
+    }
+    expr {[lsearch $lowercase_commands [string tolower $cmd_wanted]] != -1}
+}
+
 # forward compatibility, lmap missing in TCL 8.5
 proc lmap args {
     set body [lindex $args end]
@@ -1066,4 +1644,44 @@ proc lmap args {
         lappend temp [uplevel 1 $body]
     }
     set temp
+}
+
+proc format_command {args} {
+    set cmd "*[llength $args]\r\n"
+    foreach a $args {
+        append cmd "$[string length $a]\r\n$a\r\n"
+    }
+    set _ $cmd
+}
+
+# Returns whether or not the system supports stack traces
+proc system_backtrace_supported {} {
+    # Thread sanitizer reports backtrace_symbols_fd() as
+    # signal-unsafe since it allocates memory
+    if {$::tsan} {
+        return 0
+    }
+
+    set system_name [get_system_name]
+    if {$system_name eq {darwin}} {
+        return 1
+    } elseif {$system_name ne {linux}} {
+        return 0
+    }
+
+    # libmusl does not support backtrace. Also return 0 on
+    # static binaries (ldd exit code 1) where we can't detect libmusl
+    if {![catch {set ldd [exec ldd src/redis-server]}]} {
+        if {![string match {*libc.*musl*} $ldd]} {
+            return 1
+        }
+    }
+    return 0
+}
+
+proc generate_largevalue_test_array {} {
+    array set largevalue {}
+    set largevalue(listpack) "hello"
+    set largevalue(quicklist) [string repeat "x" 8192]
+    return [array get largevalue]
 }

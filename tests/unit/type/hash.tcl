@@ -1,4 +1,7 @@
 start_server {tags {"hash"}} {
+    r config set hash-max-listpack-value 64
+    r config set hash-max-listpack-entries 512
+
     test {HSET/HLEN - Small hash creation} {
         array set smallhash {}
         for {set i 0} {$i < 8} {incr i} {
@@ -40,7 +43,7 @@ start_server {tags {"hash"}} {
         create_hash myhash $contents
         assert_encoding $type myhash
 
-        # coverage for objectComputeSize
+        # coverage for kvobjComputeSize
         assert_morethan [memory_usage myhash] 0
 
         test "HRANDFIELD - $type" {
@@ -69,6 +72,13 @@ start_server {tags {"hash"}} {
 
     test "HRANDFIELD count of 0 is handled correctly" {
         r hrandfield myhash 0
+    } {}
+
+    test "HRANDFIELD count overflow" {
+        r hmset myhash a 1
+        assert_error {*value is out of range*} {r hrandfield myhash -9223372036854770000 withvalues}
+        assert_error {*value is out of range*} {r hrandfield myhash -9223372036854775808 withvalues}
+        assert_error {*value is out of range*} {r hrandfield myhash -9223372036854775808}
     } {}
 
     test "HRANDFIELD with <count> against non existing key" {
@@ -286,6 +296,119 @@ start_server {tags {"hash"}} {
         set _ $rv
     } {0 newval1 1 0 newval2 1 1 1}
 
+    test {HSET fresh wide build (batch fast path) - basic} {
+        r del fresh
+        set args {}
+        for {set i 0} {$i < 64} {incr i} { lappend args f$i v$i }
+        assert_equal 64 [r hset fresh {*}$args]
+        assert_equal 64 [r hlen fresh]
+        assert_encoding listpack fresh
+        assert_equal v0 [r hget fresh f0]
+        assert_equal v63 [r hget fresh f63]
+    }
+
+    test {HSET fresh wide build - in-command duplicate fields are last-wins} {
+        r del freshdup
+        # >=5 distinct fields so the fresh-build fast path engages; f1 repeats
+        # (a->c->d) to exercise the fast-path dedup: created counts unique fields only.
+        assert_equal 5 [r hset freshdup f1 a f2 b f3 x f4 y f1 c f5 z f1 d]
+        assert_equal 5 [r hlen freshdup]
+        assert_equal d [r hget freshdup f1]
+        assert_equal b [r hget freshdup f2]
+        assert_equal z [r hget freshdup f5]
+    }
+
+    test {HSET fresh wide build - dedup keys on raw field bytes (123 vs 0123 distinct)} {
+        # The fast path dedups fields through a dict keyed on the raw field sds
+        # (byte compare), while listpack int-encoding happens per entry at append.
+        # "123" int-encodes and "0123" stays a string: they must remain two fields.
+        # >=5 distinct fields so the fresh-build fast path engages.
+        r del freshint
+        assert_equal 5 [r hset freshint 123 x 0123 y 5 a 05 b 999 c]
+        assert_equal 5 [r hlen freshint]
+        assert_equal x [r hget freshint 123]
+        assert_equal y [r hget freshint 0123]
+        assert_equal b [r hget freshint 05]
+    }
+
+    test {HSET fresh build crossing hash-max-listpack-entries converts to hashtable} {
+        # hashTypeTryConversion runs before the fast-path gate, so a build that
+        # exceeds the entry limit is hashtable and never enters the fast path.
+        set prev [lindex [r config get hash-max-listpack-entries] 1]
+        r config set hash-max-listpack-entries 128
+        r del freshbig
+        set args {}
+        for {set i 0} {$i < 200} {incr i} { lappend args f$i v$i }
+        assert_equal 200 [r hset freshbig {*}$args]
+        assert_equal 200 [r hlen freshbig]
+        assert_encoding hashtable freshbig
+        assert_equal v199 [r hget freshbig f199]
+        r config set hash-max-listpack-entries $prev
+    }
+
+    test {HMSET fresh wide build returns OK and stores all fields} {
+        r del freshhmset
+        set args {}
+        for {set i 0} {$i < 32} {incr i} { lappend args g$i w$i }
+        assert_equal {OK} [r hmset freshhmset {*}$args]
+        assert_equal 32 [r hlen freshhmset]
+        assert_equal w31 [r hget freshhmset g31]
+    }
+
+    test {HSET fresh wide build above the stack threshold (300 fields) stays listpack} {
+        # 300 > HSET_LP_STACK_PAIRS(128) but < default hash-max-listpack-entries(512):
+        # exercises the heap-allocated pairs[] path; stays listpack.
+        r del freshheap
+        set args {}
+        for {set i 0} {$i < 300} {incr i} { lappend args f$i v$i }
+        assert_equal 300 [r hset freshheap {*}$args]
+        assert_equal 300 [r hlen freshheap]
+        assert_encoding listpack freshheap
+        assert_equal v0 [r hget freshheap f0]
+        assert_equal v299 [r hget freshheap f299]
+    }
+
+    test {HSET fresh wide build - wide command with one duplicate field, last-wins} {
+        r del freshwidedup
+        set args {}
+        for {set i 0} {$i < 60} {incr i} { lappend args k$i u$i }
+        # repeat k0 at the tail with a new value -> dict collapses it last-wins
+        lappend args k0 LAST
+        assert_equal 60 [r hset freshwidedup {*}$args]
+        assert_equal 60 [r hlen freshwidedup]
+        assert_encoding listpack freshwidedup
+        assert_equal LAST [r hget freshwidedup k0]
+        assert_equal u59 [r hget freshwidedup k59]
+    }
+
+    test {HSET fresh build with an over-limit value converts to hashtable} {
+        set prev [lindex [r config get hash-max-listpack-value] 1]
+        r config set hash-max-listpack-value 64
+        r del freshbigval
+        set big [string repeat x 100]
+        assert_equal 2 [r hset freshbigval f1 v1 f2 $big]
+        assert_encoding hashtable freshbigval
+        assert_equal $big [r hget freshbigval f2]
+        r config set hash-max-listpack-value $prev
+    }
+
+    test {HSET fresh wide build is byte-identical to the per-field path} {
+        # The fast path must produce exactly the listpack the per-field loop would:
+        # same fields, same first-occurrence order, same last-wins values.
+        # (Delete keys one at a time -- they may live in different cluster slots.)
+        r del fastp
+        r del perfieldp
+        # Fast path: one wide HSET (incl. a duplicate field to exercise last-wins).
+        r hset fastp a 1 b 2 c 3 a 9 d 4
+        # Per-field path: separate single-field HSETs (numfields==1 each -> not fast).
+        foreach {f v} {a 1 b 2 c 3 a 9 d 4} { r hset perfieldp $f $v }
+        assert_encoding listpack fastp
+        assert_encoding listpack perfieldp
+        # HGETALL list equality checks both content AND physical order.
+        assert_equal [r hgetall fastp] [r hgetall perfieldp]
+        assert_equal [r debug digest-value fastp] [r debug digest-value perfieldp]
+    } {} {needs:debug}
+
     test {HSETNX target key missing - small hash} {
         r hsetnx smallhash __123123123__ foo
         r hget smallhash __123123123__
@@ -343,9 +466,25 @@ start_server {tags {"hash"}} {
         set _ $rv
     } {{{} {}} {{} {}} {{} {}}}
 
-    test {HMGET against wrong type} {
+    test {Hash commands against wrong type} {
         r set wrongtype somevalue
-        assert_error "*wrong*" {r hmget wrongtype field1 field2}
+        assert_error "WRONGTYPE Operation against a key*" {r hmget wrongtype field1 field2}
+        assert_error "WRONGTYPE Operation against a key*" {r hrandfield wrongtype}
+        assert_error "WRONGTYPE Operation against a key*" {r hget wrongtype field1}
+        assert_error "WRONGTYPE Operation against a key*" {r hgetall wrongtype}
+        assert_error "WRONGTYPE Operation against a key*" {r hdel wrongtype field1}
+        assert_error "WRONGTYPE Operation against a key*" {r hincrby wrongtype field1 2}
+        assert_error "WRONGTYPE Operation against a key*" {r hincrbyfloat wrongtype field1 2.5}
+        assert_error "WRONGTYPE Operation against a key*" {r hstrlen wrongtype field1}
+        assert_error "WRONGTYPE Operation against a key*" {r hvals wrongtype}
+        assert_error "WRONGTYPE Operation against a key*" {r hkeys wrongtype}
+        assert_error "WRONGTYPE Operation against a key*" {r hexists wrongtype field1}
+        assert_error "WRONGTYPE Operation against a key*" {r hset wrongtype field1 val1}
+        assert_error "WRONGTYPE Operation against a key*" {r hmset wrongtype field1 val1 field2 val2}
+        assert_error "WRONGTYPE Operation against a key*" {r hsetnx wrongtype field1 val1}
+        assert_error "WRONGTYPE Operation against a key*" {r hlen wrongtype}
+        assert_error "WRONGTYPE Operation against a key*" {r hscan wrongtype 0}
+        assert_error "WRONGTYPE Operation against a key*" {r hgetdel wrongtype fields 1 a}
     }
 
     test {HMGET - small hash} {
@@ -412,6 +551,11 @@ start_server {tags {"hash"}} {
         lsort [r hgetall bighash]
     } [lsort [array get bighash]]
 
+    test {HGETALL against non-existing key} {
+        r del htest
+        r hgetall htest
+    } {}
+
     test {HDEL and return value} {
         set rv {}
         lappend rv [r hdel smallhash nokey]
@@ -464,6 +608,13 @@ start_server {tags {"hash"}} {
         r del htest
         list [r hincrby htest foo 2]
     } {2}
+
+    test {HINCRBY HINCRBYFLOAT against non-integer increment value} {
+        r del incrhash
+        r hset incrhash field 5
+        assert_error "*value is not an integer*" {r hincrby incrhash field v}
+        assert_error "*value is not a*" {r hincrbyfloat incrhash field v}
+    }
 
     test {HINCRBY against non existing hash key} {
         set rv {}
@@ -673,6 +824,89 @@ start_server {tags {"hash"}} {
         r config set hash-max-listpack-value $original_max_value
     }
 
+    test {HGETDEL input validation} {
+        r del key1
+        assert_error "*wrong number of arguments*" {r hgetdel}
+        assert_error "*wrong number of arguments*" {r hgetdel key1}
+        assert_error "*wrong number of arguments*" {r hgetdel key1 FIELDS}
+        assert_error "*wrong number of arguments*" {r hgetdel key1 FIELDS 0}
+        assert_error "*wrong number of arguments*" {r hgetdel key1 FIELDX}
+        assert_error "*argument FIELDS is missing*" {r hgetdel key1 XFIELDX 1 a}
+        assert_error "*numfields*parameter*must match*number of arguments*" {r hgetdel key1 FIELDS 2 a}
+        assert_error "*numfields*parameter*must match*number of arguments*" {r hgetdel key1 FIELDS 2 a b c}
+        assert_error "*Number of fields must be a positive integer*" {r hgetdel key1 FIELDS 0 a}
+        assert_error "*Number of fields must be a positive integer*" {r hgetdel key1 FIELDS -1 a}
+        assert_error "*Number of fields must be a positive integer*" {r hgetdel key1 FIELDS b a}
+        assert_error "*Number of fields must be a positive integer*" {r hgetdel key1 FIELDS 9223372036854775808 a}
+    }
+
+    foreach type {listpack ht} {
+        set orig_config [lindex [r config get hash-max-listpack-entries] 1]
+        r del key1
+
+        if {$type == "listpack"} {
+            r config set hash-max-listpack-entries $orig_config
+            r hset key1 f1 1 f2 2 f3 3 strfield strval
+            assert_encoding listpack key1
+        } else {
+            r config set hash-max-listpack-entries 0
+            r hset key1 f1 1 f2 2 f3 3 strfield strval
+            assert_encoding hashtable key1
+        }
+
+        test {HGETDEL basic test} {
+            r del key1
+            r hset key1 f1 1 f2 2 f3 3 strfield strval
+            assert_equal [r hgetdel key1 fields 1 f2] 2
+            assert_equal [r hlen key1] 3
+            assert_equal [r hget key1 f1] 1
+            assert_equal [r hget key1 f2] ""
+            assert_equal [r hget key1 f3] 3
+            assert_equal [r hget key1 strfield] strval
+
+            assert_equal [r hgetdel key1 fields 1 f1] 1
+            assert_equal [lsort [r hgetall key1]] [lsort "f3 3 strfield strval"]
+            assert_equal [r hgetdel key1 fields 1 f3] 3
+            assert_equal [r hgetdel key1 fields 1 strfield] strval
+            assert_equal [r hgetall key1] ""
+            assert_equal [r exists key1] 0
+        }
+
+        test {HGETDEL test with non existing fields} {
+             r del key1
+             r hset key1 f1 1 f2 2 f3 3
+             assert_equal [r hgetdel key1 fields 4 x1 x2 x3 x4] "{} {} {} {}"
+             assert_equal [r hgetdel key1 fields 4 x1 x2 f3 x4] "{} {} 3 {}"
+             assert_equal [lsort [r hgetall key1]] [lsort "f1 1 f2 2"]
+             assert_equal [r hgetdel key1 fields 3 f1 f2 f3] "1 2 {}"
+             assert_equal [r hgetdel key1 fields 3 f1 f2 f3] "{} {} {}"
+        }
+
+        r config set hash-max-listpack-entries $orig_config
+    }
+
+    test {HGETDEL propagated as HDEL command to replica} {
+        set repl [attach_to_replication_stream]
+        r hset key1 f1 v1 f2 v2 f3 v3 f4 v4 f5 v5
+        r hgetdel key1 fields 1 f1
+        r hgetdel key1 fields 2 f2 f3
+
+        # make sure non-existing fields are not replicated
+        r hgetdel key1 fields 2 f7 f8
+
+        # delete more
+        r hgetdel key1 fields 3 f4 f5 f6
+
+        assert_replication_stream $repl {
+            {select *}
+            {hset key1 f1 v1 f2 v2 f3 v3 f4 v4 f5 v5}
+            {hdel key1 f1}
+            {hdel key1 f2 f3}
+            {hdel key1 f4 f5 f6}
+        }
+        close_replication_stream $repl
+    } {} {needs:repl}
+
     test {Hash ziplist regression test for large keys} {
         r hset hash kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk a
         r hset hash kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk b
@@ -818,6 +1052,18 @@ start_server {tags {"hash"}} {
         set k [dict remove $k ZIP_STR_32B]
         set _ $k
     } {ZIP_INT_8B 127 ZIP_INT_16B 32767 ZIP_INT_32B 2147483647 ZIP_INT_64B 9223372036854775808 ZIP_INT_IMM_MIN 0 ZIP_INT_IMM_MAX 12}
+
+    test {KEYS command return expired keys when allow_access_expired is 1} {
+        r flushall
+        r debug set-allow-access-expired 1
+        r debug set-active-expire 0
+        r set key1 value1
+        r pexpire key1 1
+        after 2
+        assert_equal {key1} [r keys *]
+        r debug set-allow-access-expired 0
+        r debug set-active-expire 1
+    } {OK} {needs:debug}
 
     # On some platforms strtold("+inf") with valgrind returns a non-inf result
     if {!$::valgrind} {

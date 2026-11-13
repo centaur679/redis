@@ -1,6 +1,6 @@
 {
     "FCALL": {
-        "summary": "Invoke a function",
+        "summary": "Invokes a function.",
         "complexity": "Depends on the function that is executed.",
         "group": "scripting",
         "since": "7.0.0",
@@ -12,6 +12,7 @@
             "SKIP_MONITOR",
             "MAY_REPLICATE",
             "NO_MANDATORY_KEYS",
+            "SCRIPT_RUNNER",
             "STALE"
         ],
         "acl_categories": [
@@ -61,6 +62,9 @@
                 "optional": true,
                 "multiple": true
             }
-        ]
+        ],
+        "reply_schema": {
+            "description": "Return value depends on the function that is executed"
+        }
     }
 }

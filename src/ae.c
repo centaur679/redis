@@ -2,32 +2,12 @@
  * for the Jim's event-loop (Jim is a Tcl interpreter) but later translated
  * it in form of a library for easy reuse.
  *
- * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "ae.h"
@@ -63,16 +43,17 @@
     #endif
 #endif
 
-
+#define INITIAL_EVENT 1024
 aeEventLoop *aeCreateEventLoop(int setsize) {
     aeEventLoop *eventLoop;
     int i;
 
-    monotonicInit();    /* just in case the calling app didn't initialize */
+    monotonicInit(NULL);    /* just in case the calling app didn't initialize */
 
     if ((eventLoop = zmalloc(sizeof(*eventLoop))) == NULL) goto err;
-    eventLoop->events = zmalloc(sizeof(aeFileEvent)*setsize);
-    eventLoop->fired = zmalloc(sizeof(aeFiredEvent)*setsize);
+    eventLoop->nevents = setsize < INITIAL_EVENT ? setsize : INITIAL_EVENT;
+    eventLoop->events = zmalloc(sizeof(aeFileEvent)*eventLoop->nevents);
+    eventLoop->fired = zmalloc(sizeof(aeFiredEvent)*eventLoop->nevents);
     if (eventLoop->events == NULL || eventLoop->fired == NULL) goto err;
     eventLoop->setsize = setsize;
     eventLoop->timeEventHead = NULL;
@@ -82,10 +63,11 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->beforesleep = NULL;
     eventLoop->aftersleep = NULL;
     eventLoop->flags = 0;
+    memset(eventLoop->privdata, 0, sizeof(eventLoop->privdata));
     if (aeApiCreate(eventLoop) == -1) goto err;
     /* Events with mask == AE_NONE are not set. So let's initialize the
      * vector with it. */
-    for (i = 0; i < setsize; i++)
+    for (i = 0; i < eventLoop->nevents; i++)
         eventLoop->events[i].mask = AE_NONE;
     return eventLoop;
 
@@ -103,7 +85,11 @@ int aeGetSetSize(aeEventLoop *eventLoop) {
     return eventLoop->setsize;
 }
 
-/* Tells the next iteration/s of the event processing to set timeout of 0. */
+/*
+ * Tell the event processing to change the wait timeout as soon as possible.
+ *
+ * Note: it just means you turn on/off the global AE_DONT_WAIT.
+ */
 void aeSetDontWait(aeEventLoop *eventLoop, int noWait) {
     if (noWait)
         eventLoop->flags |= AE_DONT_WAIT;
@@ -119,20 +105,19 @@ void aeSetDontWait(aeEventLoop *eventLoop, int noWait) {
  *
  * Otherwise AE_OK is returned and the operation is successful. */
 int aeResizeSetSize(aeEventLoop *eventLoop, int setsize) {
-    int i;
-
     if (setsize == eventLoop->setsize) return AE_OK;
     if (eventLoop->maxfd >= setsize) return AE_ERR;
     if (aeApiResize(eventLoop,setsize) == -1) return AE_ERR;
 
-    eventLoop->events = zrealloc(eventLoop->events,sizeof(aeFileEvent)*setsize);
-    eventLoop->fired = zrealloc(eventLoop->fired,sizeof(aeFiredEvent)*setsize);
     eventLoop->setsize = setsize;
 
-    /* Make sure that if we created new slots, they are initialized with
-     * an AE_NONE mask. */
-    for (i = eventLoop->maxfd+1; i < setsize; i++)
-        eventLoop->events[i].mask = AE_NONE;
+    /* If the current allocated space is larger than the requested size,
+     * we need to shrink it to the requested size. */
+    if (setsize < eventLoop->nevents) {
+        eventLoop->events = zrealloc(eventLoop->events,sizeof(aeFileEvent)*setsize);
+        eventLoop->fired = zrealloc(eventLoop->fired,sizeof(aeFiredEvent)*setsize);
+        eventLoop->nevents = setsize;
+    }
     return AE_OK;
 }
 
@@ -145,6 +130,8 @@ void aeDeleteEventLoop(aeEventLoop *eventLoop) {
     aeTimeEvent *next_te, *te = eventLoop->timeEventHead;
     while (te) {
         next_te = te->next;
+        if (te->finalizerProc)
+            te->finalizerProc(eventLoop, te->clientData);
         zfree(te);
         te = next_te;
     }
@@ -162,6 +149,22 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         errno = ERANGE;
         return AE_ERR;
     }
+
+    /* Resize the events and fired arrays if the file
+     * descriptor exceeds the current number of events. */
+    if (unlikely(fd >= eventLoop->nevents)) {
+        int newnevents = eventLoop->nevents;
+        newnevents = (newnevents * 2 > fd + 1) ? newnevents * 2 : fd + 1;
+        newnevents = (newnevents > eventLoop->setsize) ? eventLoop->setsize : newnevents;
+        eventLoop->events = zrealloc(eventLoop->events, sizeof(aeFileEvent) * newnevents);
+        eventLoop->fired = zrealloc(eventLoop->fired, sizeof(aeFiredEvent) * newnevents);
+
+        /* Initialize new slots with an AE_NONE mask */
+        for (int i = eventLoop->nevents; i < newnevents; i++)
+            eventLoop->events[i].mask = AE_NONE;
+        eventLoop->nevents = newnevents;
+    }
+
     aeFileEvent *fe = &eventLoop->events[fd];
 
     if (aeApiAddEvent(eventLoop, fd, mask) == -1)
@@ -263,10 +266,15 @@ static int64_t usUntilEarliestTimer(aeEventLoop *eventLoop) {
 
     aeTimeEvent *earliest = NULL;
     while (te) {
-        if (!earliest || te->when < earliest->when)
+        if ((!earliest || te->when < earliest->when) && te->id != AE_DELETED_EVENT_ID)
             earliest = te;
         te = te->next;
     }
+
+    /* The list may hold only events marked AE_DELETED_EVENT_ID, leaving no
+     * earliest timer. Mirror the empty-list case above and report "no timer"
+     * instead of dereferencing a NULL earliest. */
+    if (earliest == NULL) return -1;
 
     monotime now = getMonotonicUs();
     return (now >= earliest->when) ? 0 : earliest->when - now;
@@ -329,7 +337,7 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
             processed++;
             now = getMonotonicUs();
             if (retval != AE_NOMORE) {
-                te->when = now + retval * 1000;
+                te->when = now + (monotime)retval * 1000;
             } else {
                 te->id = AE_DELETED_EVENT_ID;
             }
@@ -339,8 +347,8 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
     return processed;
 }
 
-/* Process every pending time event, then every pending file event
- * (that may be registered by time event callbacks just processed).
+/* Process every pending file event, then every pending time event
+ * (that may be registered by file event callbacks just processed).
  * Without special flags the function sleeps until some file event
  * fires, or when the next time event occurs (if any).
  *
@@ -361,47 +369,43 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
     /* Nothing to do? return ASAP */
     if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
 
-    /* Note that we want to call select() even if there are no
+    /* Note that we want to call aeApiPoll() even if there are no
      * file events to process as long as we want to process time
      * events, in order to sleep until the next time event is ready
      * to fire. */
     if (eventLoop->maxfd != -1 ||
         ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
         int j;
-        struct timeval tv, *tvp;
-        int64_t usUntilTimer = -1;
+        struct timeval tv, *tvp = NULL; /* NULL means infinite wait. */
+        int64_t usUntilTimer;
 
-        if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
-            usUntilTimer = usUntilEarliestTimer(eventLoop);
-
-        if (usUntilTimer >= 0) {
-            tv.tv_sec = usUntilTimer / 1000000;
-            tv.tv_usec = usUntilTimer % 1000000;
-            tvp = &tv;
-        } else {
-            /* If we have to check for events but need to return
-             * ASAP because of AE_DONT_WAIT we need to set the timeout
-             * to zero */
-            if (flags & AE_DONT_WAIT) {
-                tv.tv_sec = tv.tv_usec = 0;
-                tvp = &tv;
-            } else {
-                /* Otherwise we can block */
-                tvp = NULL; /* wait forever */
-            }
-        }
-
-        if (eventLoop->flags & AE_DONT_WAIT) {
-            tv.tv_sec = tv.tv_usec = 0;
-            tvp = &tv;
-        }
-
-        if (eventLoop->beforesleep != NULL && flags & AE_CALL_BEFORE_SLEEP)
+        if (eventLoop->beforesleep != NULL && (flags & AE_CALL_BEFORE_SLEEP))
             eventLoop->beforesleep(eventLoop);
 
+        /* The eventLoop->flags may be changed inside beforesleep.
+         * So we should check it after beforesleep be called. At the same time,
+         * the parameter flags always should have the highest priority.
+         * That is to say, once the parameter flag is set to AE_DONT_WAIT,
+         * no matter what value eventLoop->flags is set to, we should ignore it. */
+        if ((flags & AE_DONT_WAIT) || (eventLoop->flags & AE_DONT_WAIT)) {
+            tv.tv_sec = tv.tv_usec = 0;
+            tvp = &tv;
+        } else if (flags & AE_TIME_EVENTS) {
+            usUntilTimer = usUntilEarliestTimer(eventLoop);
+            if (usUntilTimer >= 0) {
+                tv.tv_sec = usUntilTimer / 1000000;
+                tv.tv_usec = usUntilTimer % 1000000;
+                tvp = &tv;
+            }
+        }
         /* Call the multiplexing API, will return only on timeout or when
          * some event fires. */
         numevents = aeApiPoll(eventLoop, tvp);
+
+        /* Don't process file events if not requested. */
+        if (!(flags & AE_FILE_EVENTS)) {
+            numevents = 0;
+        }
 
         /* After sleep callback. */
         if (eventLoop->aftersleep != NULL && flags & AE_CALL_AFTER_SLEEP)

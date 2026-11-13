@@ -13,8 +13,19 @@
 #include <limits.h>
 #include <math.h>
 
+#ifdef __linux__
+#include <arpa/inet.h>
+#include <linux/errqueue.h>
+#include <linux/net_tstamp.h>
+#include <netinet/in.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include "hiredis.h"
 #include "async.h"
+#include "adapters/poll.h"
 #ifdef HIREDIS_TEST_SSL
 #include "hiredis_ssl.h"
 #endif
@@ -34,11 +45,11 @@ enum connection_type {
 
 struct config {
     enum connection_type type;
+    struct timeval connect_timeout;
 
     struct {
         const char *host;
         int port;
-        struct timeval timeout;
     } tcp;
 
     struct {
@@ -74,6 +85,15 @@ static int tests = 0, fails = 0, skips = 0;
 #define test(_s) { printf("#%02d ", ++tests); printf(_s); }
 #define test_cond(_c) if(_c) printf("\033[0;32mPASSED\033[0;0m\n"); else {printf("\033[0;31mFAILED\033[0;0m\n"); fails++;}
 #define test_skipped() { printf("\033[01;33mSKIPPED\033[0;0m\n"); skips++; }
+
+static void millisleep(int ms)
+{
+#ifdef _MSC_VER
+    Sleep(ms);
+#else
+    usleep(ms*1000);
+#endif
+}
 
 static long long usec(void) {
 #ifndef _MSC_VER
@@ -329,8 +349,12 @@ static void test_format_commands(void) {
     FLOAT_WIDTH_TEST(float);
     FLOAT_WIDTH_TEST(double);
 
-    test("Format command with invalid printf format: ");
+    test("Format command with unhandled printf format (specifier 'p' not supported): ");
     len = redisFormatCommand(&cmd,"key:%08p %b",(void*)1234,"foo",(size_t)3);
+    test_cond(len == -1);
+
+    test("Format command with invalid printf format (specifier missing): ");
+    len = redisFormatCommand(&cmd,"%-");
     test_cond(len == -1);
 
     const char *argv[3];
@@ -389,6 +413,25 @@ static void test_append_formatted_commands(struct config config) {
     freeReplyObject(reply);
 
     disconnect(c, 0);
+}
+
+static void test_tcp_options(struct config cfg) {
+    redisContext *c;
+
+    c = do_connect(cfg);
+
+    test("We can enable TCP_KEEPALIVE: ");
+    test_cond(redisEnableKeepAlive(c) == REDIS_OK);
+
+#ifdef TCP_USER_TIMEOUT
+    test("We can set TCP_USER_TIMEOUT: ");
+    test_cond(redisSetTcpUserTimeout(c, 100) == REDIS_OK);
+#else
+    test("Setting TCP_USER_TIMEOUT errors when unsupported: ");
+    test_cond(redisSetTcpUserTimeout(c, 100) == REDIS_ERR && c->err == REDIS_ERR_IO);
+#endif
+
+    redisFree(c);
 }
 
 static void test_reply_reader(void) {
@@ -568,6 +611,19 @@ static void test_reply_reader(void) {
     test_cond(ret == REDIS_ERR && reply == NULL);
     redisReaderFree(reader);
 
+    test("Don't reset state after protocol error(not segfault): ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader,(char*)"*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$", 25);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK);
+    redisReaderFeed(reader,(char*)"3\r\nval\r\n", 8);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK &&
+        ((redisReply*)reply)->type == REDIS_REPLY_ARRAY &&
+        ((redisReply*)reply)->elements == 3);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
     /* Regression test for issue #45 on GitHub. */
     test("Don't do empty allocation for empty multi bulk: ");
     reader = redisReaderCreate();
@@ -637,12 +693,23 @@ static void test_reply_reader(void) {
     freeReplyObject(reply);
     redisReaderFree(reader);
 
-    test("Set error when RESP3 double is NaN: ");
+    test("Correctly parses RESP3 double NaN: ");
     reader = redisReaderCreate();
     redisReaderFeed(reader, ",nan\r\n",6);
     ret = redisReaderGetReply(reader,&reply);
-    test_cond(ret == REDIS_ERR &&
-              strcasecmp(reader->errstr,"Bad double value") == 0);
+    test_cond(ret == REDIS_OK &&
+              ((redisReply*)reply)->type == REDIS_REPLY_DOUBLE &&
+              isnan(((redisReply*)reply)->dval));
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Correctly parses RESP3 double -Nan: ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader, ",-nan\r\n", 7);
+    ret = redisReaderGetReply(reader, &reply);
+    test_cond(ret == REDIS_OK &&
+              ((redisReply*)reply)->type == REDIS_REPLY_DOUBLE &&
+              isnan(((redisReply*)reply)->dval));
     freeReplyObject(reply);
     redisReaderFree(reader);
 
@@ -745,6 +812,20 @@ static void test_reply_reader(void) {
         !strcmp(((redisReply*)reply)->str,"3492890328409238509324850943850943825024385"));
     freeReplyObject(reply);
     redisReaderFree(reader);
+
+    test("Can parse RESP3 doubles in an array: ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader, "*1\r\n,3.14159265358979323846\r\n",31);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK &&
+        ((redisReply*)reply)->type == REDIS_REPLY_ARRAY &&
+        ((redisReply*)reply)->elements == 1 &&
+        ((redisReply*)reply)->element[0]->type == REDIS_REPLY_DOUBLE &&
+        fabs(((redisReply*)reply)->element[0]->dval - 3.14159265358979323846) < 0.00000001 &&
+        ((redisReply*)reply)->element[0]->len == 22 &&
+        strcmp(((redisReply*)reply)->element[0]->str, "3.14159265358979323846") == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
 }
 
 static void test_free_null(void) {
@@ -819,9 +900,9 @@ static void test_allocator_injection(void) {
 
 #define HIREDIS_BAD_DOMAIN "idontexist-noreally.com"
 static void test_blocking_connection_errors(void) {
-    redisContext *c;
     struct addrinfo hints = {.ai_family = AF_INET};
     struct addrinfo *ai_tmp = NULL;
+    redisContext *c;
 
     int rv = getaddrinfo(HIREDIS_BAD_DOMAIN, "6379", &hints, &ai_tmp);
     if (rv != 0) {
@@ -835,6 +916,7 @@ static void test_blocking_connection_errors(void) {
              strcmp(c->errstr, "Can't resolve: " HIREDIS_BAD_DOMAIN) == 0 ||
              strcmp(c->errstr, "Name does not resolve") == 0 ||
              strcmp(c->errstr, "nodename nor servname provided, or not known") == 0 ||
+             strcmp(c->errstr, "node name or service name not known") == 0 ||
              strcmp(c->errstr, "No address associated with hostname") == 0 ||
              strcmp(c->errstr, "Temporary failure in name resolution") == 0 ||
              strcmp(c->errstr, "hostname nor servname provided, or not known") == 0 ||
@@ -847,10 +929,24 @@ static void test_blocking_connection_errors(void) {
     }
 
 #ifndef _WIN32
+    redisOptions opt = {0};
+    struct timeval tv;
+
     test("Returns error when the port is not open: ");
     c = redisConnect((char*)"localhost", 1);
     test_cond(c->err == REDIS_ERR_IO &&
         strcmp(c->errstr,"Connection refused") == 0);
+    redisFree(c);
+
+
+    /* Verify we don't regress from the fix in PR #1180 */
+    test("We don't clobber connection exception with setsockopt error: ");
+    tv = (struct timeval){.tv_sec = 0, .tv_usec = 500000};
+    opt.command_timeout = opt.connect_timeout = &tv;
+    REDIS_OPTIONS_SET_TCP(&opt, "localhost", 10337);
+    c = redisConnectWithOptions(&opt);
+    test_cond(c->err == REDIS_ERR_IO &&
+              strcmp(c->errstr, "Connection refused") == 0);
     redisFree(c);
 
     test("Returns error when the unix_sock socket path doesn't accept connections: ");
@@ -859,6 +955,158 @@ static void test_blocking_connection_errors(void) {
     redisFree(c);
 #endif
 }
+
+#ifdef __linux__
+static uint32_t wait_for_epollerr(int epoll_fd) {
+    struct epoll_event event;
+    int count;
+
+    do {
+        count = epoll_wait(epoll_fd, &event, 1, 2000);
+    } while (count == -1 && errno == EINTR);
+
+    assert(count == 1);
+    assert(event.events & EPOLLERR);
+    return event.events;
+}
+
+static void consume_timestamp_error(redisFD fd) {
+    union {
+        struct cmsghdr align;
+        unsigned char data[512];
+    } control;
+    struct sock_extended_err *socket_error = NULL;
+    struct msghdr message = {0};
+    struct iovec iov;
+    struct cmsghdr *cmsg;
+    char byte;
+
+    iov.iov_base = &byte;
+    iov.iov_len = sizeof(byte);
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data;
+    message.msg_controllen = sizeof(control.data);
+
+    assert(recvmsg(fd, &message, MSG_ERRQUEUE | MSG_DONTWAIT) >= 0);
+    assert(!(message.msg_flags & MSG_CTRUNC));
+    for (cmsg = CMSG_FIRSTHDR(&message); cmsg != NULL;
+         cmsg = CMSG_NXTHDR(&message, cmsg)) {
+        if (cmsg->cmsg_level == SOL_IP && cmsg->cmsg_type == IP_RECVERR) {
+            socket_error = (struct sock_extended_err *)CMSG_DATA(cmsg);
+            break;
+        }
+    }
+    assert(socket_error != NULL);
+    assert(socket_error->ee_origin == SO_EE_ORIGIN_TIMESTAMPING);
+}
+
+static void test_nonblocking_connect_error_queue(void) {
+    const int timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
+                             SOF_TIMESTAMPING_SOFTWARE |
+                             SOF_TIMESTAMPING_OPT_TSONLY;
+    const char pong[] = "+PONG\r\n";
+    struct sockaddr_in address = {0};
+    struct epoll_event event = {0};
+    redisContext *context;
+    redisReply *reply = NULL;
+    socklen_t address_length = sizeof(address);
+    socklen_t option_length;
+    char byte = 'x';
+    int listener_fd;
+    int peer_fd;
+    int epoll_fd;
+    int completed = 0;
+    int option;
+    int count;
+    ssize_t result;
+
+    listener_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(listener_fd != -1);
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    assert(bind(listener_fd, (struct sockaddr *)&address, sizeof(address)) == 0);
+    assert(listen(listener_fd, 1) == 0);
+    assert(getsockname(listener_fd, (struct sockaddr *)&address,
+                       &address_length) == 0);
+
+    context = redisConnectNonBlock("127.0.0.1", ntohs(address.sin_port));
+    assert(context != NULL && context->err == 0);
+    peer_fd = accept(listener_fd, NULL, NULL);
+    assert(peer_fd != -1);
+
+    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    assert(epoll_fd != -1);
+    event.events = EPOLLIN;
+    event.data.fd = context->fd;
+    assert(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, context->fd, &event) == 0);
+    count = setsockopt(context->fd, SOL_SOCKET, SO_TIMESTAMPING,
+                       &timestamping, sizeof(timestamping));
+    if (count == -1 && errno == ENOPROTOOPT) {
+        test("Nonblocking connect error queue (SO_TIMESTAMPING unavailable): ");
+        test_skipped();
+        goto cleanup;
+    }
+    assert(count == 0);
+
+    /* Timestamp records use the same sk_error_queue occupancy predicate as
+     * queued ICMP errors, without requiring raw sockets or a network race. */
+    assert(send(context->fd, &byte, sizeof(byte), 0) == (ssize_t)sizeof(byte));
+    assert(recv(peer_fd, &byte, sizeof(byte), 0) == (ssize_t)sizeof(byte));
+    (void)wait_for_epollerr(epoll_fd);
+    consume_timestamp_error(context->fd);
+    assert(epoll_wait(epoll_fd, &event, 1, 0) == 0);
+
+    assert(send(context->fd, &byte, sizeof(byte), 0) == (ssize_t)sizeof(byte));
+    assert(recv(peer_fd, &byte, sizeof(byte), 0) == (ssize_t)sizeof(byte));
+    (void)wait_for_epollerr(epoll_fd);
+
+    option = 0;
+    assert(setsockopt(context->fd, SOL_SOCKET, SO_TIMESTAMPING,
+                      &option, sizeof(option)) == 0);
+    option_length = sizeof(option);
+    assert(getsockopt(context->fd, IPPROTO_IP, IP_RECVERR,
+                      &option, &option_length) == 0 && option == 0);
+    option_length = sizeof(option);
+    assert(getsockopt(context->fd, SOL_SOCKET, SO_TIMESTAMPING,
+                      &option, &option_length) == 0 && option == 0);
+    option_length = sizeof(option);
+    assert(getsockopt(context->fd, SOL_SOCKET, SO_ERROR,
+                      &option, &option_length) == 0 && option == 0);
+    errno = 0;
+    result = recv(context->fd, &byte, sizeof(byte), MSG_DONTWAIT);
+    assert(result == -1 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    assert(wait_for_epollerr(epoll_fd) & EPOLLERR);
+
+    context->flags |= REDIS_BLOCK;
+    assert(redisCheckConnectDone(context, &completed) == REDIS_OK);
+    context->flags &= ~REDIS_BLOCK;
+    assert(completed == 1);
+    count = epoll_wait(epoll_fd, &event, 1, 0);
+    test("Successful connect drains the error queue in blocking mode: ");
+    test_cond(count == 0);
+
+    assert(send(peer_fd, pong, sizeof(pong) - 1, 0) ==
+           (ssize_t)(sizeof(pong) - 1));
+    do {
+        count = epoll_wait(epoll_fd, &event, 1, 2000);
+    } while (count == -1 && errno == EINTR);
+    assert(count == 1 && (event.events & EPOLLIN));
+    assert(redisBufferRead(context) == REDIS_OK);
+    assert(redisGetReplyFromReader(context, (void **)&reply) == REDIS_OK);
+    test("Connection with a queued error remains usable: ");
+    test_cond(reply != NULL && reply->type == REDIS_REPLY_STATUS &&
+              strcmp(reply->str, "PONG") == 0);
+
+cleanup:
+    freeReplyObject(reply);
+    close(epoll_fd);
+    close(peer_fd);
+    close(listener_fd);
+    redisFree(context);
+}
+#endif
 
 /* Test push handler */
 void push_handler(void *privdata, void *r) {
@@ -914,11 +1162,19 @@ static void test_resp3_push_handler(redisContext *c) {
     old = redisSetPushCallback(c, push_handler);
     test("We can set a custom RESP3 PUSH handler: ");
     reply = redisCommand(c, "SET key:0 val:0");
+    /* We need another command because depending on the version of Redis, the
+     * notification may be delivered after the command's reply. */
+    assert(reply != NULL);
+    freeReplyObject(reply);
+    reply = redisCommand(c, "PING");
     test_cond(reply != NULL && reply->type == REDIS_REPLY_STATUS && pc.str == 1);
     freeReplyObject(reply);
 
     test("We properly handle a NIL invalidation payload: ");
     reply = redisCommand(c, "FLUSHDB");
+    assert(reply != NULL);
+    freeReplyObject(reply);
+    reply = redisCommand(c, "PING");
     test_cond(reply != NULL && reply->type == REDIS_REPLY_STATUS && pc.nil == 1);
     freeReplyObject(reply);
 
@@ -929,6 +1185,12 @@ static void test_resp3_push_handler(redisContext *c) {
     assert((reply = redisCommand(c, "GET key:0")) != NULL);
     freeReplyObject(reply);
     assert((reply = redisCommand(c, "SET key:0 invalid")) != NULL);
+    /* Depending on Redis version, we may receive either push notification or
+     * status reply. Both cases are valid. */
+    if (reply->type == REDIS_REPLY_STATUS) {
+        freeReplyObject(reply);
+        reply = redisCommand(c, "PING");
+    }
     test_cond(reply->type == REDIS_REPLY_PUSH);
     freeReplyObject(reply);
 
@@ -1089,6 +1351,13 @@ static void test_blocking_connection(struct config config) {
               strcasecmp(reply->element[1]->str,"pong") == 0);
     freeReplyObject(reply);
 
+    test("Send command by passing argc/argv: ");
+    const char *argv[3] = {"SET", "foo", "bar"};
+    size_t argvlen[3] = {3, 3, 3};
+    reply = redisCommandArgv(c,3,argv,argvlen);
+    test_cond(reply->type == REDIS_REPLY_STATUS);
+    freeReplyObject(reply);
+
     /* Make sure passing NULL to redisGetReply is safe */
     test("Can pass NULL to redisGetReply: ");
     assert(redisAppendCommand(c, "PING") == REDIS_OK);
@@ -1143,7 +1412,13 @@ static void test_blocking_connection_timeouts(struct config config) {
     test("Does not return a reply when the command times out: ");
     if (detect_debug_sleep(c)) {
         redisAppendFormattedCommand(c, sleep_cmd, strlen(sleep_cmd));
+
+        // flush connection buffer without waiting for the reply
         s = c->funcs->write(c);
+        assert(s == (ssize_t)hi_sdslen(c->obuf));
+        hi_sdsfree(c->obuf);
+        c->obuf = hi_sdsempty();
+
         tv.tv_sec = 0;
         tv.tv_usec = 10000;
         redisSetTimeout(c, tv);
@@ -1156,6 +1431,9 @@ static void test_blocking_connection_timeouts(struct config config) {
                   strcmp(c->errstr, "recv timeout") == 0);
 #endif
         freeReplyObject(reply);
+
+        // wait for the DEBUG SLEEP to complete so that Redis server is unblocked for the following tests
+        millisleep(3000);
     } else {
         test_skipped();
     }
@@ -1226,22 +1504,34 @@ static void test_blocking_io_errors(struct config config) {
 static void test_invalid_timeout_errors(struct config config) {
     redisContext *c;
 
-    test("Set error when an invalid timeout usec value is given to redisConnectWithTimeout: ");
+    test("Set error when an invalid timeout usec value is used during connect: ");
 
-    config.tcp.timeout.tv_sec = 0;
-    config.tcp.timeout.tv_usec = 10000001;
+    config.connect_timeout.tv_sec = 0;
+    config.connect_timeout.tv_usec = 10000001;
 
-    c = redisConnectWithTimeout(config.tcp.host, config.tcp.port, config.tcp.timeout);
+    if (config.type == CONN_TCP || config.type == CONN_SSL) {
+        c = redisConnectWithTimeout(config.tcp.host, config.tcp.port, config.connect_timeout);
+    } else if(config.type == CONN_UNIX) {
+        c = redisConnectUnixWithTimeout(config.unix_sock.path, config.connect_timeout);
+    } else {
+        assert(NULL);
+    }
 
     test_cond(c->err == REDIS_ERR_IO && strcmp(c->errstr, "Invalid timeout specified") == 0);
     redisFree(c);
 
-    test("Set error when an invalid timeout sec value is given to redisConnectWithTimeout: ");
+    test("Set error when an invalid timeout sec value is used during connect: ");
 
-    config.tcp.timeout.tv_sec = (((LONG_MAX) - 999) / 1000) + 1;
-    config.tcp.timeout.tv_usec = 0;
+    config.connect_timeout.tv_sec = (((LONG_MAX) - 999) / 1000) + 1;
+    config.connect_timeout.tv_usec = 0;
 
-    c = redisConnectWithTimeout(config.tcp.host, config.tcp.port, config.tcp.timeout);
+    if (config.type == CONN_TCP || config.type == CONN_SSL) {
+        c = redisConnectWithTimeout(config.tcp.host, config.tcp.port, config.connect_timeout);
+    } else if(config.type == CONN_UNIX) {
+        c = redisConnectUnixWithTimeout(config.unix_sock.path, config.connect_timeout);
+    } else {
+        assert(NULL);
+    }
 
     test_cond(c->err == REDIS_ERR_IO && strcmp(c->errstr, "Invalid timeout specified") == 0);
     redisFree(c);
@@ -1448,6 +1738,9 @@ static void test_throughput(struct config config) {
 // }
 
 #ifdef HIREDIS_TEST_ASYNC
+
+#pragma GCC diagnostic ignored "-Woverlength-strings"   /* required on gcc 4.8.x due to assert statements */
+
 struct event_base *base;
 
 typedef struct TestState {
@@ -1729,10 +2022,14 @@ void subscribe_channel_a_cb(redisAsyncContext *ac, void *r, void *privdata) {
                strcmp(reply->element[2]->str,"Hello!") == 0);
         state->checkpoint++;
 
-        /* Unsubscribe to channels, including a channel X which we don't subscribe to */
+        /* Unsubscribe to channels, including channel X & Z which we don't subscribe to */
         redisAsyncCommand(ac,unexpected_cb,
                           (void*)"unsubscribe should not call unexpected_cb()",
-                          "unsubscribe B X A");
+                          "unsubscribe B X A A Z");
+        /* Unsubscribe to patterns, none which we subscribe to */
+        redisAsyncCommand(ac,unexpected_cb,
+                          (void*)"punsubscribe should not call unexpected_cb()",
+                          "punsubscribe");
         /* Send a regular command after unsubscribing, then disconnect */
         state->disconnect = 1;
         redisAsyncCommand(ac,integer_cb,state,"LPUSH mylist foo");
@@ -1749,6 +2046,7 @@ void subscribe_channel_a_cb(redisAsyncContext *ac, void *r, void *privdata) {
 void subscribe_channel_b_cb(redisAsyncContext *ac, void *r, void *privdata) {
     redisReply *reply = r;
     TestState *state = privdata;
+    (void)ac;
 
     assert(reply != NULL && reply->type == REDIS_REPLY_ARRAY &&
            reply->elements == 3);
@@ -1767,8 +2065,10 @@ void subscribe_channel_b_cb(redisAsyncContext *ac, void *r, void *privdata) {
 
 /* Test handling of multiple channels
  * - subscribe to channel A and B
- * - a published message on A triggers an unsubscribe of channel B, X and A
- *   where channel X is not subscribed to.
+ * - a published message on A triggers an unsubscribe of channel B, X, A and Z
+ *   where channel X and Z are not subscribed to.
+ * - the published message also triggers an unsubscribe to patterns. Since no
+ *   pattern is subscribed to the responded pattern element type is NIL.
  * - a command sent after unsubscribe triggers a disconnect */
 static void test_pubsub_multiple_channels(struct config config) {
     test("Subscribe to multiple channels: ");
@@ -1881,6 +2181,250 @@ static void test_monitor(struct config config) {
 }
 #endif /* HIREDIS_TEST_ASYNC */
 
+/* tests for async api using polling adapter, requires no extra libraries*/
+
+/* enum for the test cases, the callbacks have different logic based on them */
+typedef enum astest_no
+{
+    ASTEST_CONNECT=0,
+    ASTEST_CONN_TIMEOUT,
+    ASTEST_PINGPONG,
+    ASTEST_PINGPONG_TIMEOUT,
+    ASTEST_ISSUE_931,
+    ASTEST_ISSUE_931_PING
+}astest_no;
+
+/* a static context for the async tests */
+struct _astest {
+    redisAsyncContext *ac;
+    astest_no testno;
+    int counter;
+    int connects;
+    int connect_status;
+    int disconnects;
+    int pongs;
+    int disconnect_status;
+    int connected;
+    int err;
+    char errstr[256];
+};
+static struct _astest astest;
+
+/* async callbacks */
+static void asCleanup(void* data)
+{
+    struct _astest *t = (struct _astest *)data;
+    t->ac = NULL;
+}
+
+static void commandCallback(struct redisAsyncContext *ac, void* _reply, void* _privdata);
+
+static void connectCallback(redisAsyncContext *c, int status) {
+    struct _astest *t = (struct _astest *)c->data;
+    assert(t == &astest);
+    assert(t->connects == 0);
+    t->err = c->err;
+    strcpy(t->errstr, c->errstr);
+    t->connects++;
+    t->connect_status = status;
+    t->connected = status == REDIS_OK ? 1 : -1;
+
+    if (t->testno == ASTEST_ISSUE_931) {
+        /* disconnect again */
+        redisAsyncDisconnect(c);
+    }
+    else if (t->testno == ASTEST_ISSUE_931_PING)
+    {
+        redisAsyncCommand(c, commandCallback, NULL, "PING");
+    }
+}
+static void disconnectCallback(const redisAsyncContext *c, int status) {
+    assert(c->data == (void*)&astest);
+    assert(astest.disconnects == 0);
+    astest.err = c->err;
+    strcpy(astest.errstr, c->errstr);
+    astest.disconnects++;
+    astest.disconnect_status = status;
+    astest.connected = 0;
+}
+
+static void commandCallback(struct redisAsyncContext *ac, void* _reply, void* _privdata)
+{
+    redisReply *reply = (redisReply*)_reply;
+    struct _astest *t = (struct _astest *)ac->data;
+    assert(t == &astest);
+    (void)_privdata;
+    t->err = ac->err;
+    strcpy(t->errstr, ac->errstr);
+    t->counter++;
+    if (t->testno == ASTEST_PINGPONG ||t->testno == ASTEST_ISSUE_931_PING)
+    {
+        assert(reply != NULL && reply->type == REDIS_REPLY_STATUS && strcmp(reply->str, "PONG") == 0);
+        t->pongs++;
+        redisAsyncFree(ac);
+    }
+    if (t->testno == ASTEST_PINGPONG_TIMEOUT)
+    {
+        /* two ping pongs */
+        assert(reply != NULL && reply->type == REDIS_REPLY_STATUS && strcmp(reply->str, "PONG") == 0);
+        t->pongs++;
+        if (t->counter == 1) {
+            int status = redisAsyncCommand(ac, commandCallback, NULL, "PING");
+            assert(status == REDIS_OK);
+        } else {
+            redisAsyncFree(ac);
+        }
+    }
+}
+
+static redisAsyncContext *do_aconnect(struct config config, astest_no testno)
+{
+    redisOptions options = {0};
+    memset(&astest, 0, sizeof(astest));
+
+    astest.testno = testno;
+    astest.connect_status = astest.disconnect_status = -2;
+
+    if (config.type == CONN_TCP) {
+        options.type = REDIS_CONN_TCP;
+        options.connect_timeout = &config.connect_timeout;
+        REDIS_OPTIONS_SET_TCP(&options, config.tcp.host, config.tcp.port);
+    } else if (config.type == CONN_SSL) {
+        options.type = REDIS_CONN_TCP;
+        options.connect_timeout = &config.connect_timeout;
+        REDIS_OPTIONS_SET_TCP(&options, config.ssl.host, config.ssl.port);
+    } else if (config.type == CONN_UNIX) {
+        options.type = REDIS_CONN_UNIX;
+        options.endpoint.unix_socket = config.unix_sock.path;
+    } else if (config.type == CONN_FD) {
+        options.type = REDIS_CONN_USERFD;
+        /* Create a dummy connection just to get an fd to inherit */
+        redisContext *dummy_ctx = redisConnectUnix(config.unix_sock.path);
+        if (dummy_ctx) {
+            redisFD fd = disconnect(dummy_ctx, 1);
+            printf("Connecting to inherited fd %d\n", (int)fd);
+            options.endpoint.fd = fd;
+        }
+    }
+    redisAsyncContext *c = redisAsyncConnectWithOptions(&options);
+    assert(c);
+    astest.ac = c;
+    c->data = &astest;
+    c->dataCleanup = asCleanup;
+    redisPollAttach(c);
+    redisAsyncSetConnectCallbackNC(c, connectCallback);
+    redisAsyncSetDisconnectCallback(c, disconnectCallback);
+    return c;
+}
+
+static void as_printerr(void) {
+    printf("Async err %d : %s\n", astest.err, astest.errstr);
+}
+
+#define ASASSERT(e) do { \
+    if (!(e)) \
+        as_printerr(); \
+    assert(e); \
+} while (0);
+
+static void test_async_polling(struct config config) {
+    int status;
+    redisAsyncContext *c;
+    struct config defaultconfig = config;
+
+    test("Async connect: ");
+    c = do_aconnect(config, ASTEST_CONNECT);
+    assert(c);
+    while(astest.connected == 0)
+        redisPollTick(c, 0.1);
+    assert(astest.connects == 1);
+    ASASSERT(astest.connect_status == REDIS_OK);
+    assert(astest.disconnects == 0);
+    test_cond(astest.connected == 1);
+
+    test("Async free after connect: ");
+    assert(astest.ac != NULL);
+    redisAsyncFree(c);
+    assert(astest.disconnects == 1);
+    assert(astest.ac == NULL);
+    test_cond(astest.disconnect_status == REDIS_OK);
+
+    if (config.type == CONN_TCP || config.type == CONN_SSL) {
+        /* timeout can only be simulated with network */
+        test("Async connect timeout: ");
+        config.tcp.host = "192.168.254.254";  /* blackhole ip */
+        config.connect_timeout.tv_usec = 100000;
+        c = do_aconnect(config, ASTEST_CONN_TIMEOUT);
+        assert(c);
+        assert(c->err == 0);
+        while(astest.connected == 0)
+            redisPollTick(c, 0.1);
+        assert(astest.connected == -1);
+        /*
+         * freeing should not be done, clearing should have happened.
+         *redisAsyncFree(c);
+         */
+        assert(astest.ac == NULL);
+        test_cond(astest.connect_status == REDIS_ERR);
+        config = defaultconfig;
+    }
+
+    /* Test a ping/pong after connection */
+    test("Async PING/PONG: ");
+    c = do_aconnect(config, ASTEST_PINGPONG);
+    while(astest.connected == 0)
+        redisPollTick(c, 0.1);
+    status = redisAsyncCommand(c, commandCallback, NULL, "PING");
+    assert(status == REDIS_OK);
+    while(astest.ac)
+        redisPollTick(c, 0.1);
+    test_cond(astest.pongs == 1);
+
+    /* Test a ping/pong after connection that didn't time out.
+     * see https://github.com/redis/hiredis/issues/945
+     */
+    if (config.type == CONN_TCP || config.type == CONN_SSL) {
+        test("Async PING/PONG after connect timeout: ");
+        config.connect_timeout.tv_usec = 10000; /* 10ms  */
+        c = do_aconnect(config, ASTEST_PINGPONG_TIMEOUT);
+        while(astest.connected == 0)
+            redisPollTick(c, 0.1);
+        /* sleep 0.1 s, allowing old timeout to arrive */
+        millisleep(10);
+        status = redisAsyncCommand(c, commandCallback, NULL, "PING");
+        assert(status == REDIS_OK);
+        while(astest.ac)
+            redisPollTick(c, 0.1);
+        test_cond(astest.pongs == 2);
+        config = defaultconfig;
+    }
+
+    /* Test disconnect from an on_connect callback
+     * see https://github.com/redis/hiredis/issues/931
+     */
+    test("Disconnect from onConnected callback (Issue #931): ");
+    c = do_aconnect(config, ASTEST_ISSUE_931);
+    while(astest.disconnects == 0)
+        redisPollTick(c, 0.1);
+    assert(astest.connected == 0);
+    assert(astest.connects == 1);
+    test_cond(astest.disconnects == 1);
+
+    /* Test ping/pong from an on_connect callback
+     * see https://github.com/redis/hiredis/issues/931
+     */
+    test("Ping/Pong from onConnected callback (Issue #931): ");
+    c = do_aconnect(config, ASTEST_ISSUE_931_PING);
+    /* connect callback issues ping, reponse callback destroys context */
+    while(astest.ac)
+        redisPollTick(c, 0.1);
+    assert(astest.connected == 0);
+    assert(astest.connects == 1);
+    assert(astest.disconnects == 1);
+    test_cond(astest.pongs == 1);
+}
+/* End of Async polling_adapter driven tests */
+
 int main(int argc, char **argv) {
     struct config cfg = {
         .tcp = {
@@ -1955,6 +2499,9 @@ int main(int argc, char **argv) {
     test_reply_reader();
     test_blocking_connection_errors();
     test_free_null();
+#ifdef __linux__
+    test_nonblocking_connect_error_queue();
+#endif
 
     printf("\nTesting against TCP connection (%s:%d):\n", cfg.tcp.host, cfg.tcp.port);
     cfg.type = CONN_TCP;
@@ -1963,6 +2510,7 @@ int main(int argc, char **argv) {
     test_blocking_io_errors(cfg);
     test_invalid_timeout_errors(cfg);
     test_append_formatted_commands(cfg);
+    test_tcp_options(cfg);
     if (throughput) test_throughput(cfg);
 
     printf("\nTesting against Unix socket connection (%s): ", cfg.unix_sock.path);
@@ -1972,6 +2520,7 @@ int main(int argc, char **argv) {
         test_blocking_connection(cfg);
         test_blocking_connection_timeouts(cfg);
         test_blocking_io_errors(cfg);
+        test_invalid_timeout_errors(cfg);
         if (throughput) test_throughput(cfg);
     } else {
         test_skipped();
@@ -2000,6 +2549,7 @@ int main(int argc, char **argv) {
 #endif
 
 #ifdef HIREDIS_TEST_ASYNC
+    cfg.type = CONN_TCP;
     printf("\nTesting asynchronous API against TCP connection (%s:%d):\n", cfg.tcp.host, cfg.tcp.port);
     cfg.type = CONN_TCP;
 
@@ -2016,6 +2566,15 @@ int main(int argc, char **argv) {
         test_command_timeout_during_pubsub(cfg);
     }
 #endif /* HIREDIS_TEST_ASYNC */
+
+    cfg.type = CONN_TCP;
+    printf("\nTesting asynchronous API using polling_adapter TCP (%s:%d):\n", cfg.tcp.host, cfg.tcp.port);
+    test_async_polling(cfg);
+    if (test_unix_socket) {
+        cfg.type = CONN_UNIX;
+        printf("\nTesting asynchronous API using polling_adapter UNIX (%s):\n", cfg.unix_sock.path);
+        test_async_polling(cfg);
+    }
 
     if (test_inherit_fd) {
         printf("\nTesting against inherited fd (%s): ", cfg.unix_sock.path);

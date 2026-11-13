@@ -117,7 +117,9 @@ mp_buf *mp_buf_new(lua_State *L) {
 
 void mp_buf_append(lua_State *L, mp_buf *buf, const unsigned char *s, size_t len) {
     if (buf->free < len) {
-        size_t newsize = (buf->len+len)*2;
+        size_t newsize = buf->len+len;
+        if (newsize < buf->len || newsize >= SIZE_MAX/2) abort();
+        newsize *= 2;
 
         buf->b = (unsigned char*)mp_realloc(L, buf->b, buf->len + buf->free, newsize);
         buf->free = newsize - buf->len;
@@ -173,7 +175,7 @@ void mp_cur_init(mp_cur *cursor, const unsigned char *s, size_t len) {
 
 void mp_encode_bytes(lua_State *L, mp_buf *buf, const unsigned char *s, size_t len) {
     unsigned char hdr[5];
-    int hdrlen;
+    size_t hdrlen;
 
     if (len < 32) {
         hdr[0] = 0xa0 | (len&0xff); /* fix raw */
@@ -220,7 +222,7 @@ void mp_encode_double(lua_State *L, mp_buf *buf, double d) {
 
 void mp_encode_int(lua_State *L, mp_buf *buf, int64_t n) {
     unsigned char b[9];
-    int enclen;
+    size_t enclen;
 
     if (n >= 0) {
         if (n <= 127) {
@@ -290,9 +292,9 @@ void mp_encode_int(lua_State *L, mp_buf *buf, int64_t n) {
     mp_buf_append(L,buf,b,enclen);
 }
 
-void mp_encode_array(lua_State *L, mp_buf *buf, int64_t n) {
+void mp_encode_array(lua_State *L, mp_buf *buf, uint64_t n) {
     unsigned char b[5];
-    int enclen;
+    size_t enclen;
 
     if (n <= 15) {
         b[0] = 0x90 | (n & 0xf);    /* fix array */
@@ -313,7 +315,7 @@ void mp_encode_array(lua_State *L, mp_buf *buf, int64_t n) {
     mp_buf_append(L,buf,b,enclen);
 }
 
-void mp_encode_map(lua_State *L, mp_buf *buf, int64_t n) {
+void mp_encode_map(lua_State *L, mp_buf *buf, uint64_t n) {
     unsigned char b[5];
     int enclen;
 
@@ -626,10 +628,10 @@ void mp_decode_to_lua_type(lua_State *L, mp_cur *c) {
     case 0xd2:  /* int 32 */
         mp_cur_need(c,5);
         lua_pushinteger(L,
-            ((int32_t)c->p[1] << 24) |
-            ((int32_t)c->p[2] << 16) |
-            ((int32_t)c->p[3] << 8) |
-             (int32_t)c->p[4]);
+            (int32_t)(((uint32_t)c->p[1] << 24) |
+                      ((uint32_t)c->p[2] << 16) |
+                      ((uint32_t)c->p[3] << 8) |
+                       (uint32_t)c->p[4]));
         mp_cur_consume(c,5);
         break;
     case 0xcf:  /* uint 64 */
@@ -652,14 +654,14 @@ void mp_decode_to_lua_type(lua_State *L, mp_cur *c) {
 #else
         lua_pushinteger(L,
 #endif
-            ((int64_t)c->p[1] << 56) |
-            ((int64_t)c->p[2] << 48) |
-            ((int64_t)c->p[3] << 40) |
-            ((int64_t)c->p[4] << 32) |
-            ((int64_t)c->p[5] << 24) |
-            ((int64_t)c->p[6] << 16) |
-            ((int64_t)c->p[7] << 8) |
-             (int64_t)c->p[8]);
+            (int64_t)(((uint64_t)c->p[1] << 56) |
+                      ((uint64_t)c->p[2] << 48) |
+                      ((uint64_t)c->p[3] << 40) |
+                      ((uint64_t)c->p[4] << 32) |
+                      ((uint64_t)c->p[5] << 24) |
+                      ((uint64_t)c->p[6] << 16) |
+                      ((uint64_t)c->p[7] << 8) |
+                       (uint64_t)c->p[8]));
         mp_cur_consume(c,9);
         break;
     case 0xc0:  /* nil */
@@ -791,7 +793,7 @@ void mp_decode_to_lua_type(lua_State *L, mp_cur *c) {
     }
 }
 
-int mp_unpack_full(lua_State *L, int limit, int offset) {
+int mp_unpack_full(lua_State *L, lua_Integer limit, lua_Integer offset) {
     size_t len;
     const char *s;
     mp_cur c;
@@ -803,10 +805,10 @@ int mp_unpack_full(lua_State *L, int limit, int offset) {
     if (offset < 0 || limit < 0) /* requesting negative off or lim is invalid */
         return luaL_error(L,
             "Invalid request to unpack with offset of %d and limit of %d.",
-            offset, len);
+            (int) offset, (int) len);
     else if (offset > len)
         return luaL_error(L,
-            "Start offset %d greater than input length %d.", offset, len);
+            "Start offset %d greater than input length %d.", (int) offset, (int) len);
 
     if (decode_all) limit = INT_MAX;
 
@@ -828,12 +830,13 @@ int mp_unpack_full(lua_State *L, int limit, int offset) {
         /* c->left is the remaining size of the input buffer.
          * subtract the entire buffer size from the unprocessed size
          * to get our next start offset */
-        int offset = len - c.left;
+        size_t new_offset = len - c.left;
+        if (new_offset > LONG_MAX) abort();
 
         luaL_checkstack(L, 1, "in function mp_unpack_full");
 
         /* Return offset -1 when we have have processed the entire buffer. */
-        lua_pushinteger(L, c.left == 0 ? -1 : offset);
+        lua_pushinteger(L, c.left == 0 ? -1 : (lua_Integer) new_offset);
         /* Results are returned with the arg elements still
          * in place. Lua takes care of only returning
          * elements above the args for us.
@@ -852,15 +855,15 @@ int mp_unpack(lua_State *L) {
 }
 
 int mp_unpack_one(lua_State *L) {
-    int offset = luaL_optinteger(L, 2, 0);
+    lua_Integer offset = luaL_optinteger(L, 2, 0);
     /* Variable pop because offset may not exist */
     lua_pop(L, lua_gettop(L)-1);
     return mp_unpack_full(L, 1, offset);
 }
 
 int mp_unpack_limit(lua_State *L) {
-    int limit = luaL_checkinteger(L, 2);
-    int offset = luaL_optinteger(L, 3, 0);
+    lua_Integer limit = luaL_checkinteger(L, 2);
+    lua_Integer offset = luaL_optinteger(L, 3, 0);
     /* Variable pop because offset may not exist */
     lua_pop(L, lua_gettop(L)-1);
 

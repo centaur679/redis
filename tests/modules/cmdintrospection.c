@@ -23,7 +23,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     RedisModuleCommandInfo info = {
         .version = REDISMODULE_COMMAND_INFO_VERSION,
         .arity = -5,
-        .summary = "Appends a new entry to a stream",
+        .summary = "Appends a new message to a stream. Creates the key if it doesn't exist.",
         .since = "5.0.0",
         .complexity = "O(1) when adding a new entry, O(N) when trimming where N being the number of entries evicted.",
         .tips = "nondeterministic_output",
@@ -34,6 +34,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
              * XADD). */
             {"6.2.0", "Added the `NOMKSTREAM` option, `MINID` trimming strategy and the `LIMIT` option."},
             {"7.0.0", "Added support for the `<ms>-*` explicit ID form."},
+            {"8.2.0", "Added the `KEEPREF`, `DELREF` and `ACKED` options."},
             {0}
         },
         .key_specs = (RedisModuleCommandKeySpec[]){
@@ -59,6 +60,59 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
                 .token = "NOMKSTREAM",
                 .since = "6.2.0",
                 .flags = REDISMODULE_CMD_ARG_OPTIONAL
+            },
+            {
+                .name = "condition",
+                .type = REDISMODULE_ARG_TYPE_ONEOF,
+                .flags = REDISMODULE_CMD_ARG_OPTIONAL,
+                .subargs = (RedisModuleCommandArg[]){
+                    {
+                        .name = "keepref",
+                        .type = REDISMODULE_ARG_TYPE_PURE_TOKEN,
+                        .token = "KEEPREF"
+                    },
+                    {
+                        .name = "delref",
+                        .type = REDISMODULE_ARG_TYPE_PURE_TOKEN,
+                        .token = "DELREF"
+                    },
+                    {
+                        .name = "acked",
+                        .type = REDISMODULE_ARG_TYPE_PURE_TOKEN,
+                        .token = "ACKED"
+                    },
+                    {0}
+                }
+            },
+            {
+                .name = "idmp",
+                .type = REDISMODULE_ARG_TYPE_ONEOF,
+                .since = "8.6.0",
+                .flags = REDISMODULE_CMD_ARG_OPTIONAL,
+                .subargs = (RedisModuleCommandArg[]){
+                    {
+                        .name = "pid",
+                        .type = REDISMODULE_ARG_TYPE_STRING,
+                        .token = "IDMPAUTO"
+                    },
+                    {
+                        .name = "idmp",
+                        .type = REDISMODULE_ARG_TYPE_BLOCK,
+                        .token = "IDMP",
+                        .subargs = (RedisModuleCommandArg[]){
+                            {
+                                .name = "pid",
+                                .type = REDISMODULE_ARG_TYPE_STRING,
+                            },
+                            {
+                                .name = "iid",
+                                .type = REDISMODULE_ARG_TYPE_STRING,
+                            },
+                            {0}
+                        }
+                    },
+                    {0}
+                }
             },
             {
                 .name = "trim",

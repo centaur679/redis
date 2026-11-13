@@ -1,12 +1,18 @@
 {
     "ZUNION": {
-        "summary": "Add multiple sorted sets",
+        "summary": "Returns the union of multiple sorted sets.",
         "complexity": "O(N)+O(M*log(M)) with N being the sum of the sizes of the input sorted sets, and M being the number of elements in the resulting sorted set.",
         "group": "sorted_set",
         "since": "6.2.0",
         "arity": -3,
         "function": "zunionCommand",
         "get_keys_function": "zunionInterDiffGetKeys",
+        "history": [
+            [
+                "8.8.0",
+                "Added `COUNT` aggregate option."
+            ]
+        ],
         "command_flags": [
             "READONLY"
         ],
@@ -33,6 +39,36 @@
                 }
             }
         ],
+        "reply_schema": {
+            "anyOf": [
+                {
+                    "description": "The result of union when 'WITHSCORES' is not used.",
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                {
+                    "description": "The result of union when 'WITHSCORES' is used.",
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "number"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
         "arguments": [
             {
                 "name": "numkeys",
@@ -71,6 +107,12 @@
                         "name": "max",
                         "type": "pure-token",
                         "token": "MAX"
+                    },
+                    {
+                        "name": "count",
+                        "type": "pure-token",
+                        "token": "COUNT",
+                        "since": "8.8.0"
                     }
                 ]
             },

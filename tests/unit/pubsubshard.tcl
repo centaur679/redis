@@ -40,12 +40,17 @@ start_server {tags {"pubsubshard external:skip"}} {
         $rd2 close
     }
 
-    test "PUBLISH/SUBSCRIBE after UNSUBSCRIBE without arguments" {
+    test "SPUBLISH/SSUBSCRIBE after UNSUBSCRIBE without arguments" {
         set rd1 [redis_deferring_client]
         assert_equal {1} [ssubscribe $rd1 {chan1}]
         assert_equal {2} [ssubscribe $rd1 {chan2}]
         assert_equal {3} [ssubscribe $rd1 {chan3}]
         sunsubscribe $rd1
+        wait_for_condition 100 10 {
+            [regexp {cmd=sunsubscribe} [r client list]] eq 1
+        } else {
+            fail "sunsubscribe did not arrive"
+        }
         assert_equal 0 [r SPUBLISH chan1 hello]
         assert_equal 0 [r SPUBLISH chan2 hello]
         assert_equal 0 [r SPUBLISH chan3 hello]
@@ -54,7 +59,7 @@ start_server {tags {"pubsubshard external:skip"}} {
         $rd1 close
     }
 
-    test "SUBSCRIBE to one channel more than once" {
+    test "SSUBSCRIBE to one channel more than once" {
         set rd1 [redis_deferring_client]
         assert_equal {1 1 1} [ssubscribe $rd1 {chan1 chan1 chan1}]
         assert_equal 1 [r SPUBLISH chan1 hello]
@@ -64,7 +69,7 @@ start_server {tags {"pubsubshard external:skip"}} {
         $rd1 close
     }
 
-    test "UNSUBSCRIBE from non-subscribed channels" {
+    test "SUNSUBSCRIBE from non-subscribed channels" {
         set rd1 [redis_deferring_client]
         assert_equal {0} [sunsubscribe $rd1 {foo}]
         assert_equal {0} [sunsubscribe $rd1 {bar}]
@@ -105,6 +110,33 @@ start_server {tags {"pubsubshard external:skip"}} {
         assert_equal "chan1 1" [r pubsub numsub chan1]
         assert_equal "chan1" [r pubsub shardchannels]
         assert_equal "chan1" [r pubsub channels]
+
+        $rd1 close
+        $rd2 close
+    }
+
+    test "PubSubShard with CLIENT REPLY OFF" {
+        set rd [redis_deferring_client]
+        $rd hello 3
+        $rd read ;# Discard the hello reply
+
+        # Test that the ssubscribe notification is ok
+        $rd client reply off
+        $rd ping
+        assert_equal {1} [ssubscribe $rd channel]
+
+        # Test that the spublish notification is ok
+        $rd client reply off
+        $rd ping
+        assert_equal 1 [r spublish channel hello]
+        assert_equal {smessage channel hello} [$rd read]
+
+        # Test that sunsubscribe notification is ok
+        $rd client reply off
+        $rd ping
+        assert_equal {0} [sunsubscribe $rd channel]
+
+        $rd close
     }
 }
 

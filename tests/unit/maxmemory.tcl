@@ -1,4 +1,17 @@
 start_server {tags {"maxmemory" "external:skip"}} {
+
+    test {SET and RESTORE key nearly as large as the memory limit} {
+        r flushall
+        set used [s used_memory]
+        r config set maxmemory [expr {$used+10000000}]
+        r set foo [string repeat a 8000000]
+        set encoded [r dump foo]
+        r del foo
+        r restore foo 0 $encoded
+        r strlen foo
+    } {8000000} {logreqres:skip}
+
+    r flushall
     r config set maxmemory 11mb
     r config set maxmemory-policy allkeys-lru
     set server_pid [s process_id]
@@ -15,11 +28,11 @@ start_server {tags {"maxmemory" "external:skip"}} {
         }
 
         r config resetstat
-        # fill 5mb using 50 keys of 100kb
-        for {set j 0} {$j < 50} {incr j} {
-            r setrange $j 100000 x
+        # fill 5mb using 500 keys of 10kb
+        for {set j 0} {$j < 500} {incr j} {
+            r setrange key$j 10000 x
         }
-        assert_equal [r dbsize] 50
+        assert_equal [r dbsize] 500
     }
     
     # Return true if the eviction occurred (client or key) based on argument
@@ -29,9 +42,13 @@ start_server {tags {"maxmemory" "external:skip"}} {
         set dbsize [r dbsize]
         
         if $client_eviction {
-            return [expr $evicted_clients > 0 && $evicted_keys == 0 && $dbsize == 50]
+            if {[lindex [r config get io-threads] 1] == 1} {
+                return [expr $evicted_clients > 0 && $evicted_keys == 0 && $dbsize == 500]
+            } else {
+                return [expr $evicted_clients >= 0 && $evicted_keys >= 0 && $dbsize <= 500]
+            }
         } else {
-            return [expr $evicted_clients == 0 && $evicted_keys > 0 && $dbsize < 50]
+            return [expr $evicted_clients == 0 && $evicted_keys > 0 && $dbsize < 500]
         }
     }
 
@@ -66,7 +83,7 @@ start_server {tags {"maxmemory" "external:skip"}} {
             while {![check_eviction_test $client_eviction] && [expr [clock seconds] - $t] < 20} {
                 foreach rr $clients {
                     if {[catch {
-                        $rr mget 1
+                        $rr mget key1 key2 key3 key4 key5 key6 key7 key8 key9 key10
                         $rr flush
                     } err]} {
                         lremove clients $rr
@@ -144,32 +161,9 @@ start_server {tags {"maxmemory" "external:skip"}} {
 }
 
 start_server {tags {"maxmemory external:skip"}} {
-    test "Without maxmemory small integers are shared" {
-        r config set maxmemory 0
-        r set a 1
-        assert {[r object refcount a] > 1}
-    }
-
-    test "With maxmemory and non-LRU policy integers are still shared" {
-        r config set maxmemory 1073741824
-        r config set maxmemory-policy allkeys-random
-        r set a 1
-        assert {[r object refcount a] > 1}
-    }
-
-    test "With maxmemory and LRU policy integers are not shared" {
-        r config set maxmemory 1073741824
-        r config set maxmemory-policy allkeys-lru
-        r set a 1
-        r config set maxmemory-policy volatile-lru
-        r set b 1
-        assert {[r object refcount a] == 1}
-        assert {[r object refcount b] == 1}
-        r config set maxmemory 0
-    }
 
     foreach policy {
-        allkeys-random allkeys-lru allkeys-lfu volatile-lru volatile-lfu volatile-random volatile-ttl
+        allkeys-random allkeys-lru allkeys-lfu allkeys-lrm volatile-lru volatile-lfu volatile-random volatile-ttl volatile-lrm
     } {
         test "maxmemory - is the memory limit honoured? (policy $policy)" {
             # make sure to start with a blank instance
@@ -201,7 +195,7 @@ start_server {tags {"maxmemory external:skip"}} {
     }
 
     foreach policy {
-        allkeys-random allkeys-lru volatile-lru volatile-random volatile-ttl
+        allkeys-random allkeys-lru allkeys-lrm volatile-lru volatile-random volatile-ttl volatile-lrm
     } {
         test "maxmemory - only allkeys-* should remove non-volatile keys ($policy)" {
             # make sure to start with a blank instance
@@ -243,7 +237,7 @@ start_server {tags {"maxmemory external:skip"}} {
     }
 
     foreach policy {
-        volatile-lru volatile-lfu volatile-random volatile-ttl
+        volatile-lru volatile-lfu volatile-random volatile-ttl volatile-lrm
     } {
         test "maxmemory - policy $policy should only remove volatile keys." {
             # make sure to start with a blank instance
@@ -350,15 +344,28 @@ proc test_slave_buffers {test_name cmd_count payload_len limit_memory pipeline} 
 
             # put the slave to sleep
             set rd_slave [redis_deferring_client]
-            exec kill -SIGSTOP $slave_pid
+            pause_process $slave_pid
 
             # send some 10mb worth of commands that don't increase the memory usage
             if {$pipeline == 1} {
                 set rd_master [redis_deferring_client -1]
+                # Send commands in batches and read responses to avoid TCP deadlock.
+                # Without interleaving reads, the client's send buffer fills up when
+                # the server's output buffers are full (because we're not reading),
+                # causing flush to block indefinitely on slow machines.
+                set batch_size 10000
                 for {set k 0} {$k < $cmd_count} {incr k} {
                     $rd_master setrange key:0 0 [string repeat A $payload_len]
+                    if {($k + 1) % $batch_size == 0} {
+                        # Drain responses to prevent TCP buffer deadlock
+                        for {set j 0} {$j < $batch_size} {incr j} {
+                            $rd_master read
+                        }
+                    }
                 }
-                for {set k 0} {$k < $cmd_count} {incr k} {
+                # Read any remaining responses
+                set remaining [expr {$cmd_count % $batch_size}]
+                for {set k 0} {$k < $remaining} {incr k} {
                     $rd_master read
                 }
             } else {
@@ -399,7 +406,7 @@ proc test_slave_buffers {test_name cmd_count payload_len limit_memory pipeline} 
 
         }
         # unfreeze slave process (after the 'test' succeeded or failed, but before we attempt to terminate the server
-        exec kill -SIGCONT $slave_pid
+        resume_process $slave_pid
         }
     }
 }
@@ -421,11 +428,16 @@ start_server {tags {"maxmemory external:skip"}} {
         r config set maxmemory-policy allkeys-random
 
         # Next rehash size is 8192, that will eat 64k memory
-        populate 4096 "" 1
+        populate 4095 "" 1
 
         set used [s used_memory]
         set limit [expr {$used + 10*1024}]
         r config set maxmemory $limit
+
+        # Adding a key to meet the 1:1 radio.
+        r set k0 v0
+        # The dict has reached 4096, it can be resized in tryResizeHashTables in cron,
+        # or we add a key to let it check whether it can be resized.
         r set k1 v1
         # Next writing command will trigger evicting some keys if last
         # command trigger DB dict rehash
@@ -441,6 +453,12 @@ start_server {tags {"maxmemory external:skip"}} {
         r config set maxmemory 0
         r config set maxmemory-policy allkeys-lru
         r config set maxmemory-eviction-tenacity 100
+
+        # check if enabling multithreaded IO
+        set multithreaded 0
+        if {[r config get io-threads] > 1} {
+            set multithreaded 1
+        }
 
         # 10 clients listening on tracking messages
         set clients {}
@@ -478,6 +496,15 @@ start_server {tags {"maxmemory external:skip"}} {
         set used [s used_memory]
         set limit [expr {$used - 40000}]
         r config set maxmemory $limit
+
+        # If multithreaded, we need to let IO threads have chance to reply output
+        # buffer, to avoid next commands causing eviction. After eviction is performed,
+        # the next command becomes ready immediately in IO threads, and now we enqueue
+        # the client to be processed in main thread’s beforeSleep without notification.
+        # However, invalidation messages generated by eviction may not have been fully
+        # delivered by that time. As a result, executing the command in beforeSleep of
+        # the event loop (running eviction) can cause additional keys to be evicted.
+        if $multithreaded { after 200 }
 
         # make sure some eviction happened
         set evicted [s evicted_keys]
@@ -569,5 +596,113 @@ start_server {tags {"maxmemory" "external:skip"}} {
 
         r config set maxmemory 0
         r config set maxmemory-policy noeviction
+    }
+}
+
+start_server {tags {"maxmemory" "external:skip"}} {
+    test {lru/lfu value of the key just added} {
+        r config set maxmemory-policy allkeys-lru
+        r set foo a
+        assert {[r object idletime foo] <= 2}
+        r del foo
+        r set foo 1
+        r get foo
+        assert {[r object idletime foo] <= 2}
+
+        r config set maxmemory-policy allkeys-lfu
+        r del foo 
+        r set foo a
+        assert {[r object freq foo] == 5}
+    }
+}
+
+# LRM eviction policy tests
+start_server {tags {"maxmemory" "external:skip"}} {
+    test {LRM: Basic write updates idle time} {
+        r flushdb
+        r config set maxmemory-policy allkeys-lrm
+
+        r set foo a
+        after 2000
+
+        # Read the key should NOT update LRM
+        r get foo
+        assert_morethan_equal [r object idletime foo] 1
+
+        # LRM should be updated (idletime should be smaller)
+        r set foo b
+        assert_lessthan_equal [r object idletime foo] 1
+    } {} {slow}
+
+    test {LRM: RENAME updates destination key LRM} {
+        r flushdb
+        r set src value
+        after 2000
+        r rename src dst
+        assert_lessthan_equal [r object idletime dst] 1
+    } {} {slow}
+
+    test {LRM: XREADGROUP updates stream LRM} {
+        r flushdb
+        r xadd mystream * field value
+        r xgroup create mystream mygroup 0
+        after 2000
+        r xreadgroup GROUP mygroup consumer1 STREAMS mystream >
+
+        # LRM should be updated (idletime should be smaller)
+        assert_lessthan_equal [r object idletime mystream] 1
+    } {} {slow}
+
+    test {LRM: Keys with only read operations should be removed first} {
+        r flushdb
+        r config set maxmemory 0
+        r config set maxmemory-policy allkeys-lrm
+        r config set maxmemory-samples 64 ;# Ensure eviction sampling can pick all keys
+
+        # Create keys and populate them
+        # We'll create two groups of keys:
+        # - read-only keys: will only be read after creation
+        # - write keys: will be continuously written to
+        for {set j 0} {$j < 25} {incr j} {
+            r set "read:$j" [string repeat x 20000]
+            r set "write:$j" [string repeat x 20000]
+        }
+
+        after 1000
+
+        # Perform read and write operations on keys
+        for {set j 0} {$j < 25} {incr j} {
+            r get "read:$j"
+            r set "write:$j" [string repeat y 20000]
+        }
+
+        # Set memory limit to force eviction
+        set used [s used_memory]
+        set limit [expr {$used - 200*1024}]
+        r config set maxmemory $limit
+
+        # Add more keys to trigger eviction
+        for {set j 0} {$j < 10} {incr j} {
+            r set "trigger:$j" [string repeat z 20000]
+        }
+
+        # Count how many keys from each group survived
+        set read_survived 0
+        set write_survived 0
+        for {set j 0} {$j < 25} {incr j} {
+            if {[r exists "read:$j"]} {
+                incr read_survived
+            }
+            if {[r exists "write:$j"]} {
+                incr write_survived
+            }
+        }
+
+        # If read-only keys haven't been fully evicted, write keys must not be evicted at all. */
+        if {$read_survived > 0} {
+            assert {$write_survived == 25}
+        } else {
+            assert {$write_survived > $read_survived}
+        }
     }
 }

@@ -1,30 +1,10 @@
 /*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #ifndef __REDIS_UTIL_H
@@ -57,6 +37,8 @@ typedef enum {
     LD_STR_HEX       /* %La */
 } ld2string_mode;
 
+int prefixmatch(const char *pattern, int patternLen, const char *prefixStr, 
+                int prefixStrLen, int nocase);
 int stringmatchlen(const char *p, int plen, const char *s, int slen, int nocase);
 int stringmatch(const char *p, const char *s, int nocase);
 int stringmatchlen_fuzz_test(void);
@@ -70,25 +52,86 @@ int ull2string(char *s, size_t len, unsigned long long value);
 int string2ll(const char *s, size_t slen, long long *value);
 int string2ull(const char *s, unsigned long long *value);
 int string2l(const char *s, size_t slen, long *value);
+int string2ul_base16_async_signal_safe(const char *src, size_t slen, unsigned long *result_output);
 int string2ld(const char *s, size_t slen, long double *dp);
 int string2d(const char *s, size_t slen, double *dp);
 int trimDoubleString(char *buf, size_t len);
 int d2string(char *buf, size_t len, double value);
+int fixedpoint_d2string(char *dst, size_t dstlen, double dvalue, int fractional_digits);
 int ld2string(char *buf, size_t len, long double value, ld2string_mode mode);
 int double2ll(double d, long long *out);
 int yesnotoi(char *s);
 sds getAbsolutePath(char *filename);
 long getTimeZone(void);
 int pathIsBaseName(char *path);
+char *getFileExtension(char *path);
+char *getFileBaseName(char *path);
+sds getFilePath(char *path);
 int dirCreateIfMissing(char *dname);
 int dirExists(char *dname);
+int dirIsEmpty(char *dname);
 int dirRemove(char *dname);
 int fileExist(char *filename);
 sds makePath(char *path, char *filename);
+int copyFile(char *source, char *destination);
 int fsyncFileDir(const char *filename);
-
+int reclaimFilePageCache(int fd, size_t offset, size_t length);
+char *fgets_async_signal_safe(char *dest, int buff_size, int fd);
+int vsnprintf_async_signal_safe(char *to, size_t size, const char *format, va_list ap);
+#ifdef __GNUC__
+int snprintf_async_signal_safe(char *to, size_t n, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+#else
+int snprintf_async_signal_safe(char *to, size_t n, const char *fmt, ...);
+#endif
 size_t redis_strlcpy(char *dst, const char *src, size_t dsize);
 size_t redis_strlcat(char *dst, const char *src, size_t dsize);
+
+/* to keep it opt without conditions Works only for: 0 < x < 2^63 */
+static inline int log2ceil(size_t x) {
+#if UINTPTR_MAX == 0xffffffffffffffff
+    return  63 - __builtin_clzll(x);
+#else
+    return 31 - __builtin_clz(x);
+#endif
+}
+
+/* Return the smallest power of 2 >= count (e.g. 5 -> 8, 8 -> 8). */
+static inline int nearestNextPowerOf2(unsigned int count) {
+    if (count <= 1) return 1;
+    return 1 << (32 - __builtin_clz(count-1));
+}
+
+/* Check for __builtin_add_overflow() */
+#ifndef __has_builtin
+#define __has_builtin(x) 0
+#endif
+#if __has_builtin(__builtin_add_overflow) || (defined(__GNUC__) && __GNUC__ >= 5)
+#define add_overflow_ll(a, b, res) __builtin_add_overflow((a), (b), (res))
+#define sub_overflow_ll(a, b, res) __builtin_sub_overflow((a), (b), (res))
+#else
+#include <limits.h>
+static inline int add_overflow_ll(long long a, long long b, long long *res) {
+    if ((b > 0 && a > LLONG_MAX - b) || (b < 0 && a < LLONG_MIN - b)) {
+        *res = (long long)((unsigned long long)a + (unsigned long long)b);
+        return 1;
+    }
+    *res = a + b;
+    return 0;
+}
+static inline int sub_overflow_ll(long long a, long long b, long long *res) {
+    if ((b < 0 && a > LLONG_MAX + b) || (b > 0 && a < LLONG_MIN + b)) {
+        *res = (long long)((unsigned long long)a - (unsigned long long)b);
+        return 1;
+    }
+    *res = a - b;
+    return 0;
+}
+#endif
+
+#ifndef static_assert
+#define static_assert(expr, lit) extern char __static_assert_failure[(expr) ? 1:-1]
+#endif
 
 #ifdef REDIS_TEST
 int utilTest(int argc, char **argv, int flags);

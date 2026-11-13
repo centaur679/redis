@@ -1,34 +1,20 @@
 /*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "server.h"
+#include "cluster.h"
+#include "xxhash.h"
+#include <float.h>
 #include <math.h> /* isnan(), isinf() */
+
+/* XXH3 64-bit hash produces 16 hex characters when formatted */
+#define DIGEST_HEX_LENGTH 16
 
 /* Forward declarations */
 int getGenericCommand(client *c);
@@ -37,8 +23,14 @@ int getGenericCommand(client *c);
  * String Commands
  *----------------------------------------------------------------------------*/
 
-static int checkStringLength(client *c, long long size) {
-    if (!mustObeyClient(c) && size > server.proto_max_bulk_len) {
+static int checkStringLength(client *c, long long size, long long append) {
+    if (mustObeyClient(c))
+        return C_OK;
+    /* 'uint64_t' cast is there just to prevent undefined behavior on overflow */
+    long long total = (uint64_t)size + append;
+    /* Test configured max-bulk-len representing a limit of the biggest string object,
+     * and also test for overflow. */
+    if (total > server.proto_max_bulk_len || total < size || total < append) {
         addReplyError(c,"string exceeds maximum allowed size (proto-max-bulk-len)");
         return C_ERR;
     }
@@ -49,10 +41,14 @@ static int checkStringLength(client *c, long long size) {
  * options and variants. This function is called in order to implement the
  * following commands: SET, SETEX, PSETEX, SETNX, GETSET.
  *
- * 'flags' changes the behavior of the command (NX, XX or GET, see below).
+ * 'flags' changes the behavior of the command (NX, XX, GET, IFEQ, IFNE, IFDEQ
+ * or IFDNE - see below).
  *
  * 'expire' represents an expire to set in form of a Redis object as passed
  * by the user. It is interpreted according to the specified 'unit'.
+ *
+ * 'match_value' is a value to check against if any of IFEQ/IFNE/IFDEQ/IFDNE is
+ * present.
  *
  * 'ok_reply' and 'abort_reply' is what the function will reply to the client
  * if the operation is performed, or when it is not because of NX or
@@ -71,16 +67,32 @@ static int checkStringLength(client *c, long long size) {
 #define OBJ_EXAT (1<<6)            /* Set if timestamp in second is given */
 #define OBJ_PXAT (1<<7)            /* Set if timestamp in ms is given */
 #define OBJ_PERSIST (1<<8)         /* Set if we need to remove the ttl */
+#define OBJ_SET_IFEQ (1<<9)        /* Set if value equals match value */
+#define OBJ_SET_IFNE (1<<10)       /* Set if value does not equal match value */
+#define OBJ_SET_IFDEQ (1<<11)      /* Set if current digest equals match digest */
+#define OBJ_SET_IFDNE (1<<12)      /* Set if current digest does not equal match digest */
 
 /* Forward declaration */
-static int getExpireMillisecondsOrReply(client *c, robj *expire, int flags, int unit, long long *milliseconds);
+static int getExpireMillisecondsOrReply(client *c, robj *expire, int relative_ttl, int unit, long long *milliseconds);
 
-void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire, int unit, robj *ok_reply, robj *abort_reply) {
-    long long milliseconds = 0; /* initialized to avoid any harmness warning */
+/* Generic SET command family (SET, SETEX, PSETEX, SETNX)
+ *
+ * Arguments:
+ *   valref: A pointer to the robj to be set. This argument may be updated by the function.
+ *           The object is expected to have a refcount of 1, allowing its ownership to be
+ *           transferred directly to the database to avoid making a copy. If needed, the
+ *           function will replace *valref with a new allocation and increment its refcount
+ *           so that both the database and the caller maintain valid references.
+ */
+void setGenericCommand(client *c, int flags, robj *key, robj **valref, robj *expire,
+                       int unit, robj *match_value, robj *ok_reply, robj *abort_reply)
+{
+    long long milliseconds = 0; /* initialized to avoid any harmless warning */
     int found = 0;
     int setkey_flags = 0;
+    int relative_ttl = (flags & (OBJ_EX|OBJ_PX)) != 0; /* EX/PX are relative; EXAT/PXAT are absolute. */
 
-    if (expire && getExpireMillisecondsOrReply(c, expire, flags, unit, &milliseconds) != C_OK) {
+    if (expire && getExpireMillisecondsOrReply(c, expire, relative_ttl, unit, &milliseconds) != C_OK) {
         return;
     }
 
@@ -88,13 +100,78 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
         if (getGenericCommand(c) == C_ERR) return;
     }
 
-    found = (lookupKeyWrite(c->db,key) != NULL);
+    dictEntryLink link = NULL;
+    kvobj *current = lookupKeyWriteWithLink(c->db,key,&link);
+    found = (current != NULL);
 
     if ((flags & OBJ_SET_NX && found) ||
-        (flags & OBJ_SET_XX && !found))
+        (flags & (OBJ_SET_XX | OBJ_SET_IFEQ | OBJ_SET_IFDEQ) && !found))
     {
         if (!(flags & OBJ_SET_GET)) {
             addReply(c, abort_reply ? abort_reply : shared.null[c->resp]);
+        }
+        return;
+    }
+
+    /* Handle conditional set operations - only set if key is found and condition
+     * is met - otherwise return nil. */
+    if (found && (flags & (OBJ_SET_IFEQ | OBJ_SET_IFNE | OBJ_SET_IFDEQ | OBJ_SET_IFDNE))) {
+        /* Reuse the kvobj found above: another lookup could run a rehash step
+         * and invalidate `link`. */
+        if (checkType(c, current, OBJ_STRING)) {
+            return;
+        }
+
+        if (flags & OBJ_SET_IFEQ || flags & OBJ_SET_IFNE) {
+            robj *current_decoded = getDecodedObject(current);
+            int condition = (flags & OBJ_SET_IFEQ) ?
+                            sdscmp(current_decoded->ptr, match_value->ptr) == 0 :
+                            sdscmp(current_decoded->ptr, match_value->ptr) != 0;
+            decrRefCount(current_decoded);
+            if (!condition) {
+                if (!(flags & OBJ_SET_GET)) {
+                    addReply(c, abort_reply ? abort_reply : shared.null[c->resp]);
+                }
+                return;
+            }
+        } else if (flags & OBJ_SET_IFDEQ || flags & OBJ_SET_IFDNE) {
+            if (validateHexDigest(c, match_value->ptr) != C_OK)
+                return;
+
+            sds current_digest = stringDigest(current);
+            int condition = flags & OBJ_SET_IFDEQ ?
+                            strcasecmp(current_digest, match_value->ptr) == 0 :
+                            strcasecmp(current_digest, match_value->ptr) != 0;
+            sdsfree(current_digest);
+            if (!condition) {
+                if (!(flags & OBJ_SET_GET)) {
+                    addReply(c, abort_reply ? abort_reply : shared.null[c->resp]);
+                }
+                return;
+            }
+        }
+    }
+
+    /* If the expire time is already elapsed, we don't need to add the key,
+     * but we still need to update the stats, and we also need to delete the
+     * key if it exists.
+     *
+     * From stats perspective, we behave as if we inserted a new key (possibly
+     * an overwrite) and later expired it, but from the per-key KSN observability,
+     * we reflect what we've actually done in the db (deletion of old key, and
+     * no insertion of new one), so we don't confuse modules. */
+    if (expire && checkAlreadyExpired(milliseconds)) {
+        if (found) {
+            dbDelete(c->db, key);
+            robj *aux = server.lazyfree_lazy_server_del ? shared.unlink : shared.del;
+            rewriteClientCommandVector(c, 2, aux, key);
+            keyModified(c, c->db, key, NULL, 1);
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", key, c->db->id);
+            server.dirty++;
+        }
+        server.stat_expiredkeys++;
+        if (!(flags & OBJ_SET_GET)) {
+            addReply(c, ok_reply ? ok_reply : shared.ok);
         }
         return;
     }
@@ -103,17 +180,38 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
     setkey_flags |= ((flags & OBJ_KEEPTTL) || expire) ? SETKEY_KEEPTTL : 0;
     setkey_flags |= found ? SETKEY_ALREADY_EXIST : SETKEY_DOESNT_EXIST;
 
-    setKey(c,c->db,key,val,setkey_flags);
+    setKeyByLink(c, c->db, key, valref, setkey_flags, &link);
+    /* If there's an expiration, setExpireByLink may reallocate the object.
+     * We must update valref to reflect the new object if that happens.
+     * setKeyByLink() fired KSN, so check the link first. */
+    if (expire) {
+        dbRefreshLink(c->db, key->ptr, &link, *valref);
+        *valref = setExpireByLink(c, c->db, key->ptr, milliseconds, link);
+    }
+    /* The client still holds a reference to the original object via c->argv[i],
+     * and will call decrRefCount() at the end of call(). We increment the refcount
+     * from 1 to 2 to ensure both DB and client have valid references. */
+    incrRefCount(*valref); /* 1->2 */
+
     server.dirty++;
     notifyKeyspaceEvent(NOTIFY_STRING,"set",key,c->db->id);
 
     if (expire) {
-        setExpire(c,c->db,key,milliseconds);
         /* Propagate as SET Key Value PXAT millisecond-timestamp if there is
-         * EX/PX/EXAT/PXAT flag. */
-        robj *milliseconds_obj = createStringObjectFromLongLong(milliseconds);
-        rewriteClientCommandVector(c, 5, shared.set, key, val, shared.pxat, milliseconds_obj);
-        decrRefCount(milliseconds_obj);
+         * EX/PX/EXAT flag. */
+        if (!(flags & OBJ_PXAT)) {
+            robj *milliseconds_obj = createStringObjectFromLongLong(milliseconds);
+            /* If command is exactly "SET key value EX/PX/EXAT ttl", we can just
+             * replace the expire type and value in-place. Otherwise, we need to
+             * rewrite the entire command to strip extra flags (NX, XX, GET, etc). */
+            if ((c->cmd->proc == setCommand) && c->argc == 5) {
+                rewriteClientCommandArgument(c, 3, shared.pxat);
+                rewriteClientCommandArgument(c, 4, milliseconds_obj);
+            } else {
+                rewriteClientCommandVector(c, 5, shared.set, key, *valref, shared.pxat, milliseconds_obj);
+            }
+            decrRefCount(milliseconds_obj);
+        }
         notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);
     }
 
@@ -123,37 +221,33 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
 
     /* Propagate without the GET argument (Isn't needed if we had expire since in that case we completely re-written the command argv) */
     if ((flags & OBJ_SET_GET) && !expire) {
-        int argc = 0;
-        int j;
-        robj **argv = zmalloc((c->argc-1)*sizeof(robj*));
-        for (j=0; j < c->argc; j++) {
+        for (int j = c->argc - 1; j >= 3; j--) {
             char *a = c->argv[j]->ptr;
             /* Skip GET which may be repeated multiple times. */
-            if (j >= 3 &&
-                (a[0] == 'g' || a[0] == 'G') &&
+            if ((a[0] == 'g' || a[0] == 'G') &&
                 (a[1] == 'e' || a[1] == 'E') &&
                 (a[2] == 't' || a[2] == 'T') && a[3] == '\0')
-                continue;
-            argv[argc++] = c->argv[j];
-            incrRefCount(c->argv[j]);
+            {
+                rewriteClientCommandArgument(c, j, NULL);
+            }
         }
-        replaceClientCommandVector(c, argc, argv);
     }
 }
 
 /*
- * Extract the `expire` argument of a given GET/SET command as an absolute timestamp in milliseconds.
+ * Extract the `expire` argument of a given command as an absolute timestamp in milliseconds.
  *
  * "client" is the client that sent the `expire` argument.
  * "expire" is the `expire` argument to be extracted.
- * "flags" represents the behavior of the command (e.g. PX or EX).
+ * "relative_ttl" is true when the value is a relative TTL (EX/PX),
+ *                false when it is an absolute timestamp (EXAT/PXAT).
  * "unit" is the original unit of the given `expire` argument (e.g. UNIT_SECONDS).
  * "milliseconds" is output argument.
  *
  * If return C_OK, "milliseconds" output argument will be set to the resulting absolute timestamp.
  * If return C_ERR, an error reply has been added to the given client.
  */
-static int getExpireMillisecondsOrReply(client *c, robj *expire, int flags, int unit, long long *milliseconds) {
+static int getExpireMillisecondsOrReply(client *c, robj *expire, int relative_ttl, int unit, long long *milliseconds) {
     int ret = getLongLongFromObjectOrReply(c, expire, milliseconds, NULL);
     if (ret != C_OK) {
         return ret;
@@ -167,12 +261,7 @@ static int getExpireMillisecondsOrReply(client *c, robj *expire, int flags, int 
 
     if (unit == UNIT_SECONDS) *milliseconds *= 1000;
 
-    if ((flags & OBJ_PX) || (flags & OBJ_EX)) {
-        *milliseconds += commandTimeSnapshot();
-    }
-
-    if (*milliseconds <= 0) {
-        /* Overflow detected. */
+    if (relative_ttl && add_overflow_ll(*milliseconds, commandTimeSnapshot(), milliseconds)) {
         addReplyErrorExpireTime(c);
         return C_ERR;
     }
@@ -182,97 +271,155 @@ static int getExpireMillisecondsOrReply(client *c, robj *expire, int flags, int 
 
 #define COMMAND_GET 0
 #define COMMAND_SET 1
+#define COMMAND_MSETEX 2
+
+/* Extended string command arguments structure */
+typedef struct {
+    int flags;
+    int unit;
+    int expire_pos;  /* Position of EX/PX flag for replication rewriting */
+    robj *expire;
+    robj *match_value; /* For IFEQ/IFNE/IFDEQ/IFDNE conditions */
+} extendedStringArgs;
+
 /*
  * The parseExtendedStringArgumentsOrReply() function performs the common validation for extended
- * string arguments used in SET and GET command.
+ * string arguments used in SET, GET and MSETEX commands.
  *
  * Get specific commands - PERSIST/DEL
- * Set specific commands - XX/NX/GET
+ * Set specific commands - XX/NX/GET/IFEQ/IFNE/IFDEQ/IFDNE
  * Common commands - EX/EXAT/PX/PXAT/KEEPTTL
  *
- * Function takes pointers to client, flags, unit, pointer to pointer of expire obj if needed
- * to be determined and command_type which can be COMMAND_GET or COMMAND_SET.
+ * Function takes pointers to client, start_pos for where to begin parsing, extendedStringArgs
+ * structure to populate, and command_type which can be COMMAND_GET, COMMAND_SET, or COMMAND_MSETEX.
  *
  * If there are any syntax violations C_ERR is returned else C_OK is returned.
  *
- * Input flags are updated upon parsing the arguments. Unit and expire are updated if there are any
+ * The args structure is updated upon parsing the arguments. Unit and expire are updated if there are any
  * EX/EXAT/PX/PXAT arguments. Unit is updated to millisecond if PX/PXAT is set.
+ * match_value is updated if any of IFEQ/IFNE/IFDEQ/IFDNE is set.
  */
-int parseExtendedStringArgumentsOrReply(client *c, int *flags, int *unit, robj **expire, int command_type) {
+int parseExtendedStringArgumentsOrReply(client *c, int start_pos, extendedStringArgs *args, int command_type) {
+    /* Initialize arguments to defaults */
+    memset(args, 0, sizeof(*args));
+    args->expire_pos = -1;
+    args->unit = UNIT_SECONDS;
 
-    int j = command_type == COMMAND_GET ? 2 : 3;
+    int j = start_pos;
+   /* We can have either none or exactly one of these conditionals as they are
+     * mutually exclusive. We'll make sure to check if none of the other flags
+     * are already set if we are going to set one of them. This is done via the
+     * check:
+     *
+     * if (opt == OBJ_SET_XXX && !(*flags & (cond_mut_excl & ~OBJ_SET_XXX)))
+     *
+     * A bit ugly - but concise.
+     */
+    int cond_mut_excl = OBJ_SET_NX | OBJ_SET_XX | OBJ_SET_IFEQ | OBJ_SET_IFNE |
+                        OBJ_SET_IFDEQ | OBJ_SET_IFDNE;
     for (; j < c->argc; j++) {
         char *opt = c->argv[j]->ptr;
         robj *next = (j == c->argc-1) ? NULL : c->argv[j+1];
 
         if ((opt[0] == 'n' || opt[0] == 'N') &&
             (opt[1] == 'x' || opt[1] == 'X') && opt[2] == '\0' &&
-            !(*flags & OBJ_SET_XX) && (command_type == COMMAND_SET))
+            !(args->flags & (cond_mut_excl & ~OBJ_SET_NX)) && (command_type == COMMAND_SET || command_type == COMMAND_MSETEX))
         {
-            *flags |= OBJ_SET_NX;
+            args->flags |= OBJ_SET_NX;
         } else if ((opt[0] == 'x' || opt[0] == 'X') &&
                    (opt[1] == 'x' || opt[1] == 'X') && opt[2] == '\0' &&
-                   !(*flags & OBJ_SET_NX) && (command_type == COMMAND_SET))
+                   !(args->flags & (cond_mut_excl & ~OBJ_SET_XX)) && (command_type == COMMAND_SET || command_type == COMMAND_MSETEX))
         {
-            *flags |= OBJ_SET_XX;
+            args->flags |= OBJ_SET_XX;
         } else if ((opt[0] == 'g' || opt[0] == 'G') &&
                    (opt[1] == 'e' || opt[1] == 'E') &&
                    (opt[2] == 't' || opt[2] == 'T') && opt[3] == '\0' &&
                    (command_type == COMMAND_SET))
         {
-            *flags |= OBJ_SET_GET;
-        } else if (!strcasecmp(opt, "KEEPTTL") && !(*flags & OBJ_PERSIST) &&
-            !(*flags & OBJ_EX) && !(*flags & OBJ_EXAT) &&
-            !(*flags & OBJ_PX) && !(*flags & OBJ_PXAT) && (command_type == COMMAND_SET))
+            args->flags |= OBJ_SET_GET;
+        } else if (!strcasecmp(opt, "KEEPTTL") && !(args->flags & OBJ_PERSIST) &&
+            !(args->flags & OBJ_EX) && !(args->flags & OBJ_EXAT) &&
+            !(args->flags & OBJ_PX) && !(args->flags & OBJ_PXAT) &&
+            (command_type == COMMAND_SET || command_type == COMMAND_MSETEX))
         {
-            *flags |= OBJ_KEEPTTL;
+            args->flags |= OBJ_KEEPTTL;
         } else if (!strcasecmp(opt,"PERSIST") && (command_type == COMMAND_GET) &&
-               !(*flags & OBJ_EX) && !(*flags & OBJ_EXAT) &&
-               !(*flags & OBJ_PX) && !(*flags & OBJ_PXAT) &&
-               !(*flags & OBJ_KEEPTTL))
+               !(args->flags & OBJ_EX) && !(args->flags & OBJ_EXAT) &&
+               !(args->flags & OBJ_PX) && !(args->flags & OBJ_PXAT) &&
+               !(args->flags & OBJ_KEEPTTL))
         {
-            *flags |= OBJ_PERSIST;
+            args->flags |= OBJ_PERSIST;
         } else if ((opt[0] == 'e' || opt[0] == 'E') &&
                    (opt[1] == 'x' || opt[1] == 'X') && opt[2] == '\0' &&
-                   !(*flags & OBJ_KEEPTTL) && !(*flags & OBJ_PERSIST) &&
-                   !(*flags & OBJ_EXAT) && !(*flags & OBJ_PX) &&
-                   !(*flags & OBJ_PXAT) && next)
+                   !(args->flags & OBJ_KEEPTTL) && !(args->flags & OBJ_PERSIST) &&
+                   !(args->flags & OBJ_EXAT) && !(args->flags & OBJ_PX) &&
+                   !(args->flags & OBJ_PXAT) && next)
         {
-            *flags |= OBJ_EX;
-            *expire = next;
+            args->flags |= OBJ_EX;
+            args->expire = next;
+            args->expire_pos = j;
             j++;
         } else if ((opt[0] == 'p' || opt[0] == 'P') &&
                    (opt[1] == 'x' || opt[1] == 'X') && opt[2] == '\0' &&
-                   !(*flags & OBJ_KEEPTTL) && !(*flags & OBJ_PERSIST) &&
-                   !(*flags & OBJ_EX) && !(*flags & OBJ_EXAT) &&
-                   !(*flags & OBJ_PXAT) && next)
+                   !(args->flags & OBJ_KEEPTTL) && !(args->flags & OBJ_PERSIST) &&
+                   !(args->flags & OBJ_EX) && !(args->flags & OBJ_EXAT) &&
+                   !(args->flags & OBJ_PXAT) && next)
         {
-            *flags |= OBJ_PX;
-            *unit = UNIT_MILLISECONDS;
-            *expire = next;
+            args->flags |= OBJ_PX;
+            args->unit = UNIT_MILLISECONDS;
+            args->expire = next;
+            args->expire_pos = j;
             j++;
         } else if ((opt[0] == 'e' || opt[0] == 'E') &&
                    (opt[1] == 'x' || opt[1] == 'X') &&
                    (opt[2] == 'a' || opt[2] == 'A') &&
                    (opt[3] == 't' || opt[3] == 'T') && opt[4] == '\0' &&
-                   !(*flags & OBJ_KEEPTTL) && !(*flags & OBJ_PERSIST) &&
-                   !(*flags & OBJ_EX) && !(*flags & OBJ_PX) &&
-                   !(*flags & OBJ_PXAT) && next)
+                   !(args->flags & OBJ_KEEPTTL) && !(args->flags & OBJ_PERSIST) &&
+                   !(args->flags & OBJ_EX) && !(args->flags & OBJ_PX) &&
+                   !(args->flags & OBJ_PXAT) && next)
         {
-            *flags |= OBJ_EXAT;
-            *expire = next;
+            args->flags |= OBJ_EXAT;
+            args->expire = next;
             j++;
         } else if ((opt[0] == 'p' || opt[0] == 'P') &&
                    (opt[1] == 'x' || opt[1] == 'X') &&
                    (opt[2] == 'a' || opt[2] == 'A') &&
                    (opt[3] == 't' || opt[3] == 'T') && opt[4] == '\0' &&
-                   !(*flags & OBJ_KEEPTTL) && !(*flags & OBJ_PERSIST) &&
-                   !(*flags & OBJ_EX) && !(*flags & OBJ_EXAT) &&
-                   !(*flags & OBJ_PX) && next)
+                   !(args->flags & OBJ_KEEPTTL) && !(args->flags & OBJ_PERSIST) &&
+                   !(args->flags & OBJ_EX) && !(args->flags & OBJ_EXAT) &&
+                   !(args->flags & OBJ_PX) && next)
         {
-            *flags |= OBJ_PXAT;
-            *unit = UNIT_MILLISECONDS;
-            *expire = next;
+            args->flags |= OBJ_PXAT;
+            args->unit = UNIT_MILLISECONDS;
+            args->expire = next;
+            j++;
+        } else if (!strcasecmp(opt, "ifeq") && next &&
+                   !(args->flags & (cond_mut_excl & ~OBJ_SET_IFEQ)) &&
+                   (command_type == COMMAND_SET))
+        {
+            args->flags |= OBJ_SET_IFEQ;
+            args->match_value = next;
+            j++;
+        } else if (!strcasecmp(opt, "ifne") && next &&
+                   !(args->flags & (cond_mut_excl & ~OBJ_SET_IFNE)) &&
+                   (command_type == COMMAND_SET))
+        {
+            args->flags |= OBJ_SET_IFNE;
+            args->match_value = next;
+            j++;
+        } else if (!strcasecmp(opt, "ifdeq") && next &&
+                   !(args->flags & (cond_mut_excl & ~OBJ_SET_IFDEQ)) &&
+                   (command_type == COMMAND_SET))
+        {
+            args->flags |= OBJ_SET_IFDEQ;
+            args->match_value = next;
+            j++;
+        } else if (!strcasecmp(opt, "ifdne") && next &&
+                   !(args->flags & (cond_mut_excl & ~OBJ_SET_IFDNE)) &&
+                   (command_type == COMMAND_SET))
+        {
+            args->flags |= OBJ_SET_IFDNE;
+            args->match_value = next;
             j++;
         } else {
             addReplyErrorObject(c,shared.syntaxerr);
@@ -283,39 +430,39 @@ int parseExtendedStringArgumentsOrReply(client *c, int *flags, int *unit, robj *
 }
 
 /* SET key value [NX] [XX] [KEEPTTL] [GET] [EX <seconds>] [PX <milliseconds>]
- *     [EXAT <seconds-timestamp>][PXAT <milliseconds-timestamp>] */
+ *     [EXAT <seconds-timestamp>][PXAT <milliseconds-timestamp>]
+ *     [IFEQ <match-value>|IFNE <match-value>|IFDEQ <match-digest>|
+ *      IFDNE <match-digest>]*/
 void setCommand(client *c) {
-    robj *expire = NULL;
-    int unit = UNIT_SECONDS;
-    int flags = OBJ_NO_FLAGS;
+    extendedStringArgs args;
 
-    if (parseExtendedStringArgumentsOrReply(c,&flags,&unit,&expire,COMMAND_SET) != C_OK) {
+    if (parseExtendedStringArgumentsOrReply(c, 3, &args, COMMAND_SET) != C_OK) {
         return;
     }
 
     c->argv[2] = tryObjectEncoding(c->argv[2]);
-    setGenericCommand(c,flags,c->argv[1],c->argv[2],expire,unit,NULL,NULL);
+    setGenericCommand(c, args.flags, c->argv[1], &(c->argv[2]), args.expire, args.unit, args.match_value, NULL, NULL);
 }
 
 void setnxCommand(client *c) {
     c->argv[2] = tryObjectEncoding(c->argv[2]);
-    setGenericCommand(c,OBJ_SET_NX,c->argv[1],c->argv[2],NULL,0,shared.cone,shared.czero);
+    setGenericCommand(c, OBJ_SET_NX, c->argv[1], &(c->argv[2]), NULL, 0, NULL, shared.cone, shared.czero);
 }
 
 void setexCommand(client *c) {
     c->argv[3] = tryObjectEncoding(c->argv[3]);
-    setGenericCommand(c,OBJ_EX,c->argv[1],c->argv[3],c->argv[2],UNIT_SECONDS,NULL,NULL);
+    setGenericCommand(c, OBJ_EX, c->argv[1], &(c->argv[3]), c->argv[2], UNIT_SECONDS, NULL, NULL, NULL);
 }
 
 void psetexCommand(client *c) {
     c->argv[3] = tryObjectEncoding(c->argv[3]);
-    setGenericCommand(c,OBJ_PX,c->argv[1],c->argv[3],c->argv[2],UNIT_MILLISECONDS,NULL,NULL);
+    setGenericCommand(c, OBJ_PX, c->argv[1], &(c->argv[3]), c->argv[2], UNIT_MILLISECONDS, NULL, NULL, NULL);
 }
 
 int getGenericCommand(client *c) {
-    robj *o;
+    kvobj *o;
 
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp])) == NULL)
+    if ((o = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL)
         return C_OK;
 
     if (checkType(c,o,OBJ_STRING)) {
@@ -351,15 +498,13 @@ void getCommand(client *c) {
  * Command would either return the bulk string, error or nil.
  */
 void getexCommand(client *c) {
-    robj *expire = NULL;
-    int unit = UNIT_SECONDS;
-    int flags = OBJ_NO_FLAGS;
+    extendedStringArgs args;
 
-    if (parseExtendedStringArgumentsOrReply(c,&flags,&unit,&expire,COMMAND_GET) != C_OK) {
+    if (parseExtendedStringArgumentsOrReply(c, 2, &args, COMMAND_GET) != C_OK) {
         return;
     }
 
-    robj *o;
+    kvobj *o;
 
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp])) == NULL)
         return;
@@ -370,7 +515,8 @@ void getexCommand(client *c) {
 
     /* Validate the expiration time value first */
     long long milliseconds = 0;
-    if (expire && getExpireMillisecondsOrReply(c, expire, flags, unit, &milliseconds) != C_OK) {
+    int relative_ttl = (args.flags & (OBJ_EX|OBJ_PX)) != 0; /* EX/PX are relative; EXAT/PXAT are absolute. */
+    if (args.expire && getExpireMillisecondsOrReply(c, args.expire, relative_ttl, args.unit, &milliseconds) != C_OK) {
         return;
     }
 
@@ -379,30 +525,29 @@ void getexCommand(client *c) {
 
     /* This command is never propagated as is. It is either propagated as PEXPIRE[AT],DEL,UNLINK or PERSIST.
      * This why it doesn't need special handling in feedAppendOnlyFile to convert relative expire time to absolute one. */
-    if (((flags & OBJ_PXAT) || (flags & OBJ_EXAT)) && checkAlreadyExpired(milliseconds)) {
+    if (((args.flags & OBJ_PXAT) || (args.flags & OBJ_EXAT)) && checkAlreadyExpired(milliseconds)) {
         /* When PXAT/EXAT absolute timestamp is specified, there can be a chance that timestamp
          * has already elapsed so delete the key in that case. */
-        int deleted = server.lazyfree_lazy_expire ? dbAsyncDelete(c->db, c->argv[1]) :
-                      dbSyncDelete(c->db, c->argv[1]);
+        int deleted = dbGenericDelete(c->db, c->argv[1], server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED);
         serverAssert(deleted);
         robj *aux = server.lazyfree_lazy_expire ? shared.unlink : shared.del;
         rewriteClientCommandVector(c,2,aux,c->argv[1]);
-        signalModifiedKey(c, c->db, c->argv[1]);
+        keyModified(c, c->db, c->argv[1], NULL, 1);
         notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
         server.dirty++;
-    } else if (expire) {
-        setExpire(c,c->db,c->argv[1],milliseconds);
+    } else if (args.expire) {
+        o = setExpire(c,c->db,c->argv[1],milliseconds);
         /* Propagate as PXEXPIREAT millisecond-timestamp if there is
          * EX/PX/EXAT/PXAT flag and the key has not expired. */
         robj *milliseconds_obj = createStringObjectFromLongLong(milliseconds);
         rewriteClientCommandVector(c,3,shared.pexpireat,c->argv[1],milliseconds_obj);
         decrRefCount(milliseconds_obj);
-        signalModifiedKey(c, c->db, c->argv[1]);
+        keyModified(c, c->db, c->argv[1], o, 1);
         notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",c->argv[1],c->db->id);
         server.dirty++;
-    } else if (flags & OBJ_PERSIST) {
+    } else if (args.flags & OBJ_PERSIST) {
         if (removeExpire(c->db, c->argv[1])) {
-            signalModifiedKey(c, c->db, c->argv[1]);
+            keyModified(c, c->db, c->argv[1], o, 1);
             rewriteClientCommandVector(c, 2, shared.persist, c->argv[1]);
             notifyKeyspaceEvent(NOTIFY_GENERIC,"persist",c->argv[1],c->db->id);
             server.dirty++;
@@ -415,7 +560,7 @@ void getdelCommand(client *c) {
     if (dbSyncDelete(c->db, c->argv[1])) {
         /* Propagate as DEL command */
         rewriteClientCommandVector(c,2,shared.del,c->argv[1]);
-        signalModifiedKey(c, c->db, c->argv[1]);
+        keyModified(c, c->db, c->argv[1], NULL, 1);
         notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
         server.dirty++;
     }
@@ -424,7 +569,8 @@ void getdelCommand(client *c) {
 void getsetCommand(client *c) {
     if (getGenericCommand(c) == C_ERR) return;
     c->argv[2] = tryObjectEncoding(c->argv[2]);
-    setKey(c,c->db,c->argv[1],c->argv[2],0);
+    setKey(c, c->db, c->argv[1], &c->argv[2], 0);
+    incrRefCount(c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_STRING,"set",c->argv[1],c->db->id);
     server.dirty++;
 
@@ -433,9 +579,10 @@ void getsetCommand(client *c) {
 }
 
 void setrangeCommand(client *c) {
-    robj *o;
+    int64_t oldLen = -1, newLen;
     long offset;
     sds value = c->argv[3]->ptr;
+    const size_t value_len = sdslen(value);
 
     if (getLongFromObjectOrReply(c,c->argv[2],&offset,NULL) != C_OK)
         return;
@@ -445,55 +592,64 @@ void setrangeCommand(client *c) {
         return;
     }
 
-    o = lookupKeyWrite(c->db,c->argv[1]);
-    if (o == NULL) {
+    dictEntryLink link;
+    kvobj *kv = lookupKeyWriteWithLink(c->db, c->argv[1], &link);
+    if (kv == NULL) {
         /* Return 0 when setting nothing on a non-existing string */
-        if (sdslen(value) == 0) {
+        if (value_len == 0) {
             addReply(c,shared.czero);
             return;
         }
 
         /* Return when the resulting string exceeds allowed size */
-        if (checkStringLength(c,offset+sdslen(value)) != C_OK)
+        if (checkStringLength(c,offset,value_len) != C_OK)
             return;
 
-        o = createObject(OBJ_STRING,sdsnewlen(NULL, offset+sdslen(value)));
-        dbAdd(c->db,c->argv[1],o);
+        newLen = offset+value_len;
+        robj *o = createObject(OBJ_STRING,sdsnewlen(NULL, newLen));
+        kv = dbAddByLink(c->db, c->argv[1], &o, &link);
     } else {
-        size_t olen;
-
         /* Key exists, check type */
-        if (checkType(c,o,OBJ_STRING))
+        if (checkType(c,kv,OBJ_STRING))
             return;
 
         /* Return existing string length when setting nothing */
-        olen = stringObjectLen(o);
-        if (sdslen(value) == 0) {
-            addReplyLongLong(c,olen);
+        oldLen = stringObjectLen(kv);
+        if (value_len == 0) {
+            addReplyLongLong(c, oldLen);
             return;
         }
 
         /* Return when the resulting string exceeds allowed size */
-        if (checkStringLength(c,offset+sdslen(value)) != C_OK)
+        if (checkStringLength(c,offset,value_len) != C_OK)
             return;
 
         /* Create a copy when the object is shared or encoded. */
-        o = dbUnshareStringValue(c->db,c->argv[1],o);
+        kv = dbUnshareStringValueByLink(c->db, c->argv[1], kv, link);
+
+        newLen = max(oldLen, (int64_t) (offset + value_len));
+        updateKeysizesHist(c->db, OBJ_STRING, oldLen, newLen);            
     }
 
-    if (sdslen(value) > 0) {
-        o->ptr = sdsgrowzero(o->ptr,offset+sdslen(value));
-        memcpy((char*)o->ptr+offset,value,sdslen(value));
-        signalModifiedKey(c,c->db,c->argv[1]);
+    if (value_len > 0) {
+        size_t oldsize = 0;
+        if (server.memory_tracking_enabled)
+            oldsize = kvobjAllocSize(kv);
+        kv->ptr = sdsgrowzero(kv->ptr,offset+value_len);
+        if (server.memory_tracking_enabled)
+            updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), kv, oldsize, kvobjAllocSize(kv));
+        memcpy((char*)kv->ptr+offset,value,value_len);
+        keyModified(c,c->db,c->argv[1],kv,1);
         notifyKeyspaceEvent(NOTIFY_STRING,
             "setrange",c->argv[1],c->db->id);
         server.dirty++;
     }
-    addReplyLongLong(c,sdslen(o->ptr));
+
+    addReplyLongLong(c,newLen);
 }
 
 void getrangeCommand(client *c) {
-    robj *o;
+    kvobj *o;
     long long start, end;
     char *str, llbuf[32];
     size_t strlen;
@@ -533,49 +689,125 @@ void getrangeCommand(client *c) {
     }
 }
 
-void mgetCommand(client *c) {
-    int j;
+/* Batch size for intra-command key prefetching. */
+#define PREFETCH_BATCH_SIZE 16
 
-    addReplyArrayLen(c,c->argc-1);
-    for (j = 1; j < c->argc; j++) {
-        robj *o = lookupKeyRead(c->db,c->argv[j]);
-        if (o == NULL) {
-            addReplyNull(c);
-        } else {
-            if (o->type != OBJ_STRING) {
-                addReplyNull(c);
-            } else {
-                addReplyBulk(c,o);
-            }
+/* Pick the next prefetch batch starting at argv[start] and warm it via
+ * dictPrefetchKeys. 'stride' is 1 for keys-only args (MGET) or 2 for
+ * key/value pairs (MSET). Returns the chosen batch size in items. */
+static int prefetchKeysBatch(client *c, int slot, int start, int stride) {
+    int batch = (c->argc - start) / stride;
+
+    /* If at least two full batches remain, take one; otherwise fall
+     * through with batch = remaining keys, doing them in one go. */
+    if (batch >= PREFETCH_BATCH_SIZE*2) batch = PREFETCH_BATCH_SIZE;
+
+    dict *d = kvstoreGetDict(c->db->keys, slot);
+    if (d != NULL && dictSize(d) > 0) {
+        void *keys[PREFETCH_BATCH_SIZE*2];
+        dict *dicts[PREFETCH_BATCH_SIZE*2];
+        for (int k = 0; k < batch; k++) {
+            keys[k]  = c->argv[start + k * stride]->ptr;
+            dicts[k] = d;
         }
+        dictPrefetchKeys(dicts, keys, batch);
+    }
+    return batch;
+}
+
+void mgetCommand(client *c) {
+    int numkeys = c->argc - 1;
+
+    addReplyArrayLen(c, numkeys);
+
+    /* MGET requires all keys in the same slot in cluster mode. Reuse the
+     * slot already computed by the cross-command batching path when
+     * available, otherwise fall back to recomputing from argv[1]. */
+    int slot = 0;
+    if (server.cluster_enabled) {
+        pendingCommand *pcmd = c->current_pending_cmd;
+        slot = (pcmd && pcmd->slot != INVALID_CLUSTER_SLOT) ?
+                pcmd->slot : getKeySlot(c->argv[1]->ptr);
+    }
+
+    /* Decide whether to prefetch within this command. Skip if disabled by
+     * config (prefetch_batch_max_size == 0), or if the cross-command batch
+     * path already warmed our keys — running both paths would just contend
+     * for cache bandwidth. */
+    int already_prefetched = c->current_pending_cmd &&
+        (c->current_pending_cmd->flags & PENDING_CMD_KEYS_PREFETCHED);
+    int do_prefetch = server.prefetch_batch_max_size && !already_prefetched && numkeys > 1;
+
+    int j = 1;
+    while (j < c->argc) {
+        /* If prefetching, take one batch; otherwise take all items. */
+        int batch = do_prefetch ? prefetchKeysBatch(c, slot, j, 1) : c->argc - j;
+
+        for (int k = 0; k < batch; k++) {
+            kvobj *o = lookupKeyRead(c->db, c->argv[j + k]);
+            if (o == NULL || o->type != OBJ_STRING)
+                addReplyNull(c);
+            else
+                addReplyBulk(c, o);
+        }
+        j += batch;
     }
 }
 
 void msetGenericCommand(client *c, int nx) {
-    int j;
-
     if ((c->argc % 2) == 0) {
         addReplyErrorArity(c);
         return;
     }
 
+    int numkeys = (c->argc - 1) / 2;
+
+    /* Same gating as mgetCommand, see comment there. */
+    int slot = 0;
+    if (server.cluster_enabled) {
+        pendingCommand *pcmd = c->current_pending_cmd;
+        slot = (pcmd && pcmd->slot != INVALID_CLUSTER_SLOT) ?
+                pcmd->slot : getKeySlot(c->argv[1]->ptr);
+    }
+    int already_prefetched = c->current_pending_cmd &&
+        (c->current_pending_cmd->flags & PENDING_CMD_KEYS_PREFETCHED);
+    int do_prefetch = server.prefetch_batch_max_size && !already_prefetched && numkeys > 1;
+
     /* Handle the NX flag. The MSETNX semantic is to return zero and don't
      * set anything if at least one key already exists. */
     if (nx) {
-        for (j = 1; j < c->argc; j += 2) {
-            if (lookupKeyWrite(c->db,c->argv[j]) != NULL) {
-                addReply(c, shared.czero);
-                return;
+        int j = 1;
+        while (j < c->argc) {
+            /* If prefetching, take one batch; otherwise take all items. */
+            int batch = do_prefetch ? prefetchKeysBatch(c, slot, j, 2)
+                                    : (c->argc - j) / 2;
+            for (int k = 0; k < batch; k++) {
+                if (lookupKeyWrite(c->db, c->argv[j + k * 2]) != NULL) {
+                    addReply(c, shared.czero);
+                    return;
+                }
             }
+            j += batch * 2;
         }
     }
 
-    for (j = 1; j < c->argc; j += 2) {
-        c->argv[j+1] = tryObjectEncoding(c->argv[j+1]);
-        setKey(c,c->db,c->argv[j],c->argv[j+1],0);
-        notifyKeyspaceEvent(NOTIFY_STRING,"set",c->argv[j],c->db->id);
+    /* If nx is set, the NX loop above already prefetched. */
+    do_prefetch = do_prefetch && !nx;
+
+    int j = 1;
+    while (j < c->argc) {
+        int batch = do_prefetch ? prefetchKeysBatch(c, slot, j, 2)
+                                : (c->argc - j) / 2;
+        for (int k = 0; k < batch; k++) {
+            int i = j + k * 2;
+            c->argv[i + 1] = tryObjectEncoding(c->argv[i + 1]);
+            setKey(c, c->db, c->argv[i], &(c->argv[i + 1]), 0);
+            incrRefCount(c->argv[i + 1]);
+            notifyKeyspaceEvent(NOTIFY_STRING, "set", c->argv[i], c->db->id);
+        }
+        j += batch * 2;
     }
-    server.dirty += (c->argc-1)/2;
+    server.dirty += numkeys;
     addReply(c, nx ? shared.cone : shared.ok);
 }
 
@@ -587,11 +819,103 @@ void msetnxCommand(client *c) {
     msetGenericCommand(c,1);
 }
 
+void msetexCommand(client *c) {
+    /* Parse numkeys parameter */
+    long kv_count;
+    if (getRangeLongFromObjectOrReply(c, c->argv[1], 1, INT_MAX,
+        &kv_count, "invalid numkeys value") != C_OK)
+    {
+        return;
+    }
+
+    /* Validate we have enough arguments: command + numkeys + (key-value pairs) * 2
+     * Be careful to avoid overflow when calculating kv_count * 2 */
+    if ((long long)kv_count * 2 + 2 > c->argc) {
+        addReplyError(c, "wrong number of key-value pairs");
+        return;
+    }
+
+    extendedStringArgs args;
+    if (parseExtendedStringArgumentsOrReply(c, kv_count * 2 + 2, &args, COMMAND_MSETEX) != C_OK) {
+        return;
+    }
+
+    /* Validate the expiration time value first */
+    long long milliseconds = 0;
+    int relative_ttl = (args.flags & (OBJ_EX|OBJ_PX)) != 0; /* EX/PX are relative; EXAT/PXAT are absolute. */
+    if (args.expire && getExpireMillisecondsOrReply(c, args.expire, relative_ttl, args.unit, &milliseconds) != C_OK) {
+        return;
+    }
+
+    if (args.flags & (OBJ_SET_NX | OBJ_SET_XX)) {
+        /* Check NX/XX conditions for each key - pattern from setGenericCommand */
+        for (int j = 0; j < kv_count; j++) {
+            int key_idx = (j * 2) + 2;
+            robj *found = lookupKeyWrite(c->db, c->argv[key_idx]);
+
+            if ((args.flags & OBJ_SET_NX && found) ||
+                (args.flags & OBJ_SET_XX && !found))
+            {
+                addReply(c, shared.czero);
+                return;
+            }
+        }
+    }
+
+    /* Set all key-value pairs */
+    for (int j = 0; j < kv_count; j++) {
+        int key_idx = (j * 2) + 2;
+        int val_idx = key_idx + 1;
+
+        c->argv[val_idx] = tryObjectEncoding(c->argv[val_idx]);
+
+        /* Handle KEEPTTL - preserve existing TTL */
+        int setkey_flags = 0;
+        if (args.flags & OBJ_KEEPTTL) {
+            setkey_flags |= SETKEY_KEEPTTL;
+        }
+
+        setKey(c, c->db, c->argv[key_idx], &(c->argv[val_idx]), setkey_flags);
+        incrRefCount(c->argv[val_idx]);
+
+        /* Set expiration for each key (but not for KEEPTTL) */
+        if (args.expire && !(args.flags & OBJ_KEEPTTL)) {
+            setExpire(c, c->db, c->argv[key_idx], milliseconds);
+            notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",c->argv[key_idx],c->db->id);
+        }
+        notifyKeyspaceEvent(NOTIFY_STRING,"set",c->argv[key_idx],c->db->id);
+    }
+
+    /* Handle replication rewriting for relative expiration times */
+    if (args.expire && !(args.flags & OBJ_PXAT) && !(args.flags & OBJ_EXAT) && args.expire_pos != -1) {
+        /* Convert EX/PX (relative) to PXAT (absolute) for consistent replication.
+         * Keep everything before the options (MSETEX, numkeys and the key-value
+         * pairs), rewrite the option slots as [NX|XX] PXAT <ms>, and drop the
+         * remaining tail. This also removes repeated EX/PX (last one wins). */
+        int pos = kv_count * 2 + 2; /* First option slot. */
+        if (args.flags & (OBJ_SET_NX|OBJ_SET_XX)) {
+            robj *cond_obj = createStringObject((args.flags & OBJ_SET_NX) ? "NX" : "XX", 2);
+            rewriteClientCommandArgument(c, pos++, cond_obj);
+            decrRefCount(cond_obj);
+        }
+        robj *milliseconds_obj = createStringObjectFromLongLong(milliseconds);
+        rewriteClientCommandArgument(c, pos++, shared.pxat);
+        rewriteClientCommandArgument(c, pos++, milliseconds_obj);
+        decrRefCount(milliseconds_obj);
+        /* Remove from the tail so no arguments need to be shifted. */
+        while (c->argc > pos)
+            rewriteClientCommandArgument(c, c->argc - 1, NULL);
+    }
+
+    server.dirty += kv_count;
+    addReply(c, shared.cone);
+}
+
 void incrDecrCommand(client *c, long long incr) {
     long long value, oldvalue;
-    robj *o, *new;
-
-    o = lookupKeyWrite(c->db,c->argv[1]);
+    robj *new;
+    dictEntryLink link;
+    kvobj *o = lookupKeyWriteWithLink(c->db, c->argv[1], &link);
     if (checkType(c,o,OBJ_STRING)) return;
     if (getLongLongFromObjectOrReply(c,o,&value,NULL) != C_OK) return;
 
@@ -604,23 +928,27 @@ void incrDecrCommand(client *c, long long incr) {
     value += incr;
 
     if (o && o->refcount == 1 && o->encoding == OBJ_ENCODING_INT &&
-        (value < 0 || value >= OBJ_SHARED_INTEGERS) &&
         value >= LONG_MIN && value <= LONG_MAX)
     {
         new = o;
         o->ptr = (void*)((long)value);
+        updateKeysizesHist(c->db, OBJ_STRING,
+                           (int64_t) sdigits10(oldvalue),
+                           (int64_t) sdigits10(value));
     } else {
         new = createStringObjectFromLongLongForValue(value);
         if (o) {
-            dbOverwrite(c->db,c->argv[1],new);
+            /* replace value in db and also update keysizes hist */
+            dbReplaceValueWithLink(c->db, c->argv[1], &new, link);
         } else {
-            dbAdd(c->db,c->argv[1],new);
+            /* Add new key to db and also update keysizes hist */
+            dbAddByLink(c->db, c->argv[1], &new, &link);
         }
     }
-    signalModifiedKey(c,c->db,c->argv[1]);
+    addReplyLongLongFromStr(c,new);
+    keyModified(c,c->db,c->argv[1],new,1);
     notifyKeyspaceEvent(NOTIFY_STRING,"incrby",c->argv[1],c->db->id);
     server.dirty++;
-    addReplyLongLong(c, value);
 }
 
 void incrCommand(client *c) {
@@ -652,9 +980,9 @@ void decrbyCommand(client *c) {
 
 void incrbyfloatCommand(client *c) {
     long double incr, value;
-    robj *o, *new;
 
-    o = lookupKeyWrite(c->db,c->argv[1]);
+    dictEntryLink link;
+    kvobj *o = lookupKeyWriteWithLink(c->db,c->argv[1],&link);
     if (checkType(c,o,OBJ_STRING)) return;
     if (getLongDoubleFromObjectOrReply(c,o,&value,NULL) != C_OK ||
         getLongDoubleFromObjectOrReply(c,c->argv[2],&incr,NULL) != C_OK)
@@ -665,12 +993,12 @@ void incrbyfloatCommand(client *c) {
         addReplyError(c,"increment would produce NaN or Infinity");
         return;
     }
-    new = createStringObjectFromLongDouble(value,1);
+    robj *new = createStringObjectFromLongDouble(value,1);
     if (o)
-        dbOverwrite(c->db,c->argv[1],new);
+        dbReplaceValueWithLink(c->db, c->argv[1], &new, link);
     else
-        dbAdd(c->db,c->argv[1],new);
-    signalModifiedKey(c,c->db,c->argv[1]);
+        dbAddByLink(c->db, c->argv[1], &new, &link);
+    keyModified(c,c->db,c->argv[1],new,1);
     notifyKeyspaceEvent(NOTIFY_STRING,"incrbyfloat",c->argv[1],c->db->id);
     server.dirty++;
     addReplyBulk(c,new);
@@ -683,15 +1011,386 @@ void incrbyfloatCommand(client *c) {
     rewriteClientCommandArgument(c,3,shared.keepttl);
 }
 
+/* INCREX option flags. */
+#define OBJ_INCREX_BYFLOAT (1<<0)  /* Set if float-point increment is given */
+#define OBJ_INCREX_BYINT   (1<<1)  /* Set if integer increment is given */
+#define OBJ_INCREX_LBOUND  (1<<2)  /* Set if lower bound of increx result is given */
+#define OBJ_INCREX_UBOUND  (1<<3)  /* Set if upper bound of increx result is given */
+#define OBJ_INCREX_SATURATE (1<<4) /* Saturate the result to LBOUND/UBOUND/type limits when out of bounds. */
+#define OBJ_INCREX_ENX     (1<<5)  /* Set expiration only when the key has no expiry */
+#define OBJ_INCREX_PERSIST (1<<6)  /* Set if we need to remove the ttl */
+#define OBJ_INCREX_EX      (1<<7)  /* Set if time in seconds is given */
+#define OBJ_INCREX_PX      (1<<8)  /* Set if time in ms is given */
+#define OBJ_INCREX_EXAT    (1<<9)  /* Set if timestamp in second is given */
+#define OBJ_INCREX_PXAT    (1<<10) /* Set if timestamp in ms is given */
+
+/* INCREX argument structure */
+typedef struct {
+    int flags;             /* OBJ_INCREX_* bits set during parsing. */
+    int unit;              /* UNIT_SECONDS or UNIT_MILLISECONDS for EX/PX/EXAT/PXAT. */
+    long long expire_ms;   /* Absolute expire timestamp in ms (0 if no expiration given). */
+    long long incr_ll;     /* BYINT increment value (defaults to 1). */
+    long long ub_ll;       /* BYINT upper bound (defaults to LLONG_MAX). */
+    long long lb_ll;       /* BYINT lower bound (defaults to LLONG_MIN). */
+    long double incr_ld;   /* BYFLOAT increment value (defaults to 0). */
+    long double ub_ld;     /* BYFLOAT upper bound (defaults to LDBL_MAX). */
+    long double lb_ld;     /* BYFLOAT lower bound (defaults to -LDBL_MAX). */
+} incrExArgs;
+
+/* The parseIncrExArgumentsOrReply() function performs validation for INCREX command.
+ * If there are any syntax violations C_ERR is returned else C_OK is returned. */
+static int parseIncrExArgumentsOrReply(client *c, int start_pos, incrExArgs *args) {
+    memset(args, 0, sizeof(*args));
+    args->unit = UNIT_SECONDS;
+    args->incr_ll = 1;
+    args->lb_ll = LLONG_MIN;
+    args->ub_ll = LLONG_MAX;
+    args->lb_ld = -LDBL_MAX;
+    args->ub_ld = LDBL_MAX;
+
+    /* LBOUND/UBOUND values are parsed after the loop because their target type
+     * depends on whether BYINT or BYFLOAT was given, which may appear later. */
+    robj *lower_bound = NULL, *upper_bound = NULL, *expire = NULL;
+
+    /* Mask of all mutually-exclusive expiration-related flags. */
+    const int expire_flags = OBJ_INCREX_EX|OBJ_INCREX_PX|OBJ_INCREX_EXAT|OBJ_INCREX_PXAT|OBJ_INCREX_PERSIST;
+
+    for (int j = start_pos; j < c->argc; j++) {
+        char *opt = c->argv[j]->ptr;
+        robj *next = (j == c->argc-1) ? NULL : c->argv[j+1];
+
+        if (!strcasecmp(opt, "BYINT") && next && !(args->flags & (OBJ_INCREX_BYINT|OBJ_INCREX_BYFLOAT))) {
+            if (getLongLongFromObjectOrReply(c, next, &args->incr_ll,
+                    "Increment is not an integer or out of range") != C_OK)
+            {
+                return C_ERR;
+            }
+            args->flags |= OBJ_INCREX_BYINT;
+            j++;
+        } else if (!strcasecmp(opt, "BYFLOAT") && next && !(args->flags & (OBJ_INCREX_BYINT|OBJ_INCREX_BYFLOAT))) {
+            if (getLongDoubleFromObjectOrReply(c, next, &args->incr_ld,
+                    "Increment is not a valid float") != C_OK)
+            {
+                return C_ERR;
+            }
+            if (isinf(args->incr_ld)) {
+                addReplyError(c, "BYFLOAT increment cannot be Infinity");
+                return C_ERR;
+            }
+            args->flags |= OBJ_INCREX_BYFLOAT;
+            j++;
+        } else if (!strcasecmp(opt, "LBOUND") && next && !(args->flags & OBJ_INCREX_LBOUND)) {
+            args->flags |= OBJ_INCREX_LBOUND;
+            lower_bound = next;
+            j++;
+        } else if (!strcasecmp(opt, "UBOUND") && next && !(args->flags & OBJ_INCREX_UBOUND)) {
+            args->flags |= OBJ_INCREX_UBOUND;
+            upper_bound = next;
+            j++;
+        } else if (!strcasecmp(opt, "SATURATE") && !(args->flags & OBJ_INCREX_SATURATE)) {
+            args->flags |= OBJ_INCREX_SATURATE;
+        } else if (!strcasecmp(opt, "ENX") && !(args->flags & (OBJ_INCREX_ENX|OBJ_INCREX_PERSIST))) {
+            args->flags |= OBJ_INCREX_ENX;
+        } else if (!strcasecmp(opt, "PERSIST") && !(args->flags & (expire_flags|OBJ_INCREX_ENX))) {
+            args->flags |= OBJ_INCREX_PERSIST;
+        } else if (!strcasecmp(opt, "EX") && !(args->flags & expire_flags) && next) {
+            args->flags |= OBJ_INCREX_EX;
+            expire = next;
+            j++;
+        } else if (!strcasecmp(opt, "PX") && !(args->flags & expire_flags) && next) {
+            args->flags |= OBJ_INCREX_PX;
+            args->unit = UNIT_MILLISECONDS;
+            expire = next;
+            j++;
+        } else if (!strcasecmp(opt, "EXAT") && !(args->flags & expire_flags) && next) {
+            args->flags |= OBJ_INCREX_EXAT;
+            expire = next;
+            j++;
+        } else if (!strcasecmp(opt, "PXAT") && !(args->flags & expire_flags) && next) {
+            args->flags |= OBJ_INCREX_PXAT;
+            args->unit = UNIT_MILLISECONDS;
+            expire = next;
+            j++;
+        } else {
+            addReplyErrorObject(c, shared.syntaxerr);
+            return C_ERR;
+        }
+    }
+
+    /* Resolve LBOUND/UBOUND values now that BYINT/BYFLOAT is known. */
+    if (args->flags & OBJ_INCREX_BYFLOAT) {
+        if (lower_bound && getLongDoubleFromObjectOrReply(c, lower_bound, &args->lb_ld,
+                "LBOUND is not a valid float") != C_OK)
+        {
+            return C_ERR;
+        }
+        if (upper_bound && getLongDoubleFromObjectOrReply(c, upper_bound, &args->ub_ld,
+                "UBOUND is not a valid float") != C_OK)
+        {
+            return C_ERR;
+        }
+        if (args->lb_ld > args->ub_ld) {
+            addReplyError(c, "LBOUND can't be greater than UBOUND");
+            return C_ERR;
+        }
+    } else {
+        if (lower_bound && getLongLongFromObjectOrReply(c, lower_bound, &args->lb_ll,
+                "LBOUND is not an integer or out of range") != C_OK)
+        {
+            return C_ERR;
+        }
+        if (upper_bound && getLongLongFromObjectOrReply(c, upper_bound, &args->ub_ll,
+                "UBOUND is not an integer or out of range") != C_OK)
+        {
+            return C_ERR;
+        }
+        if (args->lb_ll > args->ub_ll) {
+            addReplyError(c, "LBOUND can't be greater than UBOUND");
+            return C_ERR;
+        }
+    }
+
+    /* ENX requires an expiration option. */
+    if ((args->flags & OBJ_INCREX_ENX) && !(args->flags & expire_flags)) {
+        addReplyError(c, "ENX flag requires an expiration");
+        return C_ERR;
+    }
+
+    if (expire) {
+        int relative_ttl = (args->flags & (OBJ_INCREX_EX|OBJ_INCREX_PX)) != 0;
+        if (getExpireMillisecondsOrReply(c, expire, relative_ttl, args->unit, &args->expire_ms) != C_OK)
+            return C_ERR;
+    }
+    return C_OK;
+}
+
+/*
+ * INCREX <key> [BYFLOAT increment | BYINT increment] [LBOUND lowerbound]
+ *   [UBOUND upperbound] [SATURATE]
+ *   [EX seconds | PX milliseconds | EXAT seconds-timestamp | PXAT milliseconds-timestamp | PERSIST] [ENX]
+ *
+ * Increments the numeric value of a key and optionally updates its expiration time.
+ *
+ * Increment options:
+ * Defaults to incrementing by 1 (like INCR) if no increment option is given.
+ * At most one of the following may be specified:
+ * - BYINT:   Increment by an integer (like INCRBY).
+ * - BYFLOAT: Increment by a float (like INCRBYFLOAT). Returns an error if the result is NaN or Infinity.
+ *
+ * Range options:
+ * LBOUND and UBOUND optionally restrict the result to a range. The behavior
+ * when the result would land outside that range (or, with no explicit bound,
+ * would overflow the type limits) is controlled by SATURATE:
+ * - Default:    the operation is rejected (the key value and TTL are left
+ *               unchanged) and the reply is the current value with an applied
+ *               increment of 0.
+ * - SATURATE:   the result is capped at UBOUND / floored at LBOUND (or
+ *               saturated to the type limits when no explicit bound is given)
+ *               instead of being rejected.
+ *
+ * Expiration options:
+ * At most one of the following may be specified:
+ * - EX:      Set expiration in seconds.
+ * - PX:      Set expiration in milliseconds.
+ * - EXAT:    Set expiration to an absolute Unix timestamp (seconds).
+ * - PXAT:    Set expiration to an absolute Unix timestamp (milliseconds).
+ * - PERSIST: Remove the key's TTL.
+ *
+ * If no expiration option is given, the key's existing TTL is preserved.
+ * ENX restricts expiration updates to keys that currently have no TTL.
+ *
+ * Reply:
+ * - (Array) of two Bulk Strings on success:
+ *   1. The new value of the key after the increment.
+ *   2. The actual increment applied.
+ *
+ * Note: When the result is saturated by LBOUND/UBOUND, the expiration is still updated normally.
+ */
+void increxCommand(client *c) {
+    kvobj *o = NULL;
+    robj *new = NULL;
+    dictEntryLink link;
+    long long value_ll, oldvalue_ll = 0;
+    long double value_ld, oldvalue_ld = 0;
+
+    incrExArgs args;
+    if (parseIncrExArgumentsOrReply(c, 2, &args) != C_OK)
+        return;
+
+    o = lookupKeyWriteWithLink(c->db, c->argv[1], &link);
+    if (checkType(c, o, OBJ_STRING)) return;
+
+    int byfloat = args.flags & OBJ_INCREX_BYFLOAT;
+    /* By default the operation is rejected on out-of-bounds:
+     * leave the key unchanged and reply [current_value, 0]. */
+    int sat_mode = args.flags & OBJ_INCREX_SATURATE;
+    if (byfloat) {
+        long double lb = args.lb_ld, ub = args.ub_ld;
+        if (getLongDoubleFromObjectOrReply(c, o, &value_ld, NULL) != C_OK)
+            return;
+
+        /* Reject if the existing value is already Infinity (the increment is
+         * checked at parse time in parseIncrExArgumentsOrReply). */
+        if (isinf(value_ld)) {
+            addReplyError(c, "value cannot be Infinity");
+            return;
+        }
+
+        oldvalue_ld = value_ld;
+        value_ld += args.incr_ld;
+        int overflow = isinf(value_ld);
+        if (overflow || value_ld > ub || value_ld < lb) {
+            /* Result is infinite or out of [LBOUND, UBOUND]:
+             * default: reject (leave key untouched, reply [current_value, 0]);
+             * SATURATE: clamp to +/-LDBL_MAX or the breached bound. */
+            if (!sat_mode) {
+                addReplyArrayLen(c, 2);
+                addReplyHumanLongDouble(c, oldvalue_ld);
+                addReplyHumanLongDouble(c, 0);
+                return;
+            }
+
+            /* SATURATE: clamp the result. */
+            if (overflow)
+                value_ld = (args.incr_ld >= 0) ? ub : lb;
+            else
+                value_ld = value_ld > ub ? ub : lb;
+        }
+
+        long double delta = value_ld - oldvalue_ld;
+        if (isinf(delta)) {
+            /* The applied delta cannot be represented as a valid long double. This can
+             * only happen under SATURATE when the saturated result and the
+             * prior value sit at opposite ends of the type range. */
+            addReplyError(c, "applied increment would be Infinity");
+            return;
+        }
+
+        addReplyArrayLen(c, 2);
+        addReplyHumanLongDouble(c, value_ld);
+        addReplyHumanLongDouble(c, delta);
+    } else {
+        long long lb = args.lb_ll, ub = args.ub_ll;
+        if (getLongLongFromObjectOrReply(c, o, &value_ll, NULL) != C_OK)
+            return;
+
+        oldvalue_ll = value_ll;
+        int overflow = add_overflow_ll(oldvalue_ll, args.incr_ll, &value_ll);
+        if (overflow || value_ll > ub || value_ll < lb) {
+            /* Result overflows long long or is out of [LBOUND, UBOUND]:
+             * default: reject (leave key untouched, reply [current_value, 0]);
+             * SATURATE: clamp to LLONG_MAX/LLONG_MIN or the breached bound. */
+            if (!sat_mode) {
+                addReplyArrayLen(c, 2);
+                addReplyLongLong(c, oldvalue_ll);
+                addReplyLongLong(c, 0);
+                return;
+            }
+
+            /* SATURATE: clamp the result. */
+            if (overflow)
+                value_ll = (args.incr_ll >= 0) ? ub : lb;
+            else
+                value_ll = value_ll > ub ? ub : lb;
+        }
+
+        long long delta = 0;
+        if (sub_overflow_ll(value_ll, oldvalue_ll, &delta)) {
+            /* The applied delta cannot be represented as a long long. This can
+             * only happen under SATURATE when the saturated result and the
+             * prior value sit at opposite ends of the type range. */
+            addReplyError(c, "applied increment would overflow");
+            return;
+        }
+
+        addReplyArrayLen(c, 2);
+        addReplyLongLong(c, value_ll);
+        addReplyLongLong(c, delta);
+    }
+
+    /* If the expire time is already elapsed, it is propagated as DEL/UNLINK */
+    int has_expiry = o && (kvobjGetExpire(o) != -1);
+    int set_new_expire = args.expire_ms && (!(args.flags & OBJ_INCREX_ENX) || !has_expiry);
+    if (set_new_expire && checkAlreadyExpired(args.expire_ms)) {
+        if (o) {
+            int deleted = dbGenericDelete(c->db, c->argv[1], server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED);
+            serverAssert(deleted);
+            robj *aux = server.lazyfree_lazy_expire ? shared.unlink : shared.del;
+            rewriteClientCommandVector(c, 2, aux, c->argv[1]);
+            keyModified(c, c->db, c->argv[1], NULL, 1);
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
+            server.dirty++;
+        }
+        server.stat_expiredkeys++;
+        return;
+    }
+
+    if (!byfloat && o && o->refcount == 1 && o->encoding == OBJ_ENCODING_INT &&
+        value_ll >= LONG_MIN && value_ll <= LONG_MAX)
+    {
+        new = o;
+        o->ptr = (void*)((long)value_ll);
+        updateKeysizesHist(c->db, OBJ_STRING, (int64_t)sdigits10(oldvalue_ll), (int64_t)sdigits10(value_ll));
+    } else {
+        if (byfloat)
+            new = createStringObjectFromLongDouble(value_ld, 1);
+        else
+            new = createStringObjectFromLongLongForValue(value_ll);
+        if (o)
+            dbReplaceValueWithLink(c->db, c->argv[1], &new, link);
+        else
+            dbAddByLink(c->db, c->argv[1], &new, &link);
+    }
+
+    /* Replicate INCREX as SET with the final value to avoid float precision
+     * or formatting drift across replicas / AOF restart. The TTL clause is:
+     *   PERSIST          -> SET <key> <result>
+     *   sets a new TTL   -> SET <key> <result> PXAT <timestamp>
+     *   otherwise        -> SET <key> <result> KEEPTTL  (no expire option,
+     *                       or ENX hit on a key that already has a TTL) */
+    int persist_notify = 0, expire_notify = 0;
+    if (args.flags & OBJ_INCREX_PERSIST) {
+        persist_notify = removeExpire(c->db, c->argv[1]);
+        rewriteClientCommandVector(c, 3, shared.set, c->argv[1], new);
+    } else if (set_new_expire) {
+        new = setExpire(c, c->db, c->argv[1], args.expire_ms);
+        expire_notify = 1;
+        robj *milliseconds_obj = createStringObjectFromLongLong(args.expire_ms);
+        rewriteClientCommandVector(c, 5, shared.set, c->argv[1], new, shared.pxat, milliseconds_obj);
+        decrRefCount(milliseconds_obj);
+    } else {
+        rewriteClientCommandVector(c, 4, shared.set, c->argv[1], new, shared.keepttl);
+    }
+
+    keyModified(c, c->db, c->argv[1], new, 1);
+    server.dirty++;
+
+    notifyKeyspaceEvent(NOTIFY_STRING, byfloat ? "incrbyfloat" : "incrby", c->argv[1], c->db->id);
+    if (persist_notify)
+        notifyKeyspaceEvent(NOTIFY_GENERIC, "persist", c->argv[1], c->db->id);
+    if (expire_notify)
+        notifyKeyspaceEvent(NOTIFY_GENERIC, "expire", c->argv[1], c->db->id);
+
+    /* A KSN handler may reallocate the kvobj and replace it in the dict. The local
+     * pointers `o`/`new` may then point to a stale object and must not be dereferenced;
+     * null them out. The object is not freed though if rewriteClientCommandVector()
+     * above incremented its refcount, so c->argv keeps it alive for command propagation. */
+    KSN_INVALIDATE_KVOBJ(o);
+    KSN_INVALIDATE_KVOBJ(new);
+}
+
 void appendCommand(client *c) {
     size_t totlen;
-    robj *o, *append;
+    robj *append;
+    kvobj *o;
+    size_t oldsize = 0;
 
-    o = lookupKeyWrite(c->db,c->argv[1]);
+    dictEntryLink link;
+    o = lookupKeyWriteWithLink(c->db,c->argv[1],&link);
     if (o == NULL) {
         /* Create the key */
         c->argv[2] = tryObjectEncoding(c->argv[2]);
-        dbAdd(c->db,c->argv[1],c->argv[2]);
+        o = dbAddByLink(c->db, c->argv[1], &c->argv[2], &link);
         incrRefCount(c->argv[2]);
         totlen = stringObjectLen(c->argv[2]);
     } else {
@@ -701,26 +1400,33 @@ void appendCommand(client *c) {
 
         /* "append" is an argument, so always an sds */
         append = c->argv[2];
-        totlen = stringObjectLen(o)+sdslen(append->ptr);
-        if (checkStringLength(c,totlen) != C_OK)
+        size_t append_len = sdslen(append->ptr);
+        if (checkStringLength(c,stringObjectLen(o),append_len) != C_OK)
             return;
 
         /* Append the value */
-        o = dbUnshareStringValue(c->db,c->argv[1],o);
-        o->ptr = sdscatlen(o->ptr,append->ptr,sdslen(append->ptr));
+        o = dbUnshareStringValueByLink(c->db,c->argv[1],o,link);
+        if (server.memory_tracking_enabled)
+            oldsize = kvobjAllocSize(o);
+        o->ptr = sdscatlen(o->ptr,append->ptr,append_len);
+        if (server.memory_tracking_enabled)
+            updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), o, oldsize, kvobjAllocSize(o));
         totlen = sdslen(o->ptr);
+        int64_t oldlen = totlen - append_len;
+        updateKeysizesHist(c->db, OBJ_STRING, oldlen, totlen);
     }
-    signalModifiedKey(c,c->db,c->argv[1]);
+    keyModified(c,c->db,c->argv[1],o,1);
     notifyKeyspaceEvent(NOTIFY_STRING,"append",c->argv[1],c->db->id);
     server.dirty++;
+
     addReplyLongLong(c,totlen);
 }
 
 void strlenCommand(client *c) {
-    robj *o;
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
-        checkType(c,o,OBJ_STRING)) return;
-    addReplyLongLong(c,stringObjectLen(o));
+    kvobj *kv;
+    if ((kv = lookupKeyReadOrReply(c, c->argv[1], shared.czero)) == NULL ||
+        checkType(c, kv, OBJ_STRING)) return;
+    addReplyLongLong(c,stringObjectLen(kv));
 }
 
 /* LCS key1 key2 [LEN] [IDX] [MINMATCHLEN <len>] [WITHMATCHLEN] */
@@ -729,10 +1435,9 @@ void lcsCommand(client *c) {
     long long minmatchlen = 0;
     sds a = NULL, b = NULL;
     int getlen = 0, getidx = 0, withmatchlen = 0;
-    robj *obja = NULL, *objb = NULL;
 
-    obja = lookupKeyRead(c->db,c->argv[1]);
-    objb = lookupKeyRead(c->db,c->argv[2]);
+    kvobj *obja = lookupKeyRead(c->db, c->argv[1]);
+    kvobj *objb = lookupKeyRead(c->db, c->argv[2]);
     if ((obja && obja->type != OBJ_STRING) ||
         (objb && objb->type != OBJ_STRING))
     {
@@ -937,5 +1642,55 @@ cleanup:
     if (obja) decrRefCount(obja);
     if (objb) decrRefCount(objb);
     return;
+}
+
+/* Validate that a digest string has the correct length (DIGEST_HEX_LENGTH characters).
+ * Note: This only validates length, not whether characters are valid hex digits.
+ * Invalid hex characters will simply fail to match during comparison.
+ * Returns C_OK if length is correct, C_ERR otherwise. */
+int validateHexDigest(client *c, const sds digest) {
+    size_t len = sdslen(digest);
+    if (len != DIGEST_HEX_LENGTH) {
+        addReplyErrorFormat(c, "must be exactly %d hexadecimal characters", DIGEST_HEX_LENGTH);
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+/* Return the xxh3 hash of a string object as a hex string stored in an sds.
+ * The user is responsible for freeing the sds. */
+sds stringDigest(robj *o) {
+    serverAssert(o && o->type == OBJ_STRING);
+
+    XXH64_hash_t hash = 0;
+    if (sdsEncodedObject(o)) {
+        hash = XXH3_64bits(o->ptr, sdslen(o->ptr));
+    } else if (o->encoding == OBJ_ENCODING_INT) {
+        char buf[LONG_STR_SIZE];
+        size_t len = ll2string(buf,sizeof(buf),(long)o->ptr);
+        hash = XXH3_64bits(buf, len);
+    } else {
+        serverPanic("Wrong obj->encoding stringDigest()");
+    }
+
+    sds hexhash = sdsempty();
+    hexhash = sdscatprintf(hexhash, "%0" STRINGIFY(DIGEST_HEX_LENGTH) PRIx64, hash);
+    return hexhash;
+}
+
+/* DIGEST key
+ *
+ * Return digest of the key's value computed via XXH3 hash. The key must be a
+ * STRING object. */
+void digestCommand(client *c) {
+    kvobj *o;
+
+    if ((o = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL)
+        return;
+
+    if (checkType(c,o,OBJ_STRING))
+        return;
+
+    addReplyBulkSds(c, stringDigest(o));
 }
 

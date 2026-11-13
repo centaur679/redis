@@ -1,3 +1,17 @@
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
+
 start_server {tags {"auth external:skip"}} {
     test {AUTH fails if there is no password configured server side} {
         catch {r auth foo} err
@@ -45,6 +59,24 @@ start_server {tags {"auth external:skip"} overrides {requirepass foobar}} {
         assert_match {*unauthenticated bulk length*} $e
         $rr close
     }
+
+    test {For unauthenticated clients output buffer is limited} {
+        set rr [redis [srv "host"] [srv "port"] 1 $::tls]
+        $rr SET x 5
+        catch {[$rr read]} e
+        assert_match {*NOAUTH Authentication required*} $e
+
+        # Fill the output buffer in a loop without reading it and make
+        # sure the client disconnected.
+        # Considering the socket eat some of the replies, we are testing
+        # that such client can't consume more than few MB's.
+        catch {
+            for {set j 0} {$j < 1000000} {incr j} {
+                    $rr SET x 5
+            }
+        } e
+        assert_match {I/O error reading reply} $e
+    }
 }
 
 start_server {tags {"auth_binary_password external:skip"}} {
@@ -65,24 +97,29 @@ start_server {tags {"auth_binary_password external:skip"}} {
         set master_port [srv -1 port]
         set slave [srv 0 client]
 
-        test {MASTERAUTH test with binary password} {
-            $master config set requirepass "abc\x00def"
+        foreach rdbchannel {yes no} {
+            test "MASTERAUTH test with binary password rdbchannel=$rdbchannel" {
+                $slave slaveof no one
+                $master config set requirepass "abc\x00def"
+                $master config set repl-rdb-channel $rdbchannel
 
-            # Configure the replica with masterauth
-            set loglines [count_log_lines 0]
-            $slave slaveof $master_host $master_port
-            $slave config set masterauth "abc"
+                # Configure the replica with masterauth
+                set loglines [count_log_lines 0]
+                $slave config set masterauth "abc"
+                $slave config set repl-rdb-channel $rdbchannel
+                $slave slaveof $master_host $master_port
 
-            # Verify replica is not able to sync with master
-            wait_for_log_messages 0 {"*Unable to AUTH to MASTER*"} $loglines 1000 10
-            assert_equal {down} [s 0 master_link_status]
-            
-            # Test replica with the correct masterauth
-            $slave config set masterauth "abc\x00def"
-            wait_for_condition 50 100 {
-                [s 0 master_link_status] eq {up}
-            } else {
-                fail "Can't turn the instance into a replica"
+                # Verify replica is not able to sync with master
+                wait_for_log_messages 0 {"*Unable to AUTH to MASTER*"} $loglines 1000 10
+                assert_equal {down} [s 0 master_link_status]
+
+                # Test replica with the correct masterauth
+                $slave config set masterauth "abc\x00def"
+                wait_for_condition 50 100 {
+                    [s 0 master_link_status] eq {up}
+                } else {
+                    fail "Can't turn the instance into a replica"
+                }
             }
         }
     }

@@ -1,35 +1,22 @@
 /* Redis Object implementation.
  *
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-Present, Redis Ltd.
+ * All rights reserved.
+ * 
+ * Copyright (c) 2024-present, Valkey contributors.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "server.h"
+#include "bitroar.h"
 #include "functions.h"
+#include "intset.h"  /* Compact integer set structure */
+#include "cluster_asm.h"
+#include "zset_btree.h"
 #include <math.h>
 #include <ctype.h>
 
@@ -37,7 +24,90 @@
 #define strtold(a,b) ((long double)strtod((a),(b)))
 #endif
 
+static_assert(sizeof(kvBits) == 1, "kvBits must be a single byte");
+
+/* Map a metadata ID (bit index) to its compacted slot number among set bits,
+ * then return a pointer to that slot. Caller must ensure the ID bit is set. */
+uint64_t *kvobjMetaRef(kvobj *kv, int metaId) {
+    uint32_t bits = kv->metabits;
+
+    /* Expiry is always the first metadata */
+    if (likely(metaId == 0)) return ((uint64_t *)kv) - 1;
+    
+    uint32_t maskId = 1u << metaId;
+    serverAssert(bits & maskId);
+    
+    /* Count set bits with lower IDs to get the compacted slot index. */
+    uint32_t lowerMask = maskId - 1u;
+    int metaSlot = __builtin_popcount(bits & lowerMask);
+    return ((uint64_t *)kv) - metaSlot - 1;
+}
+
+/* For objects with large embedded keys, we reserve space for an expire field,
+ * so if expire is set later, we don't need to reallocate the object. */
+#define KEY_SIZE_TO_INCLUDE_EXPIRE_THRESHOLD 128
+
 /* ===================== Creation and parsing of objects ==================== */
+
+/* Creates kvobj (with embedded key and optional metadata) 
+ * 
+ * keyMetaBits - bitmask of active metadata classes to allocate space for (bit 0 is
+ *               reserved for expiration).
+ * 
+ * Example of "mykey" with expiration and metadata :
+ * 
+ *    +------------+------------+-----------+------------+------------------------+
+ *    | m.meta (8) | expiry (8) | robj (16) | kvbits (1) | sdshdr5 "mykey" \0 (7) | 
+ *    +------------+------------+-----------+------------+------------------------+
+ *                              ^
+ *                              |
+ *                              kvobjCreate() returns pointer to here
+ */
+kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits) {
+    /* Determine embedded key and expiration flags */
+    serverAssert(key != NULL);
+
+    /* If key is large and expire is not set, add space for it. */
+    size_t key_sds_len = sdslen(key);
+    if (key_sds_len >= KEY_SIZE_TO_INCLUDE_EXPIRE_THRESHOLD)
+        keyMetaBits |= KEY_META_MASK_EXPIRE;
+
+    /* Now that keyMetaBits is finalized, compute metadata size. */
+    uint32_t sizeMetas = getNumMeta(keyMetaBits) * sizeof(uint64_t);
+
+    /* Calculate embedded key size */
+    char key_sds_type = sdsReqType(key_sds_len);
+    size_t key_sds_size = sdsReqSize(key_sds_len, key_sds_type);
+    debugServerAssert(key_sds_type <= SDS_TYPE_32); /* keys are never > 4GB */
+
+    /* Compute the base object size */
+    size_t min_size = sizeof(robj) + sizeof(kvBits);
+    min_size += sizeMetas;
+    min_size += key_sds_size;
+
+    /* Allocate object memory */
+    char *alloc = zmalloc(min_size);
+    kvobj *kv = (kvobj *) (alloc + sizeMetas);
+    kv->type = type;
+    kv->encoding = OBJ_ENCODING_RAW;
+    kv->ptr = ptr;
+    kv->refcount = 1;
+    kv->lru = 0;
+    kv->iskvobj = 1;
+    kv->metabits = keyMetaBits;
+    kvobjBits(kv)->key_sds_type = key_sds_type;
+    kvobjBits(kv)->no_evict = 0;
+    kvobjBits(kv)->unused = 0;
+
+    /* Store embedded key, right after the kvBits. */
+    char *data = (char *) (kvobjBits(kv) + 1);
+    sdsnewplacement(data, key_sds_size, key_sds_type, key, key_sds_len);
+
+    /* Reset each allocated metadata to its reset_value (such as Expiry=-1, etc) */
+    keyMetaResetValues(kv);
+
+    return kv;
+}
 
 robj *createObject(int type, void *ptr) {
     robj *o = zmalloc(sizeof(*o));
@@ -45,15 +115,23 @@ robj *createObject(int type, void *ptr) {
     o->encoding = OBJ_ENCODING_RAW;
     o->ptr = ptr;
     o->refcount = 1;
+    o->lru = 0;
+    o->iskvobj = 0;
+    o->metabits = 0;
+    return o;
+}
 
-    /* Set the LRU to the current lruclock (minutes resolution), or
+void initObjectLRUOrLFU(robj *o) {
+    if (o->refcount == OBJ_SHARED_REFCOUNT)
+        return;
+    /* Set the LRU to the current lruclock (seconds resolution), or
      * alternatively the LFU counter. */
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
-        o->lru = (LFUGetTimeInMinutes()<<8) | LFU_INIT_VAL;
+        o->lru = (LFUGetTimeInMinutes() << 8) | LFU_INIT_VAL;
     } else {
         o->lru = LRU_CLOCK();
     }
-    return o;
+    return;
 }
 
 /* Set a special refcount in the object to make it "shared":
@@ -79,35 +157,186 @@ robj *createRawStringObject(const char *ptr, size_t len) {
     return createObject(OBJ_STRING, sdsnewlen(ptr,len));
 }
 
-/* Create a string object with encoding OBJ_ENCODING_EMBSTR, that is
- * an object where the sds string is actually an unmodifiable string
- * allocated in the same chunk as the object itself. */
-robj *createEmbeddedStringObject(const char *ptr, size_t len) {
-    robj *o = zmalloc(sizeof(robj)+sizeof(struct sdshdr8)+len+1);
-    struct sdshdr8 *sh = (void*)(o+1);
+/* Creates a new embedded string object and copies the content of key, val and
+ * expire to the new object. LRU is set to 0. 
+ * 
+ * Example of kvobj "mykey" with embedded "myvalue" (16+1+7+11 = 35bytes):
+ *    +-----------+------------+------------------------+----------------------------+
+ *    | robj (16) | kvbits (1) | sdshdr5 "mykey" \0 (7) | sdshdr8 "myvalue" \0  (11) | 
+ *    +-----------+------------+------------------------+----------------------------+
+ */
+static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
+                                     const sds key, uint32_t keyMetaBits)
+{
+    kvobj *o;
+    debugServerAssert(key != NULL);
+    uint32_t sizeMetas = getNumMeta(keyMetaBits) * sizeof(uint64_t);
+
+    /* Calculate sizes for embedded key */
+    size_t key_sds_len = sdslen(key);
+    char key_sds_type = sdsReqType(key_sds_len);
+    size_t key_sds_size = sdsReqSize(key_sds_len, key_sds_type);
+    debugServerAssert(key_sds_type <= SDS_TYPE_32); /* keys are never > 4GB */
+
+    /* Calculate size for embedded value (always SDS_TYPE_8) */
+    size_t val_sds_size = sdsReqSize(val_len, SDS_TYPE_8);
+
+    /* Compute base object size */
+    size_t min_size = sizeof(robj) + sizeof(kvBits) + val_sds_size;
+    min_size += sizeMetas;
+    min_size += key_sds_size;
+
+    /* Allocate object memory */
+    size_t bufsize = 0;
+    char *alloc = zmalloc_usable(min_size, &bufsize);
+    o = (kvobj *) (alloc + sizeMetas);
 
     o->type = OBJ_STRING;
     o->encoding = OBJ_ENCODING_EMBSTR;
-    o->ptr = sh+1;
     o->refcount = 1;
-    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
-        o->lru = (LFUGetTimeInMinutes()<<8) | LFU_INIT_VAL;
+    o->lru = 0;
+    o->metabits = keyMetaBits;
+    o->iskvobj = 1;
+    kvobjBits(o)->key_sds_type = key_sds_type;
+    kvobjBits(o)->no_evict = 0;
+    kvobjBits(o)->unused = 0;
+
+    /* Store embedded key, right after the kvBits. */
+    char *data = (char *) (kvobjBits(o) + 1);
+    sdsnewplacement(data, key_sds_size, key_sds_type, key, key_sds_len);
+    data += key_sds_size;
+
+    /* Copy embedded value (EMBSTR) always as SDS TYPE 8. Account for unused
+     * memory in the SDS alloc field. */
+    size_t remaining_size = bufsize - (data - alloc);
+    o->ptr = sdsnewplacement(data, remaining_size, SDS_TYPE_8, val_ptr, val_len);
+    
+    keyMetaResetValues(o); /* modules + expire */
+    
+    return o;
+}
+
+/* Create a string object with encoding OBJ_ENCODING_EMBSTR, that is
+ * an object where the sds string is actually an unmodifiable string
+ * allocated in the same chunk as the object itself.
+ * 
+ * Example of robj with embedded "myvalue" (16+11 = 27 bytes):
+ *    +-----------+----------------------------+
+ *    | robj (16) | sdshdr8 "myvalue" \0  (11) | 
+ *    +-----------+----------------------------+
+ */
+static inline robj *createEmbeddedStringObject(const char *val_ptr, size_t val_len) {
+    /* Calculate size for embedded value (always SDS_TYPE_8) */
+    size_t val_sds_size = sdsReqSize(val_len, SDS_TYPE_8);
+    
+    /* Allocate object memory */
+    size_t bufsize = 0;
+    robj *o = zmalloc_usable(sizeof(robj) + val_sds_size, &bufsize);
+    o->type = OBJ_STRING;
+    o->encoding = OBJ_ENCODING_EMBSTR;
+    o->refcount = 1;
+    o->lru = 0;
+    o->metabits = 0;
+    o->iskvobj = 0;
+
+    /* The memory after the struct where we embedded data. */
+    char *data = (char *)(o + 1);
+    
+    /* Copy embedded value (EMBSTR) always as SDS TYPE 8. Account for unused
+     * memory in the SDS alloc field. */
+    size_t remaining_size = bufsize - (data - (char *)(void *)o);
+    o->ptr = sdsnewplacement(data, remaining_size, SDS_TYPE_8, val_ptr, val_len);
+    return o;
+}
+
+/* SDS header size of the embedded key, indexed by kvBits->key_sds_type. */
+sds kvobjGetKey(const kvobj *kv) {
+    static const uint8_t kvobjKeyHdrSize[4] = {
+        sizeof(struct sdshdr5), sizeof(struct sdshdr8),
+        sizeof(struct sdshdr16), sizeof(struct sdshdr32)
+    };
+    debugServerAssert(kv->iskvobj);
+    kvBits *bits = kvobjBits(kv);
+    return (sds) ((char *) (bits + 1) + kvobjKeyHdrSize[bits->key_sds_type]);
+}
+
+long long kvobjGetExpire(const kvobj *kv) {
+    if (kv->metabits & KEY_META_MASK_EXPIRE) {
+        return (long long) (*kvobjMetaRef((kvobj *)kv, KEY_META_ID_EXPIRE));
     } else {
-        o->lru = LRU_CLOCK();
+        return -1;
+    }
+}
+
+/* This functions may reallocate the value. The new allocation is returned and
+ * the old object's reference counter is decremented and possibly freed. Use the
+ * returned object instead of 'val' after calling this function. */
+kvobj *kvobjSetExpire(kvobj *kv, long long expire) {
+    /* If kv not expirable, then we need to realloc to add expire metadata */ 
+    if (!(kv->metabits & KEY_META_MASK_EXPIRE)) {
+        /* Nothing to do if kv not expirable and expire is -1 */
+        if (expire == -1)
+            return kv;
+        
+        kv = kvobjSet(kvobjGetKey(kv), kv, kv->metabits | KEY_META_MASK_EXPIRE);
     }
 
-    sh->len = len;
-    sh->alloc = len;
-    sh->flags = SDS_TYPE_8;
-    if (ptr == SDS_NOINIT)
-        sh->buf[len] = '\0';
-    else if (ptr) {
-        memcpy(sh->buf,ptr,len);
-        sh->buf[len] = '\0';
+    /* kv is expirable. Update expire field. */
+    *kvobjMetaRef(kv, KEY_META_ID_EXPIRE) = expire;
+    return kv;
+}
+
+/* This functions may reallocate the value. The new allocation is returned and
+ * the old object's reference counter is decremented and possibly freed. Use the
+ * returned object instead of 'val' after calling this function. */
+kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits) {
+    kvobj *kv;
+    if (val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_EMBSTR) {
+        size_t len = sdslen(val->ptr);
+
+        /* Embed when the sum is less than a cache line (Metadata is discarded 
+         * since we don't have to be accurate and it is placed before the object) */
+        size_t size = sizeof(kvobj) + sizeof(kvBits);
+        size += (key != NULL) * (sdslen(key) + 2); /* sds hdr (1) + nullterm (1) */
+        size += 4 + len; /* embstr header (3) + nullterm (1) */
+        if (size <= CACHE_LINE_SIZE) {
+            kv = kvobjCreateEmbedString(val->ptr, len, key, keyMetaBits);
+        } else {
+            kv = kvobjCreate(OBJ_STRING, key, sdsnewlen(val->ptr, len), keyMetaBits);
+        }
     } else {
-        memset(sh->buf,0,len+1);
+        /* Create a new object with embedded key. Reuse ptr if possible. */
+        void *valptr;
+        if (val->refcount == 1) {
+            /* Reuse the ptr. There are no other references to val. */
+            valptr = val->ptr;
+            val->ptr = NULL;
+        } else if (val->type == OBJ_STRING &&
+                   val->encoding == OBJ_ENCODING_INT) {
+            /* The pointer is not allocated memory. We can just copy the pointer. */
+            valptr = val->ptr;
+        } else if (val->type == OBJ_STRING &&
+                   val->encoding == OBJ_ENCODING_RAW) {
+            /* Dup the string. */
+            valptr = sdsdup(val->ptr);
+        } else {
+            /* There are multiple references to this non-string object. Most types
+             * can be duplicated, but for a module type is not always possible. */
+            serverPanic("Not implemented");
+        }
+        kv = kvobjCreate(val->type, key, valptr, keyMetaBits);
+        kv->encoding = val->encoding;
     }
-    return o;
+    
+    kv->lru = val->lru;
+    if (val->iskvobj) kvobjBits(kv)->no_evict = kvobjBits(val)->no_evict;
+
+    /* Transfer module metadata from `val` to new `kv` (if `val` of type kvobj with metadata). */
+    if (val->metabits & KEY_META_MASK_MODULES)
+        keyMetaTransition((kvobj *) val, kv);
+    
+    decrRefCount(val);
+    return kv;
 }
 
 /* Create a string object with EMBSTR encoding if it is smaller than
@@ -139,34 +368,24 @@ robj *tryCreateStringObject(const char *ptr, size_t len) {
         return tryCreateRawStringObject(ptr,len);
 }
 
-/* Create a string object from a long long value. When possible returns a
- * shared integer object, or at least an integer encoded one.
- *
- * If valueobj is non zero, the function avoids returning a shared
- * integer, because the object is going to be used as value in the Redis key
- * space (for instance when the INCR command is used), so we want LFU/LRU
- * values specific for each key. */
-robj *createStringObjectFromLongLongWithOptions(long long value, int valueobj) {
+/* Create a string object from a long long value according to the specified flag. */
+#define LL2STROBJ_AUTO 0       /* automatically create the optimal string object */
+#define LL2STROBJ_NO_SHARED 1  /* disallow shared objects */
+#define LL2STROBJ_NO_INT_ENC 2 /* disallow integer encoded objects. */
+robj *createStringObjectFromLongLongWithOptions(long long value, int flag) {
     robj *o;
 
-    if (server.maxmemory == 0 ||
-        !(server.maxmemory_policy & MAXMEMORY_FLAG_NO_SHARED_INTEGERS))
-    {
-        /* If the maxmemory policy permits, we can still return shared integers
-         * even if valueobj is true. */
-        valueobj = 0;
-    }
-
-    if (value >= 0 && value < OBJ_SHARED_INTEGERS && valueobj == 0) {
-        incrRefCount(shared.integers[value]);
+    if (value >= 0 && value < OBJ_SHARED_INTEGERS && flag == LL2STROBJ_AUTO) {
         o = shared.integers[value];
     } else {
-        if (value >= LONG_MIN && value <= LONG_MAX) {
+        if ((value >= LONG_MIN && value <= LONG_MAX) && flag != LL2STROBJ_NO_INT_ENC) {
             o = createObject(OBJ_STRING, NULL);
             o->encoding = OBJ_ENCODING_INT;
             o->ptr = (void*)((long)value);
         } else {
-            o = createObject(OBJ_STRING,sdsfromlonglong(value));
+            char buf[LONG_STR_SIZE];
+            int len = ll2string(buf, sizeof(buf), value);
+            o = createStringObject(buf, len);
         }
     }
     return o;
@@ -175,15 +394,27 @@ robj *createStringObjectFromLongLongWithOptions(long long value, int valueobj) {
 /* Wrapper for createStringObjectFromLongLongWithOptions() always demanding
  * to create a shared object if possible. */
 robj *createStringObjectFromLongLong(long long value) {
-    return createStringObjectFromLongLongWithOptions(value,0);
+    return createStringObjectFromLongLongWithOptions(value, LL2STROBJ_AUTO);
 }
 
-/* Wrapper for createStringObjectFromLongLongWithOptions() avoiding a shared
- * object when LFU/LRU info are needed, that is, when the object is used
- * as a value in the key space, and Redis is configured to evict based on
- * LFU/LRU. */
+/* The function avoids returning a shared integer when LFU/LRU info
+ * are needed, that is, when the object is used as a value in the key
+ * space(for instance when the INCR command is used), and Redis is
+ * configured to evict based on LFU/LRU, so we want LFU/LRU values
+ * specific for each key. */
 robj *createStringObjectFromLongLongForValue(long long value) {
-    return createStringObjectFromLongLongWithOptions(value,1);
+    if (server.maxmemory == 0 || !(server.maxmemory_policy & MAXMEMORY_FLAG_NO_SHARED_INTEGERS)) {
+        /* If the maxmemory policy permits, we can still return shared integers */
+        return createStringObjectFromLongLongWithOptions(value, LL2STROBJ_AUTO);
+    } else {
+        return createStringObjectFromLongLongWithOptions(value, LL2STROBJ_NO_SHARED);
+    }
+}
+
+/* Create a string object that contains an sds inside it. That means it can't be
+ * integer encoded (OBJ_ENCODING_INT), and it'll always be an EMBSTR type. */
+robj *createStringObjectFromLongLongWithSds(long long value) {
+    return createStringObjectFromLongLongWithOptions(value, LL2STROBJ_NO_INT_ENC);
 }
 
 /* Create a string object from a long double. If humanfriendly is non-zero
@@ -227,10 +458,17 @@ robj *dupStringObject(const robj *o) {
     }
 }
 
-robj *createQuicklistObject(void) {
-    quicklist *l = quicklistCreate();
+robj *createQuicklistObject(int fill, int compress) {
+    quicklist *l = quicklistNew(fill, compress);
     robj *o = createObject(OBJ_LIST,l);
     o->encoding = OBJ_ENCODING_QUICKLIST;
+    return o;
+}
+
+robj *createListListpackObject(void) {
+    unsigned char *lp = lpNew(0);
+    robj *o = createObject(OBJ_LIST,lp);
+    o->encoding = OBJ_ENCODING_LISTPACK;
     return o;
 }
 
@@ -245,6 +483,13 @@ robj *createIntsetObject(void) {
     intset *is = intsetNew();
     robj *o = createObject(OBJ_SET,is);
     o->encoding = OBJ_ENCODING_INTSET;
+    return o;
+}
+
+robj *createSetListpackObject(void) {
+    unsigned char *lp = lpNew(0);
+    robj *o = createObject(OBJ_SET, lp);
+    o->encoding = OBJ_ENCODING_LISTPACK;
     return o;
 }
 
@@ -266,6 +511,13 @@ robj *createZsetObject(void) {
     return o;
 }
 
+/* Create an empty sorted set using the packed B+ tree encoding. */
+robj *createZsetBtreeObject(void) {
+    robj *o = createObject(OBJ_ZSET, zbtreeCreate());
+    o->encoding = OBJ_ENCODING_BTREE;
+    return o;
+}
+
 robj *createZsetListpackObject(void) {
     unsigned char *lp = lpNew(0);
     robj *o = createObject(OBJ_ZSET,lp);
@@ -277,6 +529,32 @@ robj *createStreamObject(void) {
     stream *s = streamNew();
     robj *o = createObject(OBJ_STREAM,s);
     o->encoding = OBJ_ENCODING_STREAM;
+    return o;
+}
+
+#ifdef ENABLE_GCRA
+robj *createGCRAObject(long long value) {
+    /* NOTE: for 32-bit systems we can't use integer encoding (as OBJ_STRING does)
+     * as the GCRA object is a unixtime value in microseconds, which as of the
+     * time of writing is already much more than 32-bit's LONG_MAX. */
+#if UINTPTR_MAX == 0xffffffff
+    long long *v = zmalloc(sizeof(long long));
+    *v = value;
+    robj *o = createObject(OBJ_GCRA,v);
+#else
+    robj *o = createObject(OBJ_GCRA,NULL);
+    o->ptr = (void*)value;
+#endif
+
+    o->encoding = OBJ_ENCODING_INT;
+    return o;
+}
+#endif
+
+robj *createArrayObject(void) {
+    redisArray *ar = arNew();
+    robj *o = createObject(OBJ_ARRAY, ar);
+    o->encoding = OBJ_ENCODING_SLICED_ARRAY;
     return o;
 }
 
@@ -296,22 +574,15 @@ void freeStringObject(robj *o) {
 void freeListObject(robj *o) {
     if (o->encoding == OBJ_ENCODING_QUICKLIST) {
         quicklistRelease(o->ptr);
+    } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
+        lpFree(o->ptr);
     } else {
         serverPanic("Unknown list encoding type");
     }
 }
 
 void freeSetObject(robj *o) {
-    switch (o->encoding) {
-    case OBJ_ENCODING_HT:
-        dictRelease((dict*) o->ptr);
-        break;
-    case OBJ_ENCODING_INTSET:
-        zfree(o->ptr);
-        break;
-    default:
-        serverPanic("Unknown set encoding type");
-    }
+    setTypeFree(o);
 }
 
 void freeZsetObject(robj *o) {
@@ -323,6 +594,9 @@ void freeZsetObject(robj *o) {
         zslFree(zs->zsl);
         zfree(zs);
         break;
+    case OBJ_ENCODING_BTREE:
+        zbtreeFree(o->ptr);
+        break;
     case OBJ_ENCODING_LISTPACK:
         zfree(o->ptr);
         break;
@@ -332,17 +606,7 @@ void freeZsetObject(robj *o) {
 }
 
 void freeHashObject(robj *o) {
-    switch (o->encoding) {
-    case OBJ_ENCODING_HT:
-        dictRelease((dict*) o->ptr);
-        break;
-    case OBJ_ENCODING_LISTPACK:
-        lpFree(o->ptr);
-        break;
-    default:
-        serverPanic("Unknown hash encoding type");
-        break;
-    }
+    hashTypeFree(o);
 }
 
 void freeModuleObject(robj *o) {
@@ -355,34 +619,80 @@ void freeStreamObject(robj *o) {
     freeStream(o->ptr);
 }
 
+#ifdef ENABLE_GCRA
+void freeGCRAObject(robj *o) {
+#if UINTPTR_MAX == 0xffffffff
+    zfree(o->ptr);
+#else
+    (void)o;
+#endif
+}
+#endif
+
+void freeArrayObject(robj *o) {
+    arFree(o->ptr);
+}
+
 void incrRefCount(robj *o) {
-    if (o->refcount < OBJ_FIRST_SPECIAL_REFCOUNT) {
+    if (o->refcount < OBJ_FIRST_SPECIAL_REFCOUNT - 1) {
         o->refcount++;
     } else {
         if (o->refcount == OBJ_SHARED_REFCOUNT) {
             /* Nothing to do: this refcount is immutable. */
         } else if (o->refcount == OBJ_STATIC_REFCOUNT) {
             serverPanic("You tried to retain an object allocated in the stack");
+        } else {
+            serverPanic("You tried to retain an object with maximum refcount");
         }
     }
 }
 
 void decrRefCount(robj *o) {
-    if (o->refcount == 1) {
-        switch(o->type) {
-        case OBJ_STRING: freeStringObject(o); break;
-        case OBJ_LIST: freeListObject(o); break;
-        case OBJ_SET: freeSetObject(o); break;
-        case OBJ_ZSET: freeZsetObject(o); break;
-        case OBJ_HASH: freeHashObject(o); break;
-        case OBJ_MODULE: freeModuleObject(o); break;
-        case OBJ_STREAM: freeStreamObject(o); break;
-        default: serverPanic("Unknown object type"); break;
+    if (o->refcount == OBJ_SHARED_REFCOUNT)
+        return; /* Nothing to do: this refcount is immutable. */
+
+    if (unlikely(o->refcount <= 0)) {
+        serverPanic("illegal decrRefCount for object with: type %u, encoding %u, refcount %d",
+            o->type, o->encoding, o->refcount);
+    }
+
+    if (--(o->refcount) == 0) {
+        /* Fast path for embedded strings: no inner allocation to free, and we
+         * can compute the alloc size to hint jemalloc for a faster deallocation. */
+        if (o->type == OBJ_STRING && o->encoding == OBJ_ENCODING_EMBSTR && !o->iskvobj) {
+            serverAssert(sdsType(o->ptr) == SDS_TYPE_8); /* embstr always type_8 */
+            zfree_with_size(o, sizeof(robj) + sdsAllocSize(o->ptr));
+            return;
         }
-        zfree(o);
-    } else {
-        if (o->refcount <= 0) serverPanic("decrRefCount against refcount <= 0");
-        if (o->refcount != OBJ_SHARED_REFCOUNT) o->refcount--;
+
+        void *alloc = o;
+        
+        if (o->iskvobj) {
+            /* eval real allocation pointer */
+            alloc = kvobjGetAllocPtr(o);
+            /* if kvobj has metadata attached. */
+            if (getModuleMetaBits(o->metabits))
+                keyMetaOnFree((kvobj *)o);
+        }
+        
+        if (o->ptr != NULL) {
+            switch(o->type) {
+            case OBJ_STRING: freeStringObject(o); break;
+            case OBJ_LIST: freeListObject(o); break;
+            case OBJ_SET: freeSetObject(o); break;
+            case OBJ_ZSET: freeZsetObject(o); break;
+            case OBJ_HASH: freeHashObject(o); break;
+            case OBJ_MODULE: freeModuleObject(o); break;
+            case OBJ_STREAM: freeStreamObject(o); break;
+#ifdef ENABLE_GCRA
+            case OBJ_GCRA: freeGCRAObject(o); break;
+#endif
+            case OBJ_ARRAY: freeArrayObject(o); break;
+            case OBJ_BITMAP: bitroarFree(o); break;
+            default: serverPanic("Unknown object type"); break;
+            }
+        }
+        zfree(alloc);
     }
 }
 
@@ -416,6 +726,8 @@ void dismissListObject(robj *o, size_t size_hint) {
                 node = node->next;
             }
         }
+    } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
+        dismissMemory(o->ptr, lpBytes((unsigned char*)o->ptr));
     } else {
         serverPanic("Unknown list encoding type");
     }
@@ -430,18 +742,26 @@ void dismissSetObject(robj *o, size_t size_hint) {
          * page size, and there's a high chance we'll actually dismiss something. */
         if (size_hint / dictSize(set) >= server.page_size) {
             dictEntry *de;
-            dictIterator *di = dictGetIterator(set);
-            while ((de = dictNext(di)) != NULL) {
-                dismissSds(dictGetKey(de));
+            dictIterator di;
+            dictInitIterator(&di, set);
+            const int with_expire = setHashtableHasExpire(o);
+            while ((de = dictNext(&di)) != NULL) {
+                if (with_expire)
+                    sEntryDismissMemory(dictGetKey(de));
+                else
+                    dismissSds(dictGetKey(de));
             }
-            dictReleaseIterator(di);
+            dictResetIterator(&di);
         }
 
         /* Dismiss hash table memory. */
-        dismissMemory(set->ht_table[0], DICTHT_SIZE(set->ht_size_exp[0])*sizeof(dictEntry*));
-        dismissMemory(set->ht_table[1], DICTHT_SIZE(set->ht_size_exp[1])*sizeof(dictEntry*));
+        dismissDictBucketsMemory(set);
+    } else if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
+        dismissMemory(setListpackExGetLp(o), lpBytes(setListpackExGetLp(o)));
     } else if (o->encoding == OBJ_ENCODING_INTSET) {
         dismissMemory(o->ptr, intsetBlobLen((intset*)o->ptr));
+    } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
+        dismissMemory(o->ptr, lpBytes((unsigned char *)o->ptr));
     } else {
         serverPanic("Unknown set encoding type");
     }
@@ -456,17 +776,18 @@ void dismissZsetObject(robj *o, size_t size_hint) {
         /* We iterate all nodes only when average member size is bigger than a
          * page size, and there's a high chance we'll actually dismiss something. */
         if (size_hint / zsl->length >= server.page_size) {
-            zskiplistNode *zn = zsl->tail;
+            zskiplistNode *zn = zsl->header->level[0].forward;
             while (zn != NULL) {
-                dismissSds(zn->ele);
-                zn = zn->backward;
+                zskiplistNode *next = zn->level[0].forward;
+                dismissMemory(zn, 0);
+                zn = next;
             }
         }
 
         /* Dismiss hash table memory. */
-        dict *d = zs->dict;
-        dismissMemory(d->ht_table[0], DICTHT_SIZE(d->ht_size_exp[0])*sizeof(dictEntry*));
-        dismissMemory(d->ht_table[1], DICTHT_SIZE(d->ht_size_exp[1])*sizeof(dictEntry*));
+        dismissDictBucketsMemory(zs->dict);
+    } else if (o->encoding == OBJ_ENCODING_BTREE) {
+        zbtreeDismissMemory(o->ptr);
     } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
         dismissMemory(o->ptr, lpBytes((unsigned char*)o->ptr));
     } else {
@@ -483,20 +804,34 @@ void dismissHashObject(robj *o, size_t size_hint) {
          * a page size, and there's a high chance we'll actually dismiss something. */
         if (size_hint / dictSize(d) >= server.page_size) {
             dictEntry *de;
-            dictIterator *di = dictGetIterator(d);
-            while ((de = dictNext(di)) != NULL) {
-                /* Only dismiss values memory since the field size
-                 * usually is small. */
-                dismissSds(dictGetVal(de));
+            dictIterator di;
+            dictInitIterator(&di, d);
+            while ((de = dictNext(&di)) != NULL) {
+                hEntryDismissMemory((HashEntry *) dictGetKey(de));
             }
-            dictReleaseIterator(di);
+            dictResetIterator(&di);
         }
 
         /* Dismiss hash table memory. */
-        dismissMemory(d->ht_table[0], DICTHT_SIZE(d->ht_size_exp[0])*sizeof(dictEntry*));
-        dismissMemory(d->ht_table[1], DICTHT_SIZE(d->ht_size_exp[1])*sizeof(dictEntry*));
+        dismissDictBucketsMemory(d);
     } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
         dismissMemory(o->ptr, lpBytes((unsigned char*)o->ptr));
+    } else if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
+        listpackEx *lpt = o->ptr;
+        dismissMemory(lpt->lp, lpBytes((unsigned char*)lpt->lp));
+    } else if (o->encoding == OBJ_ENCODING_TMPL_LP) {
+        unsigned char *lp = o->ptr;
+        dismissMemory(lp, lpBytes(lp));
+    } else if (o->encoding == OBJ_ENCODING_TMPL_ARRAY) {
+        hashTemplateArray *hta = o->ptr;
+        unsigned long long n = hta->field_count;
+        /* We iterate all values only when average value size is bigger than
+         * a page size, mirroring the heuristic used for OBJ_ENCODING_HT. */
+        if (n > 0 && size_hint / n >= server.page_size) {
+            for (unsigned long long i = 0; i < n; i++)
+                dismissSds(hta->values[i]);
+        }
+        dismissMemory(hta, sizeof(*hta) + n * sizeof(sds));
     } else {
         serverPanic("Unknown hash encoding type");
     }
@@ -521,6 +856,20 @@ void dismissStreamObject(robj *o, size_t size_hint) {
         raxStop(&ri);
     }
 }
+
+/* See dismissObject() */
+void dismissArrayObject(robj *o, size_t size_hint) {
+    arDismiss(o->ptr, size_hint);
+}
+
+#ifdef ENABLE_GCRA
+void dismissGCRAObject(robj *o, size_t size_hint) {
+    /* GCRA is a single allocation of a long long thus way smaller than a
+     * page-size. The dismiss mechanism is not needed for it - hence NOOP.*/
+    (void)o;
+    (void)size_hint;
+}
+#endif
 
 /* When creating a snapshot in a fork child process, the main process and child
  * process share the same physical memory pages, and if / when the parent
@@ -550,6 +899,11 @@ void dismissObject(robj *o, size_t size_hint) {
         case OBJ_ZSET: dismissZsetObject(o, size_hint); break;
         case OBJ_HASH: dismissHashObject(o, size_hint); break;
         case OBJ_STREAM: dismissStreamObject(o, size_hint); break;
+#ifdef ENABLE_GCRA
+        case OBJ_GCRA: dismissGCRAObject(o, size_hint); break;
+#endif
+        case OBJ_ARRAY: dismissArrayObject(o, size_hint); break;
+        case OBJ_BITMAP: bitroarDismiss(o, size_hint); break;
         default: break;
     }
 #else
@@ -557,16 +911,17 @@ void dismissObject(robj *o, size_t size_hint) {
 #endif
 }
 
-/* This variant of decrRefCount() gets its argument as void, and is useful
- * as free method in data structures that expect a 'void free_object(void*)'
- * prototype for the free method. */
-void decrRefCountVoid(void *o) {
-    decrRefCount(o);
-}
-
 int checkType(client *c, robj *o, int type) {
     /* A NULL is considered an empty key */
     if (o && o->type != type) {
+        addReplyErrorObject(c,shared.wrongtypeerr);
+        return 1;
+    }
+    return 0;
+}
+
+int checkStringOrBitmapType(client *c, robj *o) {
+    if (o && o->type != OBJ_STRING && o->type != OBJ_BITMAP) {
         addReplyErrorObject(c,shared.wrongtypeerr);
         return 1;
     }
@@ -588,19 +943,25 @@ int isObjectRepresentableAsLongLong(robj *o, long long *llval) {
 }
 
 /* Optimize the SDS string inside the string object to require little space,
- * in case there is more than 10% of free space at the end of the SDS
- * string. This happens because SDS strings tend to overallocate to avoid
- * wasting too much time in allocations when appending to the string. */
-void trimStringObjectIfNeeded(robj *o) {
-    if (o->encoding == OBJ_ENCODING_RAW &&
-        sdsavail(o->ptr) > sdslen(o->ptr)/10)
-    {
-        o->ptr = sdsRemoveFreeSpace(o->ptr);
+ * in case there is more than 10% of free space at the end of the SDS. */
+void trimStringObjectIfNeeded(robj *o, int trim_small_values) {
+    if (o->encoding != OBJ_ENCODING_RAW) return;
+    /* A string may have free space in the following cases:
+     * 1. When an arg len is greater than PROTO_MBULK_BIG_ARG the query buffer may be used directly as the SDS string.
+     * 2. When utilizing the argument caching mechanism in Lua. 
+     * 3. When calling from RM_TrimStringAllocation (trim_small_values is true). */
+    size_t len = sdslen(o->ptr);
+    if (len >= PROTO_MBULK_BIG_ARG ||
+        trim_small_values||
+        (server.executing_client && server.executing_client->flags & CLIENT_SCRIPT && len < LUA_CMD_OBJCACHE_MAX_LEN)) {
+        if (sdsavail(o->ptr) > len/10) {
+            o->ptr = sdsRemoveFreeSpace(o->ptr, 0);
+        }
     }
 }
 
 /* Try to encode a string object in order to save space */
-robj *tryObjectEncoding(robj *o) {
+robj *tryObjectEncodingEx(robj *o, int try_trim) {
     long value;
     sds s = o->ptr;
     size_t len;
@@ -626,28 +987,15 @@ robj *tryObjectEncoding(robj *o) {
      * representable as a 32 nor 64 bit integer. */
     len = sdslen(s);
     if (len <= 20 && string2l(s,len,&value)) {
-        /* This object is encodable as a long. Try to use a shared object.
-         * Note that we avoid using shared integers when maxmemory is used
-         * because every object needs to have a private LRU field for the LRU
-         * algorithm to work well. */
-        if ((server.maxmemory == 0 ||
-            !(server.maxmemory_policy & MAXMEMORY_FLAG_NO_SHARED_INTEGERS)) &&
-            value >= 0 &&
-            value < OBJ_SHARED_INTEGERS)
-        {
+        /* This object is encodable as a long. */
+        if (o->encoding == OBJ_ENCODING_RAW) {
+            sdsfree(o->ptr);
+            o->encoding = OBJ_ENCODING_INT;
+            o->ptr = (void*) value;
+            return o;
+        } else if (o->encoding == OBJ_ENCODING_EMBSTR) {
             decrRefCount(o);
-            incrRefCount(shared.integers[value]);
-            return shared.integers[value];
-        } else {
-            if (o->encoding == OBJ_ENCODING_RAW) {
-                sdsfree(o->ptr);
-                o->encoding = OBJ_ENCODING_INT;
-                o->ptr = (void*) value;
-                return o;
-            } else if (o->encoding == OBJ_ENCODING_EMBSTR) {
-                decrRefCount(o);
-                return createStringObjectFromLongLongForValue(value);
-            }
+            return createStringObjectFromLongLongForValue(value);
         }
     }
 
@@ -665,18 +1013,33 @@ robj *tryObjectEncoding(robj *o) {
     }
 
     /* We can't encode the object...
-     *
-     * Do the last try, and at least optimize the SDS string inside
-     * the string object to require little space, in case there
-     * is more than 10% of free space at the end of the SDS string.
-     *
-     * We do that only for relatively large strings as this branch
-     * is only entered if the length of the string is greater than
-     * OBJ_ENCODING_EMBSTR_SIZE_LIMIT. */
-    trimStringObjectIfNeeded(o);
+     * Do the last try, and at least optimize the SDS string inside */
+    if (try_trim)
+        trimStringObjectIfNeeded(o, 0);
 
     /* Return the original object. */
     return o;
+}
+
+robj *tryObjectEncoding(robj *o) {
+    return tryObjectEncodingEx(o, 1);
+}
+
+size_t getObjectLength(robj *o) {
+    switch(o->type) {
+        case OBJ_STRING: return stringObjectLen(o);
+        case OBJ_LIST: return listTypeLength(o);
+        case OBJ_SET: return setTypeSize(o);
+        case OBJ_ZSET: return zsetLength(o);
+        case OBJ_HASH: return hashTypeLength(o, 0);
+        case OBJ_STREAM: return streamLength(o);
+#ifdef ENABLE_GCRA
+        case OBJ_GCRA: return gcraObjectLength(o);
+#endif
+        case OBJ_ARRAY: return arCount(o->ptr);
+        case OBJ_BITMAP: return bitroarLen(o);
+        default: return 0;
+    }
 }
 
 /* Get a decoded version of an encoded object (returned as a new object).
@@ -754,7 +1117,7 @@ int collateStringObjects(const robj *a, const robj *b) {
 
 /* Equal string objects return 1 if the two objects are the same from the
  * point of view of a string comparison, otherwise 0 is returned. Note that
- * this function is faster then checking for (compareStringObject(a,b) == 0)
+ * this function is faster than checking for (compareStringObject(a,b) == 0)
  * because it can perform some more optimization. */
 int equalStringObjects(robj *a, robj *b) {
     if (a->encoding == OBJ_ENCODING_INT &&
@@ -763,6 +1126,11 @@ int equalStringObjects(robj *a, robj *b) {
          * long is the same. */
         return a->ptr == b->ptr;
     } else {
+        if (sdsEncodedObject(a) && sdsEncodedObject(b)
+            && sdslen(a->ptr) != sdslen(b->ptr))
+        {
+            return 0;
+        }
         return compareStringObjects(a,b) == 0;
     }
 }
@@ -773,6 +1141,21 @@ size_t stringObjectLen(robj *o) {
         return sdslen(o->ptr);
     } else {
         return sdigits10((long)o->ptr);
+    }
+}
+
+size_t stringObjectAllocSize(const robj *o) {
+    serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+    if(o->encoding == OBJ_ENCODING_INT) {
+        /* Value already counted (reuse the "ptr" in header to store int) */
+        return 0;
+    } else if(o->encoding == OBJ_ENCODING_RAW) {
+        return sdsAllocSize(o->ptr);
+    } else if(o->encoding == OBJ_ENCODING_EMBSTR) {
+        /* Value already counted (Value embedded in the object as well) */
+        return 0;
+    } else {
+        serverPanic("Unknown string encoding");
     }
 }
 
@@ -863,6 +1246,24 @@ int getLongLongFromObject(robj *o, long long *target) {
     return C_OK;
 }
 
+#ifdef ENABLE_GCRA
+int getLongLongFromGCRAObject(robj *o, long long *target) {
+    long long res;
+    serverAssertWithInfo(NULL, o, o->type == OBJ_GCRA);
+    serverAssert(o->encoding == OBJ_ENCODING_INT);
+#if UINTPTR_MAX == 0xffffffff
+    res = *((long long*)o->ptr);
+#else
+    res = (long long)o->ptr;
+#endif
+    if (unlikely(res < 0)) {
+        serverPanic("Invalid negative GCRA value");
+    }
+    *target = res;
+    return C_OK;
+}
+#endif
+
 int getLongLongFromObjectOrReply(client *c, robj *o, long long *target, const char *msg) {
     long long value;
     if (getLongLongFromObject(o, &value) != C_OK) {
@@ -931,199 +1332,110 @@ char *strEncoding(int encoding) {
     case OBJ_ENCODING_HT: return "hashtable";
     case OBJ_ENCODING_QUICKLIST: return "quicklist";
     case OBJ_ENCODING_LISTPACK: return "listpack";
+    case OBJ_ENCODING_LISTPACK_EX: return "listpackex";
     case OBJ_ENCODING_INTSET: return "intset";
     case OBJ_ENCODING_SKIPLIST: return "skiplist";
     case OBJ_ENCODING_EMBSTR: return "embstr";
     case OBJ_ENCODING_STREAM: return "stream";
+    case OBJ_ENCODING_SLICED_ARRAY: return "sliced-array";
+    case OBJ_ENCODING_TMPL_LP: return "template-listpack";
+    case OBJ_ENCODING_TMPL_ARRAY: return "template-array";
+    case OBJ_ENCODING_BITMAP_ROARING: return "bitmap-roaring";
+    case OBJ_ENCODING_BTREE: return "btree";
     default: return "unknown";
     }
 }
 
 /* =========================== Memory introspection ========================= */
 
-
-/* This is a helper function with the goal of estimating the memory
- * size of a radix tree that is used to store Stream IDs.
- *
- * Note: to guess the size of the radix tree is not trivial, so we
- * approximate it considering 16 bytes of data overhead for each
- * key (the ID), and then adding the number of bare nodes, plus some
- * overhead due by the data and child pointers. This secret recipe
- * was obtained by checking the average radix tree created by real
- * workloads, and then adjusting the constants to get numbers that
- * more or less match the real memory usage.
- *
- * Actually the number of nodes and keys may be different depending
- * on the insertion speed and thus the ability of the radix tree
- * to compress prefixes. */
-size_t streamRadixTreeMemoryUsage(rax *rax) {
-    size_t size = sizeof(*rax);
-    size = rax->numele * sizeof(streamID);
-    size += rax->numnodes * sizeof(raxNode);
-    /* Add a fixed overhead due to the aux data pointer, children, ... */
-    size += rax->numnodes * sizeof(long)*30;
-    return size;
-}
-
-/* Returns the size in bytes consumed by the key's value in RAM.
+/* Returns the size in bytes consumed by the object header, key and value in RAM.
  * Note that the returned value is just an approximation, especially in the
  * case of aggregated data types where only "sample_size" elements
  * are checked and averaged to estimate the total size. */
 #define OBJ_COMPUTE_SIZE_DEF_SAMPLES 5 /* Default sample size. */
-size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
-    sds ele, ele2;
-    dict *d;
-    dictIterator *di;
-    struct dictEntry *de;
-    size_t asize = 0, elesize = 0, samples = 0;
+size_t kvobjComputeSize(robj *key, kvobj *o, size_t sample_size, int dbid) {
+    if (o->type == OBJ_STRING ||
+        o->type == OBJ_LIST ||
+        o->type == OBJ_SET ||
+        o->type == OBJ_ZSET ||
+        o->type == OBJ_HASH ||
+        o->type == OBJ_STREAM ||
+#ifdef ENABLE_GCRA
+        o->type == OBJ_GCRA ||
+#endif
+        o->type == OBJ_BITMAP ||
+        o->type == OBJ_ARRAY)
+    {
+        return kvobjAllocSize(o);
+    } else if (o->type == OBJ_MODULE) {
+        return zmalloc_size(o) + moduleGetMemUsage(key, o, sample_size, dbid);
+    }
+    serverPanic("Unknown object type");
+}
+
+/* Returns the size in bytes consumed by the object header, key and value in RAM.
+ * Note that the returned value is accurate approximation of the actual allocated
+ * size. For performance reasons it accumulates requested size instead in several
+ * cases (e.g. kvobj allocation, type 5 sds, listpacks, etc) but it does so in a
+ * self-consistent way.
+ */
+size_t kvobjAllocSize(kvobj *o) {
+    debugServerAssert(o->iskvobj);
+    size_t asize = sizeof(kvobj) + sizeof(kvBits);
+    /* Add metadata size */
+    asize += getNumMeta(o->metabits) * sizeof(uint64_t);
+    /* Add embedded key size */
+    asize += sdsAllocSize(kvobjGetKey(o));
+    /* Add embedded string size */
+    if (o->encoding == OBJ_ENCODING_EMBSTR)
+        asize += sdsAllocSize(o->ptr);
 
     if (o->type == OBJ_STRING) {
-        if(o->encoding == OBJ_ENCODING_INT) {
-            asize = sizeof(*o);
-        } else if(o->encoding == OBJ_ENCODING_RAW) {
-            asize = sdsZmallocSize(o->ptr)+sizeof(*o);
-        } else if(o->encoding == OBJ_ENCODING_EMBSTR) {
-            asize = zmalloc_size((void *)o);
-        } else {
-            serverPanic("Unknown string encoding");
-        }
+        asize += stringObjectAllocSize(o);
     } else if (o->type == OBJ_LIST) {
-        if (o->encoding == OBJ_ENCODING_QUICKLIST) {
-            quicklist *ql = o->ptr;
-            quicklistNode *node = ql->head;
-            asize = sizeof(*o)+sizeof(quicklist);
-            do {
-                elesize += sizeof(quicklistNode)+zmalloc_size(node->entry);
-                samples++;
-            } while ((node = node->next) && samples < sample_size);
-            asize += (double)elesize/samples*ql->len;
-        } else {
-            serverPanic("Unknown list encoding");
-        }
+        asize += listTypeAllocSize(o);
     } else if (o->type == OBJ_SET) {
-        if (o->encoding == OBJ_ENCODING_HT) {
-            d = o->ptr;
-            di = dictGetIterator(d);
-            asize = sizeof(*o)+sizeof(dict)+(sizeof(struct dictEntry*)*dictSlots(d));
-            while((de = dictNext(di)) != NULL && samples < sample_size) {
-                ele = dictGetKey(de);
-                elesize += sizeof(struct dictEntry) + sdsZmallocSize(ele);
-                samples++;
-            }
-            dictReleaseIterator(di);
-            if (samples) asize += (double)elesize/samples*dictSize(d);
-        } else if (o->encoding == OBJ_ENCODING_INTSET) {
-            asize = sizeof(*o)+zmalloc_size(o->ptr);
-        } else {
-            serverPanic("Unknown set encoding");
-        }
+        asize += setTypeAllocSize(o);
     } else if (o->type == OBJ_ZSET) {
-        if (o->encoding == OBJ_ENCODING_LISTPACK) {
-            asize = sizeof(*o)+zmalloc_size(o->ptr);
-        } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
-            d = ((zset*)o->ptr)->dict;
-            zskiplist *zsl = ((zset*)o->ptr)->zsl;
-            zskiplistNode *znode = zsl->header->level[0].forward;
-            asize = sizeof(*o)+sizeof(zset)+sizeof(zskiplist)+sizeof(dict)+
-                    (sizeof(struct dictEntry*)*dictSlots(d))+
-                    zmalloc_size(zsl->header);
-            while(znode != NULL && samples < sample_size) {
-                elesize += sdsZmallocSize(znode->ele);
-                elesize += sizeof(struct dictEntry)+zmalloc_size(znode);
-                samples++;
-                znode = znode->level[0].forward;
-            }
-            if (samples) asize += (double)elesize/samples*dictSize(d);
-        } else {
-            serverPanic("Unknown sorted set encoding");
-        }
+        asize += zsetAllocSize(o);
     } else if (o->type == OBJ_HASH) {
-        if (o->encoding == OBJ_ENCODING_LISTPACK) {
-            asize = sizeof(*o)+zmalloc_size(o->ptr);
-        } else if (o->encoding == OBJ_ENCODING_HT) {
-            d = o->ptr;
-            di = dictGetIterator(d);
-            asize = sizeof(*o)+sizeof(dict)+(sizeof(struct dictEntry*)*dictSlots(d));
-            while((de = dictNext(di)) != NULL && samples < sample_size) {
-                ele = dictGetKey(de);
-                ele2 = dictGetVal(de);
-                elesize += sdsZmallocSize(ele) + sdsZmallocSize(ele2);
-                elesize += sizeof(struct dictEntry);
-                samples++;
-            }
-            dictReleaseIterator(di);
-            if (samples) asize += (double)elesize/samples*dictSize(d);
-        } else {
-            serverPanic("Unknown hash encoding");
-        }
+        asize += hashTypeAllocSize(o);
     } else if (o->type == OBJ_STREAM) {
         stream *s = o->ptr;
-        asize = sizeof(*o)+sizeof(*s);
-        asize += streamRadixTreeMemoryUsage(s->rax);
-
-        /* Now we have to add the listpacks. The last listpack is often non
-         * complete, so we estimate the size of the first N listpacks, and
-         * use the average to compute the size of the first N-1 listpacks, and
-         * finally add the real size of the last node. */
-        raxIterator ri;
-        raxStart(&ri,s->rax);
-        raxSeek(&ri,"^",NULL,0);
-        size_t lpsize = 0, samples = 0;
-        while(samples < sample_size && raxNext(&ri)) {
-            unsigned char *lp = ri.data;
-            lpsize += lpBytes(lp);
-            samples++;
-        }
-        if (s->rax->numele <= samples) {
-            asize += lpsize;
-        } else {
-            if (samples) lpsize /= samples; /* Compute the average. */
-            asize += lpsize * (s->rax->numele-1);
-            /* No need to check if seek succeeded, we enter this branch only
-             * if there are a few elements in the radix tree. */
-            raxSeek(&ri,"$",NULL,0);
-            raxNext(&ri);
-            asize += lpBytes(ri.data);
-        }
-        raxStop(&ri);
-
-        /* Consumer groups also have a non trivial memory overhead if there
-         * are many consumers and many groups, let's count at least the
-         * overhead of the pending entries in the groups and consumers
-         * PELs. */
-        if (s->cgroups) {
-            raxStart(&ri,s->cgroups);
-            raxSeek(&ri,"^",NULL,0);
-            while(raxNext(&ri)) {
-                streamCG *cg = ri.data;
-                asize += sizeof(*cg);
-                asize += streamRadixTreeMemoryUsage(cg->pel);
-                asize += sizeof(streamNACK)*raxSize(cg->pel);
-
-                /* For each consumer we also need to add the basic data
-                 * structures and the PEL memory usage. */
-                raxIterator cri;
-                raxStart(&cri,cg->consumers);
-                raxSeek(&cri,"^",NULL,0);
-                while(raxNext(&cri)) {
-                    streamConsumer *consumer = cri.data;
-                    asize += sizeof(*consumer);
-                    asize += sdslen(consumer->name);
-                    asize += streamRadixTreeMemoryUsage(consumer->pel);
-                    /* Don't count NACKs again, they are shared with the
-                     * consumer group PEL. */
-                }
-                raxStop(&cri);
-            }
-            raxStop(&ri);
-        }
+        asize += s->alloc_size;
+#ifdef ENABLE_GCRA
+    } else if (o->type == OBJ_GCRA) {
+        asize += gcraTypeAllocSize(o);
+#endif
+    } else if (o->type == OBJ_ARRAY) {
+        redisArray *ar = o->ptr;
+        asize += ar->alloc_size;
+    } else if (o->type == OBJ_BITMAP) {
+        asize += bitroarAllocSize(o);
     } else if (o->type == OBJ_MODULE) {
-        asize = moduleGetMemUsage(key, o, sample_size, dbid);
-    } else {
-        serverPanic("Unknown object type");
+        /* TODO: Provide moduleGetAllocSize() module API for O(1) allocation size retrieval */
     }
     return asize;
 }
+
+#ifdef ENABLE_GCRA
+size_t gcraTypeAllocSize(robj *o) {
+    (void)o;
+#if UINTPTR_MAX == 0xffffffff
+    return sizeof(long long);
+#else
+    /* Same as string with int encoding there is no allocation as the value is
+     * cast to void* and stored in o->ptr */
+    return 0;
+#endif
+}
+
+/* The gcra object is a single long long value */
+size_t gcraObjectLength(robj *o) {
+    (void)o;
+    return 1;
+}
+#endif
 
 /* Release data obtained with getMemoryOverheadData(). */
 void freeMemoryOverheadData(struct redisMemOverhead *mh) {
@@ -1148,10 +1460,15 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
         (float)server.cron_malloc_stats.process_rss / server.cron_malloc_stats.zmalloc_used;
     mh->total_frag_bytes =
         server.cron_malloc_stats.process_rss - server.cron_malloc_stats.zmalloc_used;
-    mh->allocator_frag =
-        (float)server.cron_malloc_stats.allocator_active / server.cron_malloc_stats.allocator_allocated;
-    mh->allocator_frag_bytes =
-        server.cron_malloc_stats.allocator_active - server.cron_malloc_stats.allocator_allocated;
+    /* Starting with redis 7.4, the lua memory is part of the total memory usage
+     * of redis, and that includes RSS and all other memory metrics. We only want
+     * to deduct it from active defrag. */
+    size_t frag_smallbins_bytes =
+        server.cron_malloc_stats.allocator_frag_smallbins_bytes - server.cron_malloc_stats.lua_allocator_frag_smallbins_bytes;
+    size_t allocated =
+        server.cron_malloc_stats.allocator_allocated - server.cron_malloc_stats.lua_allocator_allocated;
+    mh->allocator_frag = (float)frag_smallbins_bytes / allocated + 1;
+    mh->allocator_frag_bytes = frag_smallbins_bytes;
     mh->allocator_rss =
         (float)server.cron_malloc_stats.allocator_resident / server.cron_malloc_stats.allocator_active;
     mh->allocator_rss_bytes =
@@ -1176,21 +1493,44 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
         mh->clients_slaves = 0;
         mh->repl_backlog = server.repl_buffer_mem;
     }
+
+    /* Replicas' compression state is allocated per client and is not part of
+     * the shared replication buffer accounted for above, so it needs to be
+     * added separately regardless of which branch was taken. */
+    if (listLength(server.slaves)) {
+        listIter li;
+        listNode *ln;
+
+        listRewind(server.slaves, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            client *replica = listNodeValue(ln);
+            mh->clients_slaves += clientCompressionMemoryUsage(replica);
+        }
+    }
+
     if (server.repl_backlog) {
         /* The approximate memory of rax tree for indexed blocks. */
         mh->repl_backlog +=
             server.repl_backlog->blocks_index->numnodes * sizeof(raxNode) +
             raxSize(server.repl_backlog->blocks_index) * sizeof(void*);
     }
+
+    mh->replica_fullsync_buffer = server.repl_full_sync_buffer.mem_used;
+    mem_total += mh->replica_fullsync_buffer;
     mem_total += mh->repl_backlog;
     mem_total += mh->clients_slaves;
 
+    /* Compute shared/unshared reply memory. */
+    mh->clients_normal_shared = server.stat_clients_shared_memory;
+    mh->clients_normal_unshared = server.stat_clients_unshared_memory;
+
     /* Computing the memory used by the clients would be O(N) if done
      * here online. We use our values computed incrementally by
-     * updateClientMemUsage(). */
-    mh->clients_normal = server.stat_clients_type_memory[CLIENT_TYPE_MASTER]+
-                         server.stat_clients_type_memory[CLIENT_TYPE_PUBSUB]+
-                         server.stat_clients_type_memory[CLIENT_TYPE_NORMAL];
+     * updateClientMemoryUsage(). */
+    mh->clients_normal = subtractClientsWatchPubsubOvercount(
+                             server.stat_clients_type_memory[CLIENT_TYPE_MASTER]+
+                             server.stat_clients_type_memory[CLIENT_TYPE_PUBSUB]+
+                             server.stat_clients_type_memory[CLIENT_TYPE_NORMAL]);
     mem_total += mh->clients_normal;
 
     mh->cluster_links = server.stat_cluster_links_memory;
@@ -1203,42 +1543,69 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
     mh->aof_buffer = mem;
     mem_total+=mem;
 
-    mem = evalScriptsMemory();
-    mh->lua_caches = mem;
+    mem = evalScriptsMemoryEngine();
+    mh->eval_caches = mem;
     mem_total+=mem;
-    mh->functions_caches = functionsMemoryOverhead();
+    mh->functions_caches = functionsMemoryEngine();
     mem_total+=mh->functions_caches;
+
+    mh->script_vm = evalScriptsMemoryVM();
+    mh->script_vm += functionsMemoryVM();
+    mem_total+=mh->script_vm;
+
+    mh->hash_templates = hashTemplatesMemUsage();
+    mem_total+=mh->hash_templates;
+
+    /* Cluster atomic slot migration buffers. */
+    mh->asm_import_input_buffer = asmGetImportInputBufferSize();
+    mh->asm_migrate_output_buffer = asmGetMigrateOutputMemoryUsage();
+    mem_total += mh->asm_import_input_buffer;
+    mem_total += mh->asm_migrate_output_buffer;
 
     for (j = 0; j < server.dbnum; j++) {
         redisDb *db = server.db+j;
-        long long keyscount = dictSize(db->dict);
-        if (keyscount==0) continue;
+        if (!kvstoreNumAllocatedDicts(db->keys)) continue;
+
+        unsigned long long keyscount = kvstoreSize(db->keys);
 
         mh->total_keys += keyscount;
         mh->db = zrealloc(mh->db,sizeof(mh->db[0])*(mh->num_dbs+1));
         mh->db[mh->num_dbs].dbid = j;
 
-        mem = dictSize(db->dict) * sizeof(dictEntry) +
-              dictSlots(db->dict) * sizeof(dictEntry*) +
-              dictSize(db->dict) * sizeof(robj);
+        mem = kvstoreMemUsage(db->keys) +
+              keyscount * sizeof(robj);
         mh->db[mh->num_dbs].overhead_ht_main = mem;
         mem_total+=mem;
 
-        mem = dictSize(db->expires) * sizeof(dictEntry) +
-              dictSlots(db->expires) * sizeof(dictEntry*);
+        mem = kvstoreMemUsage(db->expires);
         mh->db[mh->num_dbs].overhead_ht_expires = mem;
         mem_total+=mem;
 
-        /* Account for the slot to keys map in cluster mode */
-        mem = dictSize(db->dict) * dictMetadataSize(db->dict);
-        mh->db[mh->num_dbs].overhead_ht_slot_to_keys = mem;
+        /* The bless NO-EVICT index (db->blessed_keys) is a derived per-DB kvstore;
+         * count it as overhead, not dataset. blessedIndexMemUsage is O(1) - the sds
+         * key-copy bytes it owns are tracked in the index's kvstore metadata. */
+        mem = blessedIndexMemUsage(db);
+        mh->db[mh->num_dbs].overhead_ht_blessed = mem;
         mem_total+=mem;
 
         mh->num_dbs++;
+
+        mh->overhead_db_hashtable_lut += kvstoreOverheadHashtableLut(db->keys);
+        mh->overhead_db_hashtable_lut += kvstoreOverheadHashtableLut(db->expires);
+        mh->overhead_db_hashtable_lut += kvstoreOverheadHashtableLut(db->blessed_keys);
+        mh->overhead_db_hashtable_rehashing += kvstoreOverheadHashtableRehashing(db->keys);
+        mh->overhead_db_hashtable_rehashing += kvstoreOverheadHashtableRehashing(db->expires);
+        mh->overhead_db_hashtable_rehashing += kvstoreOverheadHashtableRehashing(db->blessed_keys);
+        mh->db_dict_rehashing_count += kvstoreDictRehashingCount(db->keys);
+        mh->db_dict_rehashing_count += kvstoreDictRehashingCount(db->expires);
+        mh->db_dict_rehashing_count += kvstoreDictRehashingCount(db->blessed_keys);
     }
 
+    /* Hotkeys memory overhead */
+    mem_total += hotkeysGetMemoryUsage(server.hotkeys);
+
     mh->overhead_total = mem_total;
-    mh->dataset = zmalloc_used - mem_total;
+    mh->dataset = (zmalloc_used > mem_total) ? (zmalloc_used - mem_total) : 0;
     mh->peak_perc = (float)zmalloc_used*100/mh->peak_allocated;
 
     /* Metrics computed after subtracting the startup memory from
@@ -1247,7 +1614,7 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
     if (zmalloc_used > mh->startup_allocated)
         net_usage = zmalloc_used - mh->startup_allocated;
     mh->dataset_perc = (float)mh->dataset*100/net_usage;
-    mh->bytes_per_key = mh->total_keys ? (net_usage / mh->total_keys) : 0;
+    mh->bytes_per_key = mh->total_keys ? (mh->dataset / mh->total_keys) : 0;
 
     return mh;
 }
@@ -1395,7 +1762,7 @@ int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle,
         lru_idle = lru_idle*lru_multiplier/LRU_CLOCK_RESOLUTION;
         long lru_abs = lru_clock - lru_idle; /* Absolute access time. */
         /* If the LRU field underflows (since lru_clock is a wrapping clock),
-         * we need to make it positive again. This be handled by the unwrapping
+         * we need to make it positive again. This will be handled by the unwrapping
          * code in estimateObjectIdleTime. I.e. imagine a day when lru_clock
          * wrap arounds (happens once in some 6 months), and becomes a low
          * value, like 10, an lru_idle of 1000 should be near LRU_CLOCK_MAX. */
@@ -1411,20 +1778,20 @@ int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle,
 
 /* This is a helper function for the OBJECT command. We need to lookup keys
  * without any modification of LRU or other parameters. */
-robj *objectCommandLookup(client *c, robj *key) {
+kvobj *kvobjCommandLookup(client *c, robj *key) {
     return lookupKeyReadWithFlags(c->db,key,LOOKUP_NOTOUCH|LOOKUP_NONOTIFY);
 }
 
-robj *objectCommandLookupOrReply(client *c, robj *key, robj *reply) {
-    robj *o = objectCommandLookup(c,key);
-    if (!o) addReplyOrErrorObject(c, reply);
-    return o;
+kvobj *kvobjCommandLookupOrReply(client *c, robj *key, robj *reply) {
+    kvobj *kv = kvobjCommandLookup(c,key);
+    if (!kv) addReplyOrErrorObject(c, reply);
+    return kv;
 }
 
 /* Object command allows to inspect the internals of a Redis Object.
  * Usage: OBJECT <refcount|encoding|idletime|freq> <key> */
 void objectCommand(client *c) {
-    robj *o;
+    kvobj *kv;
 
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
@@ -1444,23 +1811,23 @@ NULL
         };
         addReplyHelp(c, help);
     } else if (!strcasecmp(c->argv[1]->ptr,"refcount") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
+        if ((kv = kvobjCommandLookupOrReply(c, c->argv[2], shared.null[c->resp]))
                 == NULL) return;
-        addReplyLongLong(c,o->refcount);
+        addReplyLongLong(c, kv->refcount);
     } else if (!strcasecmp(c->argv[1]->ptr,"encoding") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
+        if ((kv = kvobjCommandLookupOrReply(c, c->argv[2], shared.null[c->resp]))
                 == NULL) return;
-        addReplyBulkCString(c,strEncoding(o->encoding));
+        addReplyBulkCString(c, strEncoding(kv->encoding));
     } else if (!strcasecmp(c->argv[1]->ptr,"idletime") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
+        if ((kv = kvobjCommandLookupOrReply(c, c->argv[2], shared.null[c->resp]))
                 == NULL) return;
         if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
             addReplyError(c,"An LFU maxmemory policy is selected, idle time not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.");
             return;
         }
-        addReplyLongLong(c,estimateObjectIdleTime(o)/1000);
+        addReplyLongLong(c, estimateObjectIdleTime(kv) / 1000);
     } else if (!strcasecmp(c->argv[1]->ptr,"freq") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
+        if ((kv = kvobjCommandLookupOrReply(c, c->argv[2], shared.null[c->resp]))
                 == NULL) return;
         if (!(server.maxmemory_policy & MAXMEMORY_FLAG_LFU)) {
             addReplyError(c,"An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.");
@@ -1470,7 +1837,7 @@ NULL
          * in case of the key has not been accessed for a long time,
          * because we update the access time only
          * when the key is read or overwritten. */
-        addReplyLongLong(c,LFUDecrAndReturn(o));
+        addReplyLongLong(c,LFUDecrAndReturn(kv));
     } else {
         addReplySubcommandSyntaxError(c);
     }
@@ -1498,7 +1865,7 @@ NULL
         };
         addReplyHelp(c, help);
     } else if (!strcasecmp(c->argv[1]->ptr,"usage") && c->argc >= 3) {
-        dictEntry *de;
+        kvobj *kv;
         long long samples = OBJ_COMPUTE_SIZE_DEF_SAMPLES;
         for (int j = 3; j < c->argc; j++) {
             if (!strcasecmp(c->argv[j]->ptr,"samples") &&
@@ -1517,19 +1884,24 @@ NULL
                 return;
             }
         }
-        if ((de = dictFind(c->db->dict,c->argv[2]->ptr)) == NULL) {
+        if ((kv = dbFind(c->db, c->argv[2]->ptr)) == NULL) {
             addReplyNull(c);
             return;
         }
-        size_t usage = objectComputeSize(c->argv[2],dictGetVal(de),samples,c->db->id);
-        usage += sdsZmallocSize(dictGetKey(de));
-        usage += sizeof(dictEntry);
-        usage += dictMetadataSize(c->db->dict);
+        size_t usage = kvobjComputeSize(c->argv[2], kv, samples, c->db->id);
+
+        /* Add this key's share of the hash-template cost (see the comment of
+         * hashTemplatePerKeyMemoryShare()). */
+        if (kv->type == OBJ_HASH &&
+            (kv->encoding == OBJ_ENCODING_TMPL_LP ||
+             kv->encoding == OBJ_ENCODING_TMPL_ARRAY))
+            usage += hashTemplatePerKeyMemoryShare(kv);
+
         addReplyLongLong(c,usage);
     } else if (!strcasecmp(c->argv[1]->ptr,"stats") && c->argc == 2) {
         struct redisMemOverhead *mh = getMemoryOverheadData();
 
-        addReplyMapLen(c,27+mh->num_dbs);
+        addReplyMapLen(c,36+mh->num_dbs);
 
         addReplyBulkCString(c,"peak.allocated");
         addReplyLongLong(c,mh->peak_allocated);
@@ -1543,11 +1915,20 @@ NULL
         addReplyBulkCString(c,"replication.backlog");
         addReplyLongLong(c,mh->repl_backlog);
 
+        addReplyBulkCString(c,"replica.fullsync.buffer");
+        addReplyLongLong(c,mh->replica_fullsync_buffer);
+
         addReplyBulkCString(c,"clients.slaves");
         addReplyLongLong(c,mh->clients_slaves);
 
         addReplyBulkCString(c,"clients.normal");
         addReplyLongLong(c,mh->clients_normal);
+
+        addReplyBulkCString(c,"clients.normal.shared");
+        addReplyLongLong(c,mh->clients_normal_shared);
+
+        addReplyBulkCString(c,"clients.normal.unshared");
+        addReplyLongLong(c,mh->clients_normal_unshared);
 
         addReplyBulkCString(c,"cluster.links");
         addReplyLongLong(c,mh->cluster_links);
@@ -1556,10 +1937,16 @@ NULL
         addReplyLongLong(c,mh->aof_buffer);
 
         addReplyBulkCString(c,"lua.caches");
-        addReplyLongLong(c,mh->lua_caches);
+        addReplyLongLong(c,mh->eval_caches);
 
         addReplyBulkCString(c,"functions.caches");
         addReplyLongLong(c,mh->functions_caches);
+
+        addReplyBulkCString(c,"script.VMs");
+        addReplyLongLong(c,mh->script_vm);
+
+        addReplyBulkCString(c,"hash.templates");
+        addReplyLongLong(c,mh->hash_templates);
 
         for (size_t j = 0; j < mh->num_dbs; j++) {
             char dbname[32];
@@ -1573,13 +1960,21 @@ NULL
             addReplyBulkCString(c,"overhead.hashtable.expires");
             addReplyLongLong(c,mh->db[j].overhead_ht_expires);
 
-            addReplyBulkCString(c,"overhead.hashtable.slot-to-keys");
-            addReplyLongLong(c,mh->db[j].overhead_ht_slot_to_keys);
+            addReplyBulkCString(c,"overhead.hashtable.blessed");
+            addReplyLongLong(c,mh->db[j].overhead_ht_blessed);
         }
 
+        addReplyBulkCString(c,"overhead.db.hashtable.lut");
+        addReplyLongLong(c, mh->overhead_db_hashtable_lut);
+
+        addReplyBulkCString(c,"overhead.db.hashtable.rehashing");
+        addReplyLongLong(c, mh->overhead_db_hashtable_rehashing);
 
         addReplyBulkCString(c,"overhead.total");
         addReplyLongLong(c,mh->overhead_total);
+
+        addReplyBulkCString(c,"db.dict.rehashing.count");
+        addReplyLongLong(c, mh->db_dict_rehashing_count);
 
         addReplyBulkCString(c,"keys.count");
         addReplyLongLong(c,mh->total_keys);
@@ -1604,6 +1999,9 @@ NULL
 
         addReplyBulkCString(c,"allocator.resident");
         addReplyLongLong(c,server.cron_malloc_stats.allocator_resident);
+
+        addReplyBulkCString(c,"allocator.muzzy");
+        addReplyLongLong(c,server.cron_malloc_stats.allocator_muzzy);
 
         addReplyBulkCString(c,"allocator-fragmentation.ratio");
         addReplyDouble(c,mh->allocator_frag);

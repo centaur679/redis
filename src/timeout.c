@@ -1,47 +1,29 @@
-/* Copyright (c) 2009-2020, Salvatore Sanfilippo <antirez at gmail dot com>
+/*
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "server.h"
 #include "cluster.h"
+
+#include <math.h>
 
 /* ========================== Clients timeouts ============================= */
 
 /* Check if this blocked client timedout (does nothing if the client is
  * not blocked right now). If so send a reply, unblock it, and return 1.
  * Otherwise 0 is returned and no operation is performed. */
-int checkBlockedClientTimeout(client *c, mstime_t now) {
+int checkBlockedClientTimeout(client *c, uint64_t now) {
     if (c->flags & CLIENT_BLOCKED &&
-        c->bpop.timeout != 0
-        && c->bpop.timeout < now)
+        c->bstate.timeout != 0
+        && c->bstate.timeout < now)
     {
         /* Handle blocking operation specific timeout. */
-        replyToBlockedClientTimedOut(c);
-        unblockClient(c);
+        unblockClientOnTimeout(c);
         return 1;
     } else {
         return 0;
@@ -71,7 +53,7 @@ int clientsCronHandleTimeout(client *c, mstime_t now_ms) {
          * into keys no longer served by this server. */
         if (server.cluster_enabled) {
             if (clusterRedirectBlockedClientIfNeeded(c))
-                unblockClient(c);
+                unblockClientOnError(c, NULL);
         }
     }
     return 0;
@@ -112,8 +94,8 @@ void decodeTimeoutKey(unsigned char *buf, uint64_t *toptr, client **cptr) {
  * to handle blocked clients timeouts. The client is not added to the list
  * if its timeout is zero (block forever). */
 void addClientToTimeoutTable(client *c) {
-    if (c->bpop.timeout == 0) return;
-    uint64_t timeout = c->bpop.timeout;
+    if (c->bstate.timeout == 0) return;
+    uint64_t timeout = c->bstate.timeout;
     unsigned char buf[CLIENT_ST_KEYLEN];
     encodeTimeoutKey(buf,timeout,c);
     if (raxTryInsert(server.clients_timeout_table,buf,sizeof(buf),NULL,NULL))
@@ -125,7 +107,7 @@ void addClientToTimeoutTable(client *c) {
 void removeClientFromTimeoutTable(client *c) {
     if (!(c->flags & CLIENT_IN_TO_TABLE)) return;
     c->flags &= ~CLIENT_IN_TO_TABLE;
-    uint64_t timeout = c->bpop.timeout;
+    uint64_t timeout = c->bstate.timeout;
     unsigned char buf[CLIENT_ST_KEYLEN];
     encodeTimeoutKey(buf,timeout,c);
     raxRemove(server.clients_timeout_table,buf,sizeof(buf),NULL);
@@ -135,7 +117,7 @@ void removeClientFromTimeoutTable(client *c) {
  * that are waiting in blocking operations with a timeout set. */
 void handleBlockedClientsTimeout(void) {
     if (raxSize(server.clients_timeout_table) == 0) return;
-    uint64_t now = mstime();
+    uint64_t now = getMonotonicUs() / 1000;
     raxIterator ri;
     raxStart(&ri,server.clients_timeout_table);
     raxSeek(&ri,"^",NULL,0);
@@ -161,10 +143,9 @@ void handleBlockedClientsTimeout(void) {
  * Note that if the timeout is zero (usually from the point of view of
  * commands API this means no timeout) the value stored into 'timeout'
  * is zero. */
-int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int unit) {
+static int getTimeoutFromObjectOrReplyInternal(client *c, robj *object, long long *timeout, int unit, long long now) {
     long long tval;
     long double ftval;
-    mstime_t now = commandTimeSnapshot();
 
     if (unit == UNIT_SECONDS) {
         if (getLongDoubleFromObjectOrReply(c,object,&ftval,
@@ -172,11 +153,11 @@ int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int 
             return C_ERR;
 
         ftval *= 1000.0;  /* seconds => millisec */
-        if (ftval > LLONG_MAX) {
+        if (ftval > (long double)LLONG_MAX) {
             addReplyError(c, "timeout is out of range");
             return C_ERR;
         }
-        tval = (long long) ftval;
+        tval = (long long) ceill(ftval);
     } else {
         if (getLongLongFromObjectOrReply(c,object,&tval,
             "timeout is not an integer or out of range") != C_OK)
@@ -198,4 +179,16 @@ int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int 
     *timeout = tval;
 
     return C_OK;
+}
+
+int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int unit) {
+    return getTimeoutFromObjectOrReplyInternal(c, object, timeout, unit, commandTimeSnapshot());
+}
+
+int getMonotonicTimeoutFromObjectOrReply(client *c, robj *object, uint64_t *timeout, int unit) {
+    long long monotonic_timeout;
+    int result = getTimeoutFromObjectOrReplyInternal(c, object, &monotonic_timeout,
+                                                     unit, getMonotonicUs() / 1000);
+    if (result == C_OK) *timeout = monotonic_timeout;
+    return result;
 }

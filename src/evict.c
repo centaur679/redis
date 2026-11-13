@@ -2,38 +2,20 @@
  *
  * ----------------------------------------------------------------------------
  *
- * Copyright (c) 2009-2016, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "server.h"
 #include "bio.h"
 #include "atomicvar.h"
 #include "script.h"
+#include "cluster.h"
+#include "cluster_asm.h"
 #include <math.h>
 
 /* ----------------------------------------------------------------------------
@@ -53,11 +35,17 @@
  * Empty entries have the key pointer set to NULL. */
 #define EVPOOL_SIZE 16
 #define EVPOOL_CACHED_SDS_SIZE 255
+#define EVICTION_MAX_BLESSED_ONLY_ROUNDS 8
+/* When eviction can't free memory because blessed (NO-EVICT) keys hold it,
+ * tolerate used memory up to 1.25x maxmemory. There is no separate hard
+ * ceiling, so this is the ceiling. */
+#define EVICTION_OVERUSE_DIVISOR 4
 struct evictionPoolEntry {
     unsigned long long idle;    /* Object idle time (inverse frequency for LFU) */
     sds key;                    /* Key name. */
     sds cached;                 /* Cached SDS object for key name. */
     int dbid;                   /* Key DB number. */
+    int slot;                   /* Slot. */
 };
 
 static struct evictionPoolEntry *EvictionPoolLRU;
@@ -80,7 +68,7 @@ unsigned int getLRUClock(void) {
 unsigned int LRU_CLOCK(void) {
     unsigned int lruclock;
     if (1000/server.hz <= LRU_CLOCK_RESOLUTION) {
-        atomicGet(server.lruclock,lruclock);
+        lruclock = server.lruclock;
     } else {
         lruclock = getLRUClock();
     }
@@ -97,6 +85,12 @@ unsigned long long estimateObjectIdleTime(robj *o) {
         return (lruclock + (LRU_CLOCK_MAX - o->lru)) *
                     LRU_CLOCK_RESOLUTION;
     }
+}
+
+/* During atomic slot migration, keys that are being imported are in an
+ * intermediate state. We cannot evict them and therefore skip them. */
+static int randomEvictionShouldSkipDictIndex(int didx) {
+    return !clusterCanAccessKeysInSlot(didx);
 }
 
 /* LRU approximation algorithm
@@ -142,34 +136,32 @@ void evictionPoolAlloc(void) {
  * We insert keys on place in ascending order, so keys with the smaller
  * idle time are on the left, and keys with the higher idle time on the
  * right. */
-
-void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evictionPoolEntry *pool) {
+int evictionPoolPopulate(redisDb *db, kvstore *samplekvs, struct evictionPoolEntry *pool, int *candidates) {
     int j, k, count;
     dictEntry *samples[server.maxmemory_samples];
 
-    count = dictGetSomeKeys(sampledict,samples,server.maxmemory_samples);
+    *candidates = 0;
+
+    /* Don't retry, since we will call evictionPoolPopulate multiple times if needed. */
+    int slot = kvstoreGetFairRandomDictIndex(samplekvs, randomEvictionShouldSkipDictIndex, 1, 0);
+    if (slot == -1) return 0;
+    count = kvstoreDictGetSomeKeys(samplekvs,slot,samples,server.maxmemory_samples);
     for (j = 0; j < count; j++) {
         unsigned long long idle;
-        sds key;
-        robj *o;
-        dictEntry *de;
+        
+        dictEntry *de = samples[j];
+        kvobj *kv = dictGetKV(de);
+        sds key = kvobjGetKey(kv);
 
-        de = samples[j];
-        key = dictGetKey(de);
-
-        /* If the dictionary we are sampling from is not the main
-         * dictionary (but the expires one) we need to lookup the key
-         * again in the key dictionary to obtain the value object. */
-        if (server.maxmemory_policy != MAXMEMORY_VOLATILE_TTL) {
-            if (sampledict != keydict) de = dictFind(keydict, key);
-            o = dictGetVal(de);
-        }
+        /* Blessed NO-EVICT keys are never eviction candidates. */
+        if (blessIsNoEvict(kv)) continue;
+        (*candidates)++;
 
         /* Calculate the idle time according to the policy. This is called
          * idle just because the code initially handled LRU, but is in fact
-         * just a score where an higher score means better candidate. */
-        if (server.maxmemory_policy & MAXMEMORY_FLAG_LRU) {
-            idle = estimateObjectIdleTime(o);
+         * just a score where a higher score means better candidate. */
+        if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU|MAXMEMORY_FLAG_LRM)) {
+            idle = estimateObjectIdleTime(kv);
         } else if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
             /* When we use an LRU policy, we sort the keys by idle time
              * so that we expire keys starting from greater idle time.
@@ -178,10 +170,10 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evic
              * first. So inside the pool we put objects using the inverted
              * frequency subtracting the actual frequency to the maximum
              * frequency of 255. */
-            idle = 255-LFUDecrAndReturn(o);
+            idle = 255-LFUDecrAndReturn(kv);
         } else if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
             /* In this case the sooner the expire the better. */
-            idle = ULLONG_MAX - (long)dictGetVal(de);
+            idle = ULLONG_MAX - kvobjGetExpire(kv);
         } else {
             serverPanic("Unknown eviction policy in evictionPoolPopulate()");
         }
@@ -236,8 +228,11 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evic
             pool[k].key = pool[k].cached;
         }
         pool[k].idle = idle;
-        pool[k].dbid = dbid;
+        pool[k].dbid = db->id;
+        pool[k].slot = slot;
     }
+
+    return count;
 }
 
 /* ----------------------------------------------------------------------------
@@ -249,42 +244,40 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evic
  *
  * We split the 24 bits into two fields:
  *
- *          16 bits      8 bits
- *     +----------------+--------+
- *     + Last decr time | LOG_C  |
- *     +----------------+--------+
+ *            16 bits       8 bits
+ *     +------------------+--------+
+ *     + Last access time | LOG_C  |
+ *     +------------------+--------+
  *
  * LOG_C is a logarithmic counter that provides an indication of the access
  * frequency. However this field must also be decremented otherwise what used
  * to be a frequently accessed key in the past, will remain ranked like that
  * forever, while we want the algorithm to adapt to access pattern changes.
  *
- * So the remaining 16 bits are used in order to store the "decrement time",
+ * So the remaining 16 bits are used in order to store the "access time",
  * a reduced-precision Unix time (we take 16 bits of the time converted
  * in minutes since we don't care about wrapping around) where the LOG_C
- * counter is halved if it has an high value, or just decremented if it
- * has a low value.
+ * counter decays every minute by default (depends on lfu-decay-time).
  *
  * New keys don't start at zero, in order to have the ability to collect
  * some accesses before being trashed away, so they start at LFU_INIT_VAL.
  * The logarithmic increment performed on LOG_C takes care of LFU_INIT_VAL
  * when incrementing the key, so that keys starting at LFU_INIT_VAL
  * (or having a smaller value) have a very high chance of being incremented
- * on access.
+ * on access. (The chance depends on counter and lfu-log-factor.)
  *
- * During decrement, the value of the logarithmic counter is halved if
- * its current value is greater than two times the LFU_INIT_VAL, otherwise
- * it is just decremented by one.
+ * During decrement, the value of the logarithmic counter is decremented by
+ * one when lfu-decay-time minutes elapsed.
  * --------------------------------------------------------------------------*/
 
 /* Return the current time in minutes, just taking the least significant
- * 16 bits. The returned time is suitable to be stored as LDT (last decrement
+ * 16 bits. The returned time is suitable to be stored as LDT (last access
  * time) for the LFU implementation. */
 unsigned long LFUGetTimeInMinutes(void) {
     return (server.unixtime/60) & 65535;
 }
 
-/* Given an object last access time, compute the minimum number of minutes
+/* Given an object ldt (last access time), compute the minimum number of minutes
  * that elapsed since the last access. Handle overflow (ldt greater than
  * the current 16 bits minutes time) considering the time as wrapping
  * exactly once. */
@@ -306,10 +299,10 @@ uint8_t LFULogIncr(uint8_t counter) {
     return counter;
 }
 
-/* If the object decrement time is reached decrement the LFU counter but
+/* If the object's ldt (last access time) is reached, decrement the LFU counter but
  * do not update LFU fields of the object, we update the access time
  * and counter in an explicit way when the object is really accessed.
- * And we will times halve the counter according to the times of
+ * And we will decrement the counter according to the times of
  * elapsed time than server.lfu_decay_time.
  * Return the object frequency counter.
  *
@@ -363,6 +356,11 @@ size_t freeMemoryGetNotCountedMemory(void) {
             overhead += (server.repl_buffer_mem - counted_mem);
         }
     }
+
+    /* The migrate client is like a replica, we also push DELs into it when
+     * evicting keys belonging to the migrating slot, so we don't count its
+     * output buffer to avoid eviction loop. */
+    overhead += asmGetMigrateOutputMemoryUsage();
 
     if (server.aof_state != AOF_OFF) {
         overhead += sdsAllocSize(server.aof_buf);
@@ -487,6 +485,13 @@ static int isSafeToPerformEvictions(void) {
      * and just be masters exact copies. */
     if (server.masterhost && server.repl_slave_ignore_maxmemory) return 0;
 
+    /* Disable eviction during slot migration import to avoid delays and errors
+     * caused by failed evictions. A special client is created for data import,
+     * identified by the CLIENT_MASTER and CLIENT_ASM_IMPORTING flags. */
+    if (server.current_client && server.current_client->flags & CLIENT_MASTER &&
+        server.current_client->flags & CLIENT_ASM_IMPORTING)
+        return 0;
+
     /* If 'evict' action is paused, for whatever reason, then return false */
     if (isPausedActionsWithUpdate(PAUSE_ACTION_EVICT)) return 0;
 
@@ -494,7 +499,7 @@ static int isSafeToPerformEvictions(void) {
 }
 
 /* Algorithm for converting tenacity (0-100) to a time limit.  */
-static unsigned long evictionTimeLimitUs() {
+static unsigned long evictionTimeLimitUs(void) {
     serverAssert(server.maxmemory_eviction_tenacity >= 0);
     serverAssert(server.maxmemory_eviction_tenacity <= 100);
 
@@ -543,10 +548,10 @@ int performEvictions(void) {
     int keys_freed = 0;
     size_t mem_reported, mem_tofree;
     long long mem_freed; /* May be negative */
-    mstime_t latency, eviction_latency;
-    long long delta;
+    mstime_t latency;
     int slaves = listLength(server.slaves);
     int result = EVICT_FAIL;
+    int blessed_blocked = 0; /* set if eviction gave up because sampling only hit blessed keys */
 
     if (getMaxmemoryState(&mem_reported,NULL,&mem_tofree,NULL) == C_OK) {
         result = EVICT_OK;
@@ -567,17 +572,9 @@ int performEvictions(void) {
     monotime evictionTimer;
     elapsedStart(&evictionTimer);
 
-    /* Unlike active-expire and blocked client, we can reach here from 'CONFIG SET maxmemory'
-     * so we have to back-up and restore server.core_propagates. */
-    int prev_core_propagates = server.core_propagates;
+    /* Try to smoke-out bugs (server.also_propagate should be empty here) */
     serverAssert(server.also_propagate.numops == 0);
-    server.core_propagates = 1;
-
-    /* Increase nested call counter
-     * we add this in order to prevent any RM_Call that may exist
-     * in the notify CB to be propagated immediately.
-     * we want them in multi/exec with the DEL command */
-    server.in_nested_call++;
+    /* Evictions are performed on random keys that have nothing to do with the current command slot. */
 
     while (mem_freed < (long long)mem_tofree) {
         int j, k, i;
@@ -585,27 +582,53 @@ int performEvictions(void) {
         sds bestkey = NULL;
         int bestdbid;
         redisDb *db;
-        dict *dict;
         dictEntry *de;
 
-        if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU|MAXMEMORY_FLAG_LFU) ||
+        if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU|MAXMEMORY_FLAG_LFU|MAXMEMORY_FLAG_LRM) ||
             server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL)
         {
             struct evictionPoolEntry *pool = EvictionPoolLRU;
-
+            int blessed_only_rounds = 0;
             while (bestkey == NULL) {
-                unsigned long total_keys = 0, keys;
+                unsigned long total_keys = 0;
+                unsigned long total_sampled_keys = 0;
+                unsigned long total_candidates = 0;
 
                 /* We don't want to make local-db choices when expiring keys,
                  * so to start populate the eviction pool sampling keys from
                  * every DB. */
                 for (i = 0; i < server.dbnum; i++) {
                     db = server.db+i;
-                    dict = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) ?
-                            db->dict : db->expires;
-                    if ((keys = dictSize(dict)) != 0) {
-                        evictionPoolPopulate(i, dict, db->dict, pool);
-                        total_keys += keys;
+                    kvstore *kvs;
+                    if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
+                        kvs = db->keys;
+                    } else {
+                        kvs = db->expires;
+                    }
+                    unsigned long sampled_keys = 0;
+                    unsigned long current_db_keys = kvstoreSize(kvs);
+                    if (current_db_keys == 0) continue;
+
+                    total_keys += current_db_keys;
+                    int l = kvstoreNumNonEmptyDicts(kvs);
+                    /* Do not exceed the number of non-empty slots when looping. */
+                    while (l--) {
+                        int candidates = 0;
+                        int sampled = evictionPoolPopulate(db, kvs, pool, &candidates);
+                        /* Count only evictable (non-blessed) keys toward the budget,
+                         * so slots full of NO-EVICT keys don't starve the sampling
+                         * and stop us from reaching slots that still have victims. */
+                        sampled_keys += candidates;
+                        total_sampled_keys += sampled;
+                        total_candidates += candidates;
+                        /* We have sampled enough evictable keys in the current db. */
+                        if (sampled_keys >= (unsigned long) server.maxmemory_samples)
+                            break;
+                        /* If there are not a lot of keys in the current db, dict/s may be very
+                         * sparsely populated, exit the loop without meeting the sampling
+                         * requirement. */
+                        if (current_db_keys < (unsigned long) server.maxmemory_samples*10)
+                            break;
                     }
                 }
                 if (!total_keys) break; /* No keys to evict. */
@@ -615,13 +638,13 @@ int performEvictions(void) {
                     if (pool[k].key == NULL) continue;
                     bestdbid = pool[k].dbid;
 
+                    kvstore *kvs;
                     if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
-                        de = dictFind(server.db[bestdbid].dict,
-                            pool[k].key);
+                        kvs = server.db[bestdbid].keys;
                     } else {
-                        de = dictFind(server.db[bestdbid].expires,
-                            pool[k].key);
+                        kvs = server.db[bestdbid].expires;
                     }
+                    de = kvstoreDictFind(kvs, pool[k].slot, pool[k].key);
 
                     /* Remove the entry from the pool. */
                     if (pool[k].key != pool[k].cached)
@@ -632,12 +655,39 @@ int performEvictions(void) {
                     /* If the key exists, is our pick. Otherwise it is
                      * a ghost and we need to try the next element. */
                     if (de) {
-                        bestkey = dictGetKey(de);
+                        kvobj *kv = dictGetKV(de);
+                        /* The pool persists across performEvictions() calls, so a
+                         * key pooled while unblessed may since have been marked
+                         * NO-EVICT. The entry is already removed from the pool
+                         * above; skip it as a target and try the next one. */
+                        if (blessIsNoEvict(kv)) continue;
+                        bestkey = kvobjGetKey(kv);
                         break;
                     } else {
                         /* Ghost... Iterate again. */
                     }
                 }
+                if (bestkey) break;
+
+                /* No victim was pooled. This check moved below the pool scan (it
+                 * used to sit right after sampling) so we can tell two cases apart,
+                 * in order:
+                 *   1. sampled nothing at all -> no keys to evict, stop here.
+                 *   2. sampled keys but all were blessed -> retry (handled by the
+                 *      total_candidates branch below), don't stop.
+                 * The old early break sat before that split and would stop on an
+                 * all-blessed sample even when unblessed keys still remain. */
+                if (!total_sampled_keys) break;
+
+                if (!total_candidates) {
+                    /* Sampled keys, but every one was blessed (NO-EVICT). */
+                    if (++blessed_only_rounds >= EVICTION_MAX_BLESSED_ONLY_ROUNDS) {
+                        blessed_blocked = 1;
+                        break;
+                    }
+                    continue;
+                }
+                blessed_only_rounds = 0;
             }
         }
 
@@ -648,15 +698,37 @@ int performEvictions(void) {
             /* When evicting a random key, we try to evict a key for
              * each DB, so we use the static 'next_db' variable to
              * incrementally visit all DBs. */
-            for (i = 0; i < server.dbnum; i++) {
-                j = (++next_db) % server.dbnum;
-                db = server.db+j;
-                dict = (server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM) ?
-                        db->dict : db->expires;
-                if (dictSize(dict) != 0) {
-                    de = dictGetRandomKey(dict);
-                    bestkey = dictGetKey(de);
-                    bestdbid = j;
+            int blessed_only_rounds = 0;
+            while (bestkey == NULL) {
+                unsigned long total_sampled_keys = 0;
+                for (i = 0; i < server.dbnum; i++) {
+                    j = (++next_db) % server.dbnum;
+                    db = server.db+j;
+                    kvstore *kvs;
+                    if (server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM) {
+                        kvs = db->keys;
+                    } else {
+                        kvs = db->expires;
+                    }
+                    int slot = kvstoreGetFairRandomDictIndex(kvs, randomEvictionShouldSkipDictIndex, 16, 0);
+                    if (slot == -1) continue;
+                    /* Try a few random keys so blessed NOEVICT keys are skipped. */
+                    for (int attempts = 0; attempts < server.maxmemory_samples; attempts++) {
+                        de = kvstoreDictGetRandomKey(kvs, slot);
+                        if (de == NULL) break;
+                        total_sampled_keys++;
+                        kvobj *kv = dictGetKV(de);
+                        if (blessIsNoEvict(kv)) continue;
+                        bestkey = kvobjGetKey(kv);
+                        bestdbid = j;
+                        break;
+                    }
+                    if (bestkey) break;
+                }
+                if (bestkey || !total_sampled_keys) break;
+                /* Sampled keys, but every one was blessed (NO-EVICT). */
+                if (++blessed_only_rounds >= EVICTION_MAX_BLESSED_ONLY_ROUNDS) {
+                    blessed_blocked = 1;
                     break;
                 }
             }
@@ -664,35 +736,18 @@ int performEvictions(void) {
 
         /* Finally remove the selected key. */
         if (bestkey) {
+            long long key_mem_freed;
             db = server.db+bestdbid;
+
+            enterExecutionUnit(1, 0);
             robj *keyobj = createStringObject(bestkey,sdslen(bestkey));
-            /* We compute the amount of memory freed by db*Delete() alone.
-             * It is possible that actually the memory needed to propagate
-             * the DEL in AOF and replication link is greater than the one
-             * we are freeing removing the key, but we can't account for
-             * that otherwise we would never exit the loop.
-             *
-             * Same for CSC invalidation messages generated by signalModifiedKey.
-             *
-             * AOF and Output buffer memory will be freed eventually so
-             * we only care about memory used by the key space. */
-            delta = (long long) zmalloc_used_memory();
-            latencyStartMonitor(eviction_latency);
-            if (server.lazyfree_lazy_eviction)
-                dbAsyncDelete(db,keyobj);
-            else
-                dbSyncDelete(db,keyobj);
-            latencyEndMonitor(eviction_latency);
-            latencyAddSampleIfNeeded("eviction-del",eviction_latency);
-            delta -= (long long) zmalloc_used_memory();
-            mem_freed += delta;
-            server.stat_evictedkeys++;
-            signalModifiedKey(NULL,db,keyobj);
-            notifyKeyspaceEvent(NOTIFY_EVICTED, "evicted",
-                keyobj, db->id);
-            propagateDeletion(db,keyobj,server.lazyfree_lazy_eviction);
-            propagatePendingCommands();
+            deleteEvictedKeyAndPropagate(db, keyobj, &key_mem_freed);
             decrRefCount(keyobj);
+            exitExecutionUnit();
+            /* Propagate the DEL command */
+            postExecutionUnitOperations();
+
+            mem_freed += key_mem_freed;
             keys_freed++;
 
             if (keys_freed % 16 == 0) {
@@ -750,10 +805,17 @@ cant_free:
         latencyAddSampleIfNeeded("eviction-lazyfree",lazyfree_latency);
     }
 
-    serverAssert(server.core_propagates); /* This function should not be re-entrant */
-
-    server.core_propagates = prev_core_propagates;
-    server.in_nested_call--;
+    /* If we still couldn't free enough and blessed (NO-EVICT) keys exist, the
+     * blessing is likely why - failing the write with OOM would punish the user
+     * for a limit they deliberately raised. Tolerate a bounded overshoot: let the
+     * command run (EVICT_OK) while used memory stays within maxmemory*factor; we
+     * reclaim on later commands. Past the factor we still OOM (the hard ceiling). */
+    if (result == EVICT_FAIL && blessed_blocked) {
+        size_t mem_tofree;
+        if (getMaxmemoryState(NULL, NULL, &mem_tofree, NULL) == C_OK ||
+            mem_tofree <= server.maxmemory / EVICTION_OVERUSE_DIVISOR)
+            result = EVICT_OK;
+    }
 
     latencyEndMonitor(latency);
     latencyAddSampleIfNeeded("eviction-cycle",latency);

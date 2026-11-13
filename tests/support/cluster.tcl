@@ -1,6 +1,11 @@
 # Tcl redis cluster client as a wrapper of redis.rb.
-# Copyright (C) 2014 Salvatore Sanfilippo
-# Released under the BSD license like Redis itself
+#
+# Copyright (C) 2014-Present, Redis Ltd.
+# All Rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
 #
 # Example usage:
 #
@@ -9,7 +14,7 @@
 # $c get foo
 # $c close
 
-package require Tcl 8.5
+package require Tcl 8.5-10
 package provide redis_cluster 0.1
 
 namespace eval redis_cluster {}
